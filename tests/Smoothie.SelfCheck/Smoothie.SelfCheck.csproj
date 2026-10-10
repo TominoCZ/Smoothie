@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- The plugin targets the game's Mono; the maths it checks has no Unity types. -->
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>Smoothie.SelfCheck</AssemblyName>
+    <RootNamespace>Smoothie.SelfCheck</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../../src/Smoothie/ThrottleMath.cs" />
+  </ItemGroup>
+
+</Project>

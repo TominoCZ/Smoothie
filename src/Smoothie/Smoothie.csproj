@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Version>1.0.0</Version>
+    <AssemblyName>Smoothie</AssemblyName>
+    <RootNamespace>Smoothie</RootNamespace>
+  </PropertyGroup>
+
+  <!-- Supplied by the running game. -->
+  <ItemGroup>
+    <Reference Include="Assembly-CSharp"><HintPath>$(SptManaged)/Assembly-CSharp.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine"><HintPath>$(SptManaged)/UnityEngine.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(SptManaged)/UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.AnimationModule"><HintPath>$(SptManaged)/UnityEngine.AnimationModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="AnimationSystem.Types"><HintPath>$(SptManaged)/AnimationSystem.Types.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.IMGUIModule"><HintPath>$(SptManaged)/UnityEngine.IMGUIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.PhysicsModule"><HintPath>$(SptManaged)/UnityEngine.PhysicsModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Comfort"><HintPath>$(SptManaged)/Comfort.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BepInEx"><HintPath>$(SptPath)/BepInEx/core/BepInEx.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(SptPath)/BepInEx/core/0Harmony.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="spt-reflection"><HintPath>$(SptPath)/BepInEx/plugins/spt/spt-reflection.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+
+  <!-- dotnet build -p:SptDeploy=true  installs straight into the game. -->
+  <Target Name="DeployToSpt" AfterTargets="Build" Condition="'$(SptDeploy)' == 'true'">
+    <PropertyGroup>
+      <SptPluginDir Condition="'$(SptPluginDir)' == ''">$(SptPath)/BepInEx/plugins/Smoothie</SptPluginDir>
+    </PropertyGroup>
+    <MakeDir Directories="$(SptPluginDir)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(SptPluginDir)" />
+    <Message Importance="high" Text="Smoothie -> $(SptPluginDir)" />
+  </Target>
+
+</Project>
