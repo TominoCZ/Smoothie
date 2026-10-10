@@ -1,0 +1,22 @@
+<Project>
+  <PropertyGroup>
+    <!-- BepInEx loads plugins into the game's Mono runtime. -->
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <!-- The SPT client folder holding EscapeFromTarkov.exe and BepInEx/. -->
+  <PropertyGroup>
+    <SptPath Condition="'$(SptPath)' == ''">$(SPT_PATH)</SptPath>
+    <SptManaged>$(SptPath)/EscapeFromTarkov_Data/Managed</SptManaged>
+  </PropertyGroup>
+
+  <Target Name="VerifySptPath" BeforeTargets="BeforeBuild">
+    <Error Condition="'$(SptPath)' == ''"
+           Text="SptPath is not set. Export SPT_PATH=/path/to/SPT or build with -p:SptPath=..." />
+    <Error Condition="!Exists('$(SptManaged)/Assembly-CSharp.dll')"
+           Text="Assembly-CSharp.dll not found under '$(SptManaged)'. Point SptPath at the SPT client folder." />
+  </Target>
+</Project>
