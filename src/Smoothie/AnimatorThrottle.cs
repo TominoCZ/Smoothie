@@ -35,15 +35,30 @@ internal static class AnimatorThrottle
         // Arms the game steps by hand every frame (Fika's observed bots). Their update is
         // held back in Player.ArmsUpdate and stepped here with the body instead.
         public bool DeferArms;
+
+        // Stepped by Unity: the animators are switched back on for one frame with their speed
+        // scaled up, so Unity's own (multi-threaded) update covers the time they're behind.
+        // The scale for that frame, 0 when not stepping; the game's speeds to put back.
+        public float StepScale;
+        public float BodySpeed, ArmsSpeed;
+
+        // Handed back to Unity after this last step.
+        public bool Releasing;
     }
 
     private static readonly ConditionalWeakTable<Player, State> States = new();
+
+    private static readonly AccessTools.FieldRef<MovementContext, Player> MovementPlayer =
+        AccessTools.FieldRefAccess<MovementContext, Player>("_player");
 
     private static readonly AccessTools.FieldRef<Player, BetterSource> StepSource =
         AccessTools.FieldRefAccess<Player, BetterSource>("NestedStepSoundSource");
 
     // Box around a standing bot, padded so bots at the edge of the screen count as on it.
     private static readonly Vector3 BotBox = new(2f, 2.5f, 2f);
+
+    // Lowest animation rate for a bot in a fight that you can't see.
+    private const float FightingRate = 30f;
 
     // Sanity cap on a learned footstep range.
     private const float MaxAudibleRange = 200f;
@@ -63,6 +78,17 @@ internal static class AnimatorThrottle
 
     // Last full frame's numbers, for the stats overlay.
     internal static int Throttled;
+
+    // Why the others weren't, last full frame: in view within IK range, in a fight, or
+    // close/audible enough that their rate is about the frame rate anyway.
+    internal static int FullInView, FullFighting, FullOther;
+    private static int _fullInView, _fullFighting, _fullOther;
+
+    // Why PickInterval kept a bot at full rate, for the overlay's counts.
+    private enum FullRate { Other, InView, Fighting }
+
+    // Frame the last Unity step started; its movement update runs the frame after.
+    private static int _lastStepStart = -10;
     internal static int Steps;
     internal static double StepMs;
     private static int _throttled;
@@ -129,18 +155,34 @@ internal static class AnimatorThrottle
         }
 
         NextFrame();
-
-        var interval = Plugin.On(Plugin.ThrottleAnimators) && _hasCamera && IsBot(player) ? PickInterval(player) : 0f;
         var dt = Time.deltaTime;
+
+        // Unity stepped this bot this frame (switched on at the end of the last one).
+        var stepped = state != null && state.StepScale > 0f;
+        if (stepped) FinishUnityStep(state!, dt);
+        if (state != null && state.Releasing)
+        {
+            States.Remove(player);
+            return;
+        }
+
+        // Switched off this frame, so Unity didn't animate it: this frame's time is owed too.
+        if (state != null && !stepped) state.Pending += dt;
+
+        var throttling = Plugin.On(Plugin.ThrottleAnimators) && _hasCamera && IsBot(player);
+        var reason = FullRate.Other;
+        var interval = throttling ? PickInterval(player, out reason) : 0f;
 
         if (interval <= dt * 1.5f)
         {
-            if (state != null)
+            if (throttling)
             {
-                Release(player, state);
-                States.Remove(player);
+                if (reason == FullRate.InView) _fullInView++;
+                else if (reason == FullRate.Fighting) _fullFighting++;
+                else _fullOther++;
             }
 
+            if (state != null && !Release(player, state)) States.Remove(player);
             return;
         }
 
@@ -152,10 +194,6 @@ internal static class AnimatorThrottle
             state = new State();
             States.Add(player, state);
         }
-        else
-        {
-            state.Pending += dt;
-        }
 
         Take(ref state.Body, player.BodyUpdateMode == Player.EUpdateMode.Auto ? player.BodyAnimatorCommon : null);
         Take(ref state.Arms, player.ArmsUpdateMode == Player.EUpdateMode.Auto ? player.ArmsAnimatorCommon : null);
@@ -164,8 +202,112 @@ internal static class AnimatorThrottle
 
         if (state.Pending >= interval * state.Jitter)
         {
-            Step(player, state);
+            if (!StartUnityStep(player, state, dt)) Step(player, state);
         }
+    }
+
+    // Manual Animator.Update runs on the main thread, one animator at a time (0.2-0.4 ms each
+    // was measured); Unity's own update batches every animator on worker threads. So a step
+    // switches the animators back on for one frame, sped up to cover the time they're behind,
+    // and lets Unity do it. False when there's nothing Unity can step (only hand-stepped arms).
+    private static bool StartUnityStep(Player player, State state, float dt)
+    {
+        if (!Plugin.On(Plugin.UnityStepping) || (!IsAlive(state.Body) && !IsAlive(state.Arms))) return false;
+
+        // Unity will add next frame's time times this; roughly what's owed. The difference is
+        // carried over in FinishUnityStep.
+        var scale = Mathf.Min(1f + state.Pending / Mathf.Max(dt, 0.001f), MaxStepScale);
+        if (IsAlive(state.Body))
+        {
+            state.BodySpeed = state.Body!.speed;
+            state.Body.speed = state.BodySpeed * scale;
+            state.Body.enabled = true;
+        }
+
+        if (IsAlive(state.Arms))
+        {
+            state.ArmsSpeed = state.Arms!.speed;
+            state.Arms.speed = state.ArmsSpeed * scale;
+            state.Arms.enabled = true;
+        }
+
+        state.StepScale = scale;
+        _lastStepStart = Time.frameCount;
+
+        // Arms the game steps by hand have no Unity update to ride on: stepped here, as before.
+        if (state.DeferArms) StepDeferredArms(player, state.Pending);
+        return true;
+    }
+
+    // Right after Unity's update on the step frame: speeds back, switched off again unless
+    // being handed back.
+    private static void FinishUnityStep(State state, float dt)
+    {
+        var scale = state.StepScale;
+        state.StepScale = 0f;
+
+        // Owed: what was behind, plus this frame. Applied: this frame times the scale.
+        state.Pending = Mathf.Max(0f, state.Pending + dt - dt * scale);
+
+        RestoreSpeed(state.Body, state.BodySpeed, scale);
+        RestoreSpeed(state.Arms, state.ArmsSpeed, scale);
+        if (state.Releasing)
+        {
+            state.Body = null;
+            state.Arms = null;
+            return;
+        }
+
+        if (IsAlive(state.Body)) state.Body!.enabled = false;
+        if (IsAlive(state.Arms)) state.Arms!.enabled = false;
+    }
+
+    // A bot switched off mid-step gets no LateUpdate, so nothing would end the step: its
+    // animators would keep the sped-up speed, and the movement hook would keep stretching its
+    // time step (the game still ticks a switched-off body's movement) until it woke. Ended as
+    // if no time had passed, so what it's owed is caught up once it's back.
+    internal static void EndStepIfAsleep(Player player)
+    {
+        if (!States.TryGetValue(player, out var state) || state.StepScale <= 0f) return;
+        FinishUnityStep(state, 0f);
+        if (state.Releasing) States.Remove(player);
+    }
+
+    // The game only sets a speed for sprint-to-idle; if it did in between, its value stays.
+    private static void RestoreSpeed(IAnimator? animator, float speed, float scale)
+    {
+        if (IsAlive(animator) && Mathf.Approximately(animator!.speed, speed * scale)) animator.speed = speed;
+    }
+
+    private const float MaxStepScale = 20f;
+
+    // The bot walks by root motion, capped at displacement / MovementContext.LastDeltaTime
+    // (see Step). The game sets LastDeltaTime in MovementContext.ManualUpdate, before Unity's
+    // animation; on a step frame it has to cover the whole stretch.
+    internal static void AfterMovementUpdate(MovementContext movement, float deltaTime)
+    {
+        // Called for every player every frame; nearly always no step is running.
+        if (Time.frameCount - _lastStepStart > 1) return;
+        var player = MovementPlayer(movement);
+        if (player != null && States.TryGetValue(player, out var state) && state.StepScale > 0f)
+        {
+            movement.LastDeltaTime = deltaTime * state.StepScale;
+        }
+    }
+
+    private static void StepDeferredArms(Player player, float dt)
+    {
+        if (dt <= 0f) return;
+        var start = Stopwatch.GetTimestamp();
+        UpdateDeferredArms(player, dt);
+        _steps++;
+        _stepTicks += Stopwatch.GetTimestamp() - start;
+    }
+
+    private static void UpdateDeferredArms(Player player, float dt)
+    {
+        if (IsAlive(player.ArmsAnimatorCommon)) player.ArmsAnimatorCommon.Update(dt);
+        player.UnderbarrelWeaponArmsAnimator?.Update(dt);
     }
 
     // Player.ArmsUpdate in Manual mode does three things: the hands controller update, the
@@ -191,22 +333,36 @@ internal static class AnimatorThrottle
         if (ranCleanly) player.ArmsLateUpdate(deltaTime);
     }
 
-    private static float PickInterval(Player player)
+    private static float PickInterval(Player player, out FullRate reason)
     {
+        reason = FullRate.Other;
         var position = player.Position;
         var distance = Vector3.Distance(position, _cameraPosition);
 
         // The game runs IK on top of the animator's pose here. A held pose would get IK
-        // applied a second time, so these animate every frame like vanilla.
-        if (player.IsVisible && distance <= EFTHardSettings.Instance.CULL_GROUNDER) return 0f;
-
-        // Local bots in a fight: semi-auto shots and reloads wait on arms-animator events,
-        // and the muzzle position comes from the animated skeleton.
-        var memory = player.AIData?.BotOwner?.Memory;
-        if (memory != null && (memory.HaveEnemy || memory.IsUnderFire)) return 0f;
+        // applied a second time, so these animate every frame like vanilla. The same test the
+        // IK uses: close bots behind walls skip the IK (Occlusion), so they can be throttled.
+        if (distance <= EFTHardSettings.Instance.CULL_GROUNDER && Occlusion.VisibleForIk(player))
+        {
+            reason = FullRate.InView;
+            return 0f;
+        }
 
         // A bot right in front of you but behind a wall counts as off screen.
         var onScreen = InView(position, out var inOptic) && !Occlusion.IsHidden(player);
+
+        // Local bots in a fight: semi-auto shots and reloads wait on arms-animator events,
+        // and the muzzle position comes from the animated skeleton. Events are fired for the
+        // whole stretch an update covers (AnimationEventsContainer), so a slower animator
+        // fires them late, never skips them: one you can see animates every frame, one you
+        // can't at least FightingRate, which keeps them at most 33 ms late.
+        var memory = player.AIData?.BotOwner?.Memory;
+        var fighting = memory != null && (memory.HaveEnemy || memory.IsUnderFire);
+        if (fighting && onScreen)
+        {
+            reason = FullRate.Fighting;
+            return 0f;
+        }
 
         // The step source's range is set from the bot's movement, gear and the player's
         // hearing each time it plays a step.
@@ -216,7 +372,7 @@ internal static class AnimatorThrottle
             _audibleRange = Mathf.Min(source.MaxDistance, MaxAudibleRange);
         }
 
-        return ThrottleMath.Interval(
+        var interval = ThrottleMath.Interval(
             distance,
             onScreen,
             inOptic ? _opticZoom : _mainZoom,
@@ -226,6 +382,7 @@ internal static class AnimatorThrottle
             Plugin.LowestVisibleRate.Value,
             Plugin.OffscreenRate.Value,
             Plugin.FootstepRate.Value);
+        return fighting ? Mathf.Min(interval, 1f / FightingRate) : interval;
     }
 
     internal static bool HasCamera => _hasCamera;
@@ -297,11 +454,7 @@ internal static class AnimatorThrottle
             if (IsAlive(state.Body)) state.Body!.Update(dt);
             if (IsAlive(state.Arms)) state.Arms!.Update(dt);
 
-            if (state.DeferArms)
-            {
-                if (IsAlive(player.ArmsAnimatorCommon)) player.ArmsAnimatorCommon.Update(dt);
-                player.UnderbarrelWeaponArmsAnimator?.Update(dt);
-            }
+            if (state.DeferArms) UpdateDeferredArms(player, dt);
         }
         finally
         {
@@ -312,15 +465,23 @@ internal static class AnimatorThrottle
         _stepTicks += Stopwatch.GetTimestamp() - start;
     }
 
-    private static void Release(Player player, State state)
+    // Hands the animators back to Unity. True when that takes one more frame (a last Unity
+    // step catching up); the state is dropped after it.
+    private static bool Release(Player player, State state)
     {
-        // Catch up first so the pose is current when Unity takes over again next frame.
-        state.Pending += Time.deltaTime;
+        // Catch up first so the pose is current when Unity takes over again.
+        if (StartUnityStep(player, state, Time.deltaTime))
+        {
+            state.Releasing = true;
+            return true;
+        }
+
         Step(player, state);
         GiveBack(state.Body);
         GiveBack(state.Arms);
         state.Body = null;
         state.Arms = null;
+        return false;
     }
 
     private static void GiveBack(IAnimator? animator)
@@ -338,8 +499,12 @@ internal static class AnimatorThrottle
         _frame = Time.frameCount;
 
         Throttled = _throttled;
+        FullInView = _fullInView;
+        FullFighting = _fullFighting;
+        FullOther = _fullOther;
+        _fullInView = _fullFighting = _fullOther = 0;
         Steps = _steps;
-        StepMs = _stepTicks * 1000.0 / Stopwatch.Frequency;
+        StepMs = _stepTicks * Diagnostics.TickMs;
         _throttled = 0;
         _steps = 0;
         _stepTicks = 0;

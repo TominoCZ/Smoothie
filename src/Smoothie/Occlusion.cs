@@ -15,20 +15,18 @@ namespace Smoothie;
 // close (Factory) that is most of the bots, most of the time. This works out which of them
 // you actually can't see: outside the view, or with every line from the camera to the head,
 // chest, hands, shoulders, hips, legs and gun muzzle blocked by walls. Those skip the IK and
-// animate like off-screen bots. Rendering is left alone, so shadows still show.
+// animate like off-screen bots. Rendering is left alone, so shadows still show. Lines are
+// cast a few times a second per bot (see Sight), never for bots outside the view.
 internal static class Occlusion
 {
     private sealed class State
     {
+        public readonly Sight Sight;
         public int Frame = -1;
         public bool Hidden;
 
-        // When every line was first blocked; -1 while any gets through.
-        public float BlockedSince = -1f;
+        public State(Player player) => Sight = new Sight(() => AnyLineClear(player), Random.Range(0.8f, 1.2f));
     }
-
-    // Blocked this long before a bot counts as hidden. Coming back into view is instant.
-    private const float HideDelay = 0.25f;
 
     // See-through hits passed before giving up on a line.
     private const int MaxHops = 4;
@@ -80,7 +78,7 @@ internal static class Occlusion
         if (!AnimatorThrottle.HasCamera || !AnimatorThrottle.IsBot(player)) return false;
         if (player.HealthController?.IsAlive != true) return false;
 
-        var state = States.GetOrCreateValue(player);
+        var state = States.GetValue(player, p => new State(p));
         if (state.Frame == Time.frameCount) return state.Hidden;
         state.Frame = Time.frameCount;
 
@@ -90,7 +88,7 @@ internal static class Occlusion
             HiddenCount = _hiddenCount;
             _hiddenCount = 0;
             Rays = _rays;
-            Ms = _ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            Ms = _ticks * Diagnostics.TickMs;
             _rays = 0;
             _ticks = 0;
         }
@@ -99,25 +97,13 @@ internal static class Occlusion
         var position = player.Position;
         if (Vector3.Distance(position, AnimatorThrottle.CameraPosition) > EFTHardSettings.Instance.CULL_GROUNDER)
         {
-            state.BlockedSince = -1f;
             state.Hidden = false;
             return false;
         }
 
         var start = System.Diagnostics.Stopwatch.GetTimestamp();
-        var blocked = !AnimatorThrottle.InView(position, out _) || !AnyLineClear(player);
+        state.Hidden = state.Sight.Hidden(Time.time, AnimatorThrottle.InView(position, out _));
         _ticks += System.Diagnostics.Stopwatch.GetTimestamp() - start;
-        if (!blocked)
-        {
-            state.BlockedSince = -1f;
-            state.Hidden = false;
-        }
-        else
-        {
-            if (state.BlockedSince < 0f) state.BlockedSince = Time.time;
-            state.Hidden = Time.time - state.BlockedSince >= HideDelay;
-        }
-
         if (state.Hidden) _hiddenCount++;
         return state.Hidden;
     }
@@ -186,11 +172,13 @@ internal static class Occlusion
             _ => false,
         };
 
+        // Bots' colliders come and go all raid; a full cache starts over instead of growing.
+        if (SeeThroughCache.Count >= 4096) SeeThroughCache.Clear();
         SeeThroughCache[collider] = seeThrough;
         return seeThrough;
     }
 
-    // Player.VisualPass (and Fika's ObservedVisualPass) decide whether to run IK with
+    // Player.VisualPass decides whether to run IK with
     // "IsVisible && distance <= CULL_GROUNDER". Only that one read is swapped, so nothing
     // else in the game (muzzle effects, AI, sounds) sees a different visibility.
     private class IkVisibilityPatch : ModulePatch
@@ -203,7 +191,7 @@ internal static class Occlusion
             SwapIsVisible(code, __originalMethod);
 
         // Swaps the one Player.IsVisible read for VisibleForIk. Anything else (none, several,
-        // or a getter that isn't a plain bool property, e.g. after a game or Fika update) and
+        // or a getter that isn't a plain bool property, e.g. after a game update) and
         // the method is left exactly as it was.
         internal static IEnumerable<CodeInstruction> SwapIsVisible(IEnumerable<CodeInstruction> code, MethodBase original)
         {
@@ -234,18 +222,21 @@ internal static class Occlusion
         }
     }
 
-    // Only enabled when Fika is installed (Target() finds the type by name, no reference).
-    internal class ObservedIkVisibilityPatch : ModulePatch
-    {
-        internal static MethodBase? Target() =>
-            AccessTools.TypeByName("Fika.Core.Main.Players.ObservedPlayer") is { } type && typeof(Player).IsAssignableFrom(type)
-                ? AccessTools.DeclaredMethod(type, "ObservedVisualPass") is { IsStatic: false } method ? method : null
-                : null;
+    // Fika's ObservedVisualPass, when Fika is installed (found by name, no reference). Only the
+    // cost overlay times it; Smoothie doesn't change it.
+    internal static MethodBase? ObservedVisualPass() =>
+        Plugin.FindType("Fika.Core.Main.Players.ObservedPlayer") is { } type && typeof(Player).IsAssignableFrom(type)
+            ? AccessTools.DeclaredMethod(type, "ObservedVisualPass") is { IsStatic: false } method ? method : null
+            : null;
 
-        protected override MethodBase GetTargetMethod() => Target()!;
-
-        [PatchTranspiler]
-        private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> code, MethodBase __originalMethod) =>
-            IkVisibilityPatch.SwapIsVisible(code, __originalMethod);
-    }
+    // Disabled: skipping IK for hidden bots on a Fika client meant changing Fika's own code,
+    // and fixing another mod isn't Smoothie's place.
+    // internal class ObservedIkVisibilityPatch : ModulePatch
+    // {
+    //     protected override MethodBase GetTargetMethod() => ObservedVisualPass()!;
+    //
+    //     [PatchTranspiler]
+    //     private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> code, MethodBase __originalMethod) =>
+    //         IkVisibilityPatch.SwapIsVisible(code, __originalMethod);
+    // }
 }

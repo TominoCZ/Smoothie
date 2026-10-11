@@ -1,11 +1,18 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
+using Comfort.Common;
 using EFT;
 using EFT.Animations;
 using EFT.Interactive;
+using EFT.UI;
 using HarmonyLib;
 using SPT.Reflection.Patching;
 using Systems.Effects;
 using UnityEngine;
+using UnityEngine.Video;
 
 namespace Smoothie;
 
@@ -19,6 +26,162 @@ internal static class HotPaths
         new MuzzleAttenuationPatch().Enable();
         new CorpseStillPatch().Enable();
         new ObservedCorpseStillPatch().Enable();
+        new MuzzleShadowsPatch().Enable();
+        new BotCreationDataLeakPatch().Enable();
+        new SpawnDelaysLeakPatch().Enable();
+        new DispatcherStopLeakPatch().Enable();
+        new MenuVideoPatch().Enable();
+        new MenuVideoInitPatch().Enable();
+    }
+
+    // One of the main menu's backgrounds (VideoEnvironmentUIRoot) is four 2048x1024 60 fps
+    // video loops. Its Init moves the video players out of the background, and the menu hides
+    // the background for a raid by switching off only the background itself, so the videos
+    // played on for the whole raid. Under Proton that's FFmpeg decoding them in software on
+    // 2-3 cores, the main thread's cores: 80 fps instead of 180 whenever the menu had picked
+    // that background. Paused while the background is hidden, played again when it's shown.
+    private static readonly AccessTools.FieldRef<EnvironmentUI, EnvironmentUIRoot> CurrentEnvironment =
+        AccessTools.FieldRefAccess<EnvironmentUI, EnvironmentUIRoot>("_currentEnvironment");
+
+    private static readonly AccessTools.FieldRef<VideoEnvironmentUIRoot, VideoPlayer[]> EnvironmentVideos =
+        AccessTools.FieldRefAccess<VideoEnvironmentUIRoot, VideoPlayer[]>("_videoPlayers");
+
+    // For the overlay. Only the menu background's few players, emptied whenever it's shown.
+    private static readonly List<VideoPlayer> PausedMenuVideos = new();
+
+    internal static int PausedMenuVideoCount => PausedMenuVideos.Count(v => v != null && v.isPaused);
+
+    private static readonly AccessTools.FieldRef<EnvironmentUI, bool> EnvironmentShown =
+        AccessTools.FieldRefAccess<EnvironmentUI, bool>("_lastVisibleStateEnvironment");
+
+    // Paused while hidden and this fix is on; everything paused here plays again otherwise.
+    private static void SyncMenuVideos(EnvironmentUIRoot? environment, bool shown)
+    {
+        try
+        {
+            var pause = !shown && Plugin.On(Plugin.HotPathFixes);
+            if (!pause)
+            {
+                foreach (var player in PausedMenuVideos)
+                {
+                    if (player != null && player.isPaused) player.Play();
+                }
+
+                PausedMenuVideos.Clear();
+                return;
+            }
+
+            if (environment is not VideoEnvironmentUIRoot root || EnvironmentVideos(root) is not { } players) return;
+            foreach (var player in players)
+            {
+                if (player == null || !Playing(player)) continue;
+                player.Pause();
+                if (!PausedMenuVideos.Contains(player)) PausedMenuVideos.Add(player);
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Fail(Plugin.HotPathFixes, ex);
+        }
+    }
+
+    // Playing, or about to start by itself (still loading with play-on-awake). A stopped
+    // video is left alone, so resuming never starts one that wasn't playing.
+    private static bool Playing(VideoPlayer player) =>
+        player.isPlaying || player.playOnAwake && player.isActiveAndEnabled && !player.isPaused && !player.isPrepared;
+
+    // After a settings change (the fix or the A/B switch flipped mid-raid), and every few
+    // seconds in raid for a video that started late: the background isn't hidden or shown
+    // again until the raid ends, so apply its current state now.
+    internal static void ResyncMenuVideos()
+    {
+        if (!MonoBehaviourSingleton<EnvironmentUI>.Instantiated) return;
+        var ui = MonoBehaviourSingleton<EnvironmentUI>.Instance;
+        SyncMenuVideos(CurrentEnvironment(ui), EnvironmentShown(ui));
+    }
+
+    // Raid HUD and hideout hide the background, the menu shows it again.
+    private class MenuVideoPatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod() =>
+            AccessTools.Method(typeof(EnvironmentUI), nameof(EnvironmentUI.ShowEnvironment));
+
+        [PatchPostfix]
+        private static void Postfix(EnvironmentUI __instance, bool value) => SyncMenuVideos(CurrentEnvironment(__instance), value);
+    }
+
+    // A background is loaded asynchronously and shown or hidden before its Init collects the
+    // video players, so one that finishes loading while hidden (a raid starting) would play.
+    private class MenuVideoInitPatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod() =>
+            AccessTools.Method(typeof(VideoEnvironmentUIRoot), nameof(VideoEnvironmentUIRoot.Init));
+
+        [PatchPostfix]
+        private static void Postfix(VideoEnvironmentUIRoot __instance)
+        {
+            if (!__instance.gameObject.activeSelf) SyncMenuVideos(__instance, false);
+        }
+    }
+
+    // Every BotCreationData (one per spawn attempt, with its bots' whole profiles) and every
+    // raid's SpawnDelaysService (its queue of waiting bots, and through their callbacks the
+    // raid's BotSpawner) subscribes to GlobalEventDispatcher.OnStopBotSpawn. The dispatcher
+    // lives as long as the game, nothing ever raises that event (no caller in the game or any
+    // installed mod), and the dispatcher's Stop() at raid end clears every event but this one:
+    // all of it stayed in memory until the game was closed, gigabytes after a Horde raid.
+    // Unsubscribed as soon as it's made (the event never fires, so nothing else changes), and
+    // the event cleared at raid end for anything that subscribed while this was off.
+    private static readonly AccessTools.FieldRef<GlobalEventDispatcher, Action> StopBotSpawnEvent =
+        AccessTools.FieldRefAccess<GlobalEventDispatcher, Action>("_onStopBotSpawn");
+
+    private class BotCreationDataLeakPatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod() =>
+            AccessTools.Constructor(typeof(BotCreationData), new[] { typeof(IGetProfileData) });
+
+        [PatchPostfix]
+        private static void Postfix(BotCreationData __instance)
+        {
+            try
+            {
+                if (Plugin.On(Plugin.HotPathFixes)) Singleton<GlobalEventDispatcher>.Instance.OnStopBotSpawn -= __instance.StopSpawn;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Fail(Plugin.HotPathFixes, ex);
+            }
+        }
+    }
+
+    private class SpawnDelaysLeakPatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod() => AccessTools.Constructor(typeof(SpawnDelaysService));
+
+        [PatchPostfix]
+        private static void Postfix(SpawnDelaysService __instance)
+        {
+            try
+            {
+                if (Plugin.On(Plugin.HotPathFixes)) Singleton<GlobalEventDispatcher>.Instance.OnStopBotSpawn -= __instance.ClearDelays;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Fail(Plugin.HotPathFixes, ex);
+            }
+        }
+    }
+
+    private class DispatcherStopLeakPatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod() =>
+            AccessTools.Method(typeof(GlobalEventDispatcher), nameof(GlobalEventDispatcher.Stop));
+
+        [PatchPostfix]
+        private static void Postfix(GlobalEventDispatcher __instance)
+        {
+            if (Plugin.On(Plugin.HotPathFixes)) StopBotSpawnEvent(__instance) = null!;
+        }
     }
 
     // A corpse's ragdoll simulates until all its parts sleep, or 15 s (30 s for Fika's
@@ -32,7 +195,7 @@ internal static class HotPaths
         [PatchPostfix]
         private static void Postfix(float timePass, ref bool __result)
         {
-            if (!__result && timePass >= Plugin.CorpseSettleTime.Value) __result = true;
+            if (Plugin.Fixing && !__result && timePass >= Plugin.CorpseSettleTime.Value) __result = true;
         }
     }
 
@@ -49,7 +212,7 @@ internal static class HotPaths
         [PatchPostfix]
         private static void Postfix(ObservedCorpse __instance, float timePass, ref bool __result)
         {
-            if (__result || timePass < Plugin.CorpseSettleTime.Value) return;
+            if (!Plugin.Fixing || __result || timePass < Plugin.CorpseSettleTime.Value) return;
             __result = true;
             IsStill(__instance) = true;
         }
@@ -70,7 +233,7 @@ internal static class HotPaths
         [PatchPrefix]
         private static bool Prefix(ProceduralWeaponAnimation __instance, Player player)
         {
-            if (!Plugin.HotPathFixes.Value || player.IsYourPlayer || Strategy(__instance) is not ThirdPersonStrategy) return true;
+            if (!Plugin.On(Plugin.HotPathFixes) || player.IsYourPlayer || Strategy(__instance) is not ThirdPersonStrategy) return true;
 
             __instance.ResetFovAdjustments(player);
             player.RibcageScaleCurrent = 1f;
@@ -91,7 +254,7 @@ internal static class HotPaths
         [PatchPrefix]
         private static void Prefix(AICoreController __instance)
         {
-            if (!Plugin.HotPathFixes.Value || __instance._listToDel.Count == 0) return;
+            if (!Plugin.On(Plugin.HotPathFixes) || __instance._listToDel.Count == 0) return;
 
             foreach (var agent in __instance._listToDel) __instance._listAgents.Remove(agent);
             __instance._listToDel.Clear();
@@ -111,10 +274,51 @@ internal static class HotPaths
         [PatchPrefix]
         private static bool Prefix()
         {
-            if (!Plugin.HotPathFixes.Value) return true;
+            if (!Plugin.On(Plugin.HotPathFixes)) return true;
             if (_frame == Time.frameCount) return false;
             _frame = Time.frameCount;
             return true;
+        }
+    }
+
+    // A muzzle flash is a light. If its weapon's prefab gives it shadows, every shot renders
+    // the scene around it into a shadow map, 6 times for a point light, for the few frames
+    // it's lit: shadow draws more than doubled (2.3k to 5.4k) in a fight. Other players'
+    // flashes still light things up, just without shadows; your own gun's are left alone.
+    private class MuzzleShadowsPatch : ModulePatch
+    {
+        // As the prefab had them, to put back when the setting is switched off.
+        private static readonly ConditionalWeakTable<MuzzleLight, LightShadows[]> Original = new();
+        private static bool _touched;
+
+        protected override MethodBase GetTargetMethod() =>
+            AccessTools.Method(typeof(MuzzleLight), nameof(MuzzleLight.OnShot));
+
+        [PatchPostfix]
+        private static void Postfix(MuzzleLight __instance)
+        {
+            try
+            {
+                var lights = __instance.Lights;
+                var on = Plugin.On(Plugin.NoMuzzleShadows);
+                // Off and never switched on this session: nothing to put back.
+                if (lights == null || !on && !_touched) return;
+                _touched = true;
+                var original = Original.GetValue(__instance, m => Array.ConvertAll(m.Lights, l => l ? l.shadows : LightShadows.None));
+
+                // Checked every shot, not cached: weapons are pooled and change hands.
+                var me = on ? Singleton<GameWorld>.Instance?.MainPlayer : null;
+                var off = on && !(me != null && __instance.transform.IsChildOf(me.Transform.Original));
+                for (var i = 0; i < lights.Length && i < original.Length; i++)
+                {
+                    var wanted = off ? LightShadows.None : original[i];
+                    if (lights[i] && lights[i].shadows != wanted) lights[i].shadows = wanted;
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Fail(Plugin.NoMuzzleShadows, ex);
+            }
         }
     }
 }
