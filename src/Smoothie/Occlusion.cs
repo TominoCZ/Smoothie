@@ -15,20 +15,18 @@ namespace Smoothie;
 // close (Factory) that is most of the bots, most of the time. This works out which of them
 // you actually can't see: outside the view, or with every line from the camera to the head,
 // chest, hands, shoulders, hips, legs and gun muzzle blocked by walls. Those skip the IK and
-// animate like off-screen bots. Rendering is left alone, so shadows still show.
+// animate like off-screen bots. Rendering is left alone, so shadows still show. Lines are
+// cast a few times a second per bot (see Sight), never for bots outside the view.
 internal static class Occlusion
 {
     private sealed class State
     {
+        public readonly Sight Sight;
         public int Frame = -1;
         public bool Hidden;
 
-        // When every line was first blocked; -1 while any gets through.
-        public float BlockedSince = -1f;
+        public State(Player player) => Sight = new Sight(() => AnyLineClear(player), Random.Range(0.8f, 1.2f));
     }
-
-    // Blocked this long before a bot counts as hidden. Coming back into view is instant.
-    private const float HideDelay = 0.25f;
 
     // See-through hits passed before giving up on a line.
     private const int MaxHops = 4;
@@ -80,7 +78,7 @@ internal static class Occlusion
         if (!AnimatorThrottle.HasCamera || !AnimatorThrottle.IsBot(player)) return false;
         if (player.HealthController?.IsAlive != true) return false;
 
-        var state = States.GetOrCreateValue(player);
+        var state = States.GetValue(player, p => new State(p));
         if (state.Frame == Time.frameCount) return state.Hidden;
         state.Frame = Time.frameCount;
 
@@ -90,7 +88,7 @@ internal static class Occlusion
             HiddenCount = _hiddenCount;
             _hiddenCount = 0;
             Rays = _rays;
-            Ms = _ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            Ms = _ticks * Diagnostics.TickMs;
             _rays = 0;
             _ticks = 0;
         }
@@ -99,25 +97,13 @@ internal static class Occlusion
         var position = player.Position;
         if (Vector3.Distance(position, AnimatorThrottle.CameraPosition) > EFTHardSettings.Instance.CULL_GROUNDER)
         {
-            state.BlockedSince = -1f;
             state.Hidden = false;
             return false;
         }
 
         var start = System.Diagnostics.Stopwatch.GetTimestamp();
-        var blocked = !AnimatorThrottle.InView(position, out _) || !AnyLineClear(player);
+        state.Hidden = state.Sight.Hidden(Time.time, AnimatorThrottle.InView(position, out _));
         _ticks += System.Diagnostics.Stopwatch.GetTimestamp() - start;
-        if (!blocked)
-        {
-            state.BlockedSince = -1f;
-            state.Hidden = false;
-        }
-        else
-        {
-            if (state.BlockedSince < 0f) state.BlockedSince = Time.time;
-            state.Hidden = Time.time - state.BlockedSince >= HideDelay;
-        }
-
         if (state.Hidden) _hiddenCount++;
         return state.Hidden;
     }
@@ -186,6 +172,8 @@ internal static class Occlusion
             _ => false,
         };
 
+        // Bots' colliders come and go all raid; a full cache starts over instead of growing.
+        if (SeeThroughCache.Count >= 4096) SeeThroughCache.Clear();
         SeeThroughCache[collider] = seeThrough;
         return seeThrough;
     }
@@ -238,7 +226,7 @@ internal static class Occlusion
     internal class ObservedIkVisibilityPatch : ModulePatch
     {
         internal static MethodBase? Target() =>
-            AccessTools.TypeByName("Fika.Core.Main.Players.ObservedPlayer") is { } type && typeof(Player).IsAssignableFrom(type)
+            Plugin.FindType("Fika.Core.Main.Players.ObservedPlayer") is { } type && typeof(Player).IsAssignableFrom(type)
                 ? AccessTools.DeclaredMethod(type, "ObservedVisualPass") is { IsStatic: false } method ? method : null
                 : null;
 
