@@ -17,6 +17,7 @@ changing what bots do. AI, sounds and bullets work as before.
 | Small gear on distant bots (sights, pouches, patches) | always drawn | **skipped** beyond 60 m; lasers and lights stay |
 | Weapon of a bot the game has culled | still drawn | **hidden** with the body |
 | Corpse ragdolls | simulate 15–30 s | settle after **5 s** |
+| Buildings, walls and furniture hidden behind nearer ones (most maps) | drawn | **not drawn** beyond 10 m, checked against the last frame's depth (your scope's view too) |
 | Horde-sized bot counts when you host | hundreds of spawn attempts every 15 s, freezes | **only as many as fit**, gear built a little per frame |
 | Backend requests | new TLS connection each time | **one kept-alive connection** |
 
@@ -47,7 +48,7 @@ Extract the release zip into your SPT folder. That puts `Smoothie.dll` here:
 <SPT>/BepInEx/plugins/Smoothie/
 ```
 
-`BepInEx/LogOutput.log` shows `Loading [Smoothie 1.0.1]` at startup. In raid as a Fika
+`BepInEx/LogOutput.log` shows `Loading [Smoothie 1.0.2]` at startup. In raid as a Fika
 client it also logs:
 
 ```
@@ -69,21 +70,24 @@ and experimental options.
 | Hide guns of bots that are not drawn | on | the gun disappears along with the bot it belongs to |
 | *advanced:* simplify distance, animation distances and rates, hearing distance | 60 m · 40/200 m · 15/10/30 per s · 60 m | fine-tuning for the above |
 | **2. Bot spawning (when you host)** | | only matters when bots run on your PC |
-| Limit spawn attempts to free bot slots | on | stops the game trying to spawn hundreds of bots at once (Horde mode) |
+| Limit spawn attempts to free bot slots | on | stops the game trying to spawn hundreds of bots at once (Horde mode), and from asking for bots at all in a raid set to no bots (Fika's No AI) |
 | Load new bots a bit at a time | on | builds new bots' gear a little per frame instead of freezing; with the frame rate limit off, sizes the game's work queue by the display's refresh rate instead of the menu's limit (spawn waves no longer pull raids down to 60 fps) |
 | *advanced:* Load new bots on another CPU core (experimental) | off | experimental: does that on another CPU core |
 | **3. Other fixes** | | |
 | Corpses stop moving after | 5 s | vanilla 15 s (30 s in Fika) |
-| Remove small CPU waste in game code | on | removes per-frame waste in the game's own code; pauses the main menu's video background while it's hidden (it kept playing through raids, 2-3 CPU cores under Proton); stops every bot the game tried to spawn from staying in memory until the game is closed |
+| Remove small CPU waste in game code | on | removes per-frame waste in the game's own code; pauses the main menu's video background while it's hidden (it kept playing through raids, 2-3 CPU cores under Proton); stops every bot the game tried to spawn from staying in memory until the game is closed; prepares the indoor lighting only for cameras that are actually drawing (it was redone every frame for scope and menu cameras too) |
 | Muzzle flashes of others cast no shadows | on | other players' and bots' muzzle flashes light things up without casting shadows; shadow work more than doubled in fights. Your own gun is untouched |
+| Hide objects covered by nearer ones (experimental) | on | level objects at least 10 m away stop drawing while last frame's depth shows them completely covered by something nearer; checked on another CPU core against a small copy of the depth the grass system already builds. Shadows don't change (covered objects keep casting theirs). Something coming into view can appear a few frames late, only when you move. While you aim through a scope, what the scope sees must be covered in its own view too. Doors, loot, players and anything that moves are left alone |
 | Prevent memory cleanup stutters in raids | off | SPT turns memory cleanup back on when you open your inventory and leaves it on, which stutters every minute or two; this lets that cleanup finish, then pauses it again (one more runs if 4 GB of garbage piles up). Does nothing on PCs below the game's own RAM limit for pausing cleanup (25 GB by default), and gives up for the raid if something else switches cleanup back on right after every pause (inventory opens don't count) |
 | Keep server connection open (faster menus) | on | one kept-open connection to the SPT server |
 | **4. Overlay and logs** (advanced) | | all off by default, shown with "Show advanced settings" |
-| Turn off all fixes (A/B test) | off | runs the game as without Smoothie, leaving your settings alone; overlay and logs keep working. Switched on mid-raid, the bot spawning fixes stay on for that raid. Always starts off |
+| Turn off all fixes (A/B test) | off | runs the game as without Smoothie, leaving your settings alone; overlay and logs keep working. Switched on mid-raid, the bot spawning fixes stay on for that raid; the hidden menu background videos stay paused either way. Always starts off |
 | Show performance overlay | off | what each frame is spent on, with a graph per part; toggle a setting and watch it change |
 | Log stutters and their causes | off | writes each stutter and its cause to the BepInEx log |
 | Log time per script (slow) | off | names the script behind each stutter in the log; costs frame time while on |
 | Show text stats panel | off | a text panel with frame timings, memory and bot counts |
+| Show hiding cells and hidden objects (debug) | off | outlines static level objects within 150 m: red hidden, yellow something behind it shows. Never loot, players or anything that moves |
+| Show the depth image hiding uses | off | the small depth image the hiding tests against, and the scope's own while aiming |
 
 Settings were renamed in 1.0.1, so values saved by 1.0.0 reset to these defaults once.
 

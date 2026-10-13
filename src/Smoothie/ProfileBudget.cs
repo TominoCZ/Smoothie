@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using EFT;
+using EFT.Bots;
 using HarmonyLib;
 using SPT.Reflection.Patching;
 using UnityEngine;
@@ -178,6 +179,12 @@ internal static class ProfileBudget
     private const int SpawnBuffer = 10;
     private static (int, int, int, int) _lastSpawnCheck;
 
+    // The raid's own setting, on the host (the only place the spawn check runs): the menu's
+    // "no bots" sets it, and so does Fika's No AI before the raid is created.
+    private static bool NoBotsRaid() =>
+        TarkovApplication.Exist(out var app) && app.CurrentRaidSettings is { } raid
+        && (raid.BotSettings.BotAmount == EBotAmount.NoBots || raid.WavesSettings.BotAmount == EBotAmount.NoBots);
+
     private class SpawnCheckPatch : ModulePatch
     {
         protected override MethodBase GetTargetMethod() =>
@@ -191,7 +198,15 @@ internal static class ProfileBudget
                 var spawner = botsController?.BotSpawner;
                 if (spawner == null) return;
                 var wanted = botFreeSlotsCount;
-                if (Plugin.On(Plugin.CapSpawnAttempts) && spawner.MaxBots > 0)
+                if (Plugin.On(Plugin.CapSpawnAttempts) && NoBotsRaid())
+                {
+                    // A raid set to no bots (the menu's "no bots", Fika's No AI) still runs the
+                    // spawn check, sized by the map rather than the raid, and its bot limit is 0,
+                    // which the spawner reads as "no limit": it kept asking the server for a
+                    // map's worth of bot profiles every check.
+                    botFreeSlotsCount = 0;
+                }
+                else if (Plugin.On(Plugin.CapSpawnAttempts) && spawner.MaxBots > 0)
                 {
                     var room = spawner.MaxBots - spawner.AllBotsWithDelayed + SpawnBuffer;
                     botFreeSlotsCount = Math.Max(0, Math.Min(botFreeSlotsCount, room));
@@ -224,6 +239,8 @@ internal static class ProfileBudget
         protected override MethodBase GetTargetMethod() =>
             AccessTools.Method(typeof(Diz.Jobs.JobScheduler), nameof(Diz.Jobs.JobScheduler.SetTargetFrameRate));
 
+        private static double _loggedHz;
+
         [PatchPostfix]
         private static void Postfix(Diz.Jobs.JobScheduler __instance, int frameRate)
         {
@@ -233,7 +250,12 @@ internal static class ProfileBudget
                 var hz = Screen.currentResolution.refreshRateRatio.value;
                 if (hz < 30.0) return;
                 __instance.FrameTicks = TimeSpan.FromMilliseconds(1000.0 / hz).Ticks;
-                if (Diagnostics.Logging) Plugin.Log.LogInfo($"job scheduler: no frame limit, budget from the display ({hz:0} Hz) instead of the menu's limit");
+                // The game sets it again and again; say so once per refresh rate.
+                if (Diagnostics.Logging && Math.Abs(hz - _loggedHz) > 0.5)
+                {
+                    _loggedHz = hz;
+                    Plugin.Log.LogInfo($"job scheduler: no frame limit, budget from the display ({hz:0} Hz) instead of the menu's limit");
+                }
             }
             catch (Exception ex)
             {

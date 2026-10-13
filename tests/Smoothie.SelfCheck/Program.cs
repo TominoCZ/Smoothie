@@ -149,6 +149,54 @@ foreach (System.Text.RegularExpressions.Match m in binds)
     }
 }
 
+// Far objects against the depth: larger is nearer, rows upside down.
+var depth = new float[4 * 4];
+for (var i = 0; i < depth.Length; i++) depth[i] = 0.3f;      // a wall everywhere
+Check(DepthCover.Test(depth, 4, 4, 0.1f, 0.1f, 0.4f, 0.4f, 0.01f) == DepthCover.Covered, "box behind a wall isn't covered");
+Check(DepthCover.Test(depth, 4, 4, 0.1f, 0.1f, 0.4f, 0.4f, 0.5f) == DepthCover.ShowsBehind, "box in front of the wall is covered");
+depth[3 * 4 + 0] = 0f;                                         // sky in the bottom-left texel (last row in memory)
+Check(DepthCover.Test(depth, 4, 4, 0.0f, 0.0f, 0.2f, 0.2f, 0.01f) == DepthCover.ShowsBehind, "box with sky under its corner is covered");
+Check(DepthCover.Test(depth, 4, 4, 0.0f, 0.8f, 0.2f, 0.95f, 0.01f) == DepthCover.Covered, "upside-down rows: top-left box sees the bottom-left sky");
+Check(DepthCover.Test(depth, 4, 4, 0.3f, 0.0f, 0.45f, 0.24f, 0.01f) == DepthCover.Covered, "box ending inside texel 1 also tests texel 2 (sky next door)");
+depth[3 * 4 + 1] = 0f;                                         // sky right of it, in texel x=1
+Check(DepthCover.Test(depth, 4, 4, 0.5f, 0.0f, 0.75f, 0.2f, 0.01f) == DepthCover.Covered, "box ending exactly on a texel edge tests the next texel");
+Check(DepthCover.Test(depth, 4, 4, 0.2f, 0.0f, 0.3f, 0.2f, 0.01f) == DepthCover.ShowsBehind, "box over the sky texel is covered");
+Check(DepthCover.Test(depth, 4, 4, -0.5f, 0.1f, -0.1f, 0.4f, 0.01f) == DepthCover.OffScreen, "box off the screen is covered");
+
+// The pyramid gives exactly the fine test's answer: random walls, sky and near things on a 37x23 image.
+var random = new Random(7);
+const int pw = 37, ph = 23;
+var image = new float[pw * ph];
+var pyramid = new DepthPyramid();
+var mismatches = 0;
+for (var round = 0; round < 200; round++)
+{
+    var wall = 0.05f + (float)random.NextDouble() * 0.3f;
+    for (var i = 0; i < image.Length; i++)
+    {
+        var roll = random.NextDouble();
+        image[i] = roll < 0.03 ? 0f : roll < 0.06 ? 0.95f : wall + (float)random.NextDouble() * 0.02f;
+    }
+
+    // Some rounds: one big wall with no holes, so the coarse levels decide.
+    if (round % 3 == 0) for (var i = 0; i < image.Length; i++) image[i] = wall;
+    pyramid.Build(image, pw, ph);
+    for (var box = 0; box < 200; box++)
+    {
+        float x = (float)random.NextDouble() * 1.2f - 0.1f, y = (float)random.NextDouble() * 1.2f - 0.1f;
+        float bw = (float)random.NextDouble() * 0.6f, bh = (float)random.NextDouble() * 0.6f;
+        var nearest = (float)random.NextDouble() * 0.3f;
+        if (pyramid.Test(x, y, x + bw, y + bh, nearest) != DepthCover.Test(image, pw, ph, x, y, x + bw, y + bh, nearest)) mismatches++;
+    }
+}
+
+Check(mismatches == 0, $"depth pyramid disagrees with the fine test {mismatches} times");
+for (var i = 0; i < image.Length; i++) image[i] = 0.3f;
+image[5 * pw + 5] = 0.4f;                                     // one nearer texel inside the box
+pyramid.Build(image, pw, ph);
+Check(pyramid.Test(0.05f, 0.05f, 0.95f, 0.95f, 0.1f) == DepthCover.Covered && Math.Abs(pyramid.NearestCover - 0.4f) < 1e-6f,
+    $"nearest cover under a covered box is {pyramid.NearestCover}, not 0.4");
+
 if (failures.Count > 0)
 {
     Console.Error.WriteLine($"FAIL ({failures.Count}):");
@@ -156,7 +204,7 @@ if (failures.Count > 0)
     return 1;
 }
 
-Console.WriteLine($"OK: throttle intervals, zoom and sight-line timing behave, {binds.Count} config names are valid.");
+Console.WriteLine($"OK: throttle intervals, zoom, depth cover and the depth pyramid behave, {binds.Count} config names are valid.");
 return 0;
 
 static string SourcePath([System.Runtime.CompilerServices.CallerFilePath] string path = "") => path;

@@ -32,6 +32,86 @@ internal static class HotPaths
         new DispatcherStopLeakPatch().Enable();
         new MenuVideoPatch().Enable();
         new MenuVideoInitPatch().Enable();
+        new AmbientUpdatePatch().Enable();
+        new AmbientBufferPatch().Enable();
+        new AmbientStencilPatch().Enable();
+    }
+
+    // AmbientLight (the indoor ambient lighting) re-records two command buffers for every
+    // camera that has ever rendered, every frame in its LateUpdate: about 580 light sources
+    // checked against each camera's view. Only the main camera renders every frame; the scope
+    // and menu cameras rarely do, and what was recorded for them was thrown away unused (half
+    // of the 0.39 ms a frame it cost). Here each camera's recording waits until that camera is
+    // about to render (its pre-cull) and is skipped if it doesn't: the same buffers, recorded
+    // later in the same frame, from the camera's final position.
+    private static readonly Dictionary<Camera, (AmbientLight Light, AmbientLight.CamSettings Settings)> AmbientDue = new();
+    private static bool _ambientRecording, _ambientHooked;
+
+    private static void AmbientPreCull(Camera camera)
+    {
+        if (AmbientDue.Count == 0 || !AmbientDue.TryGetValue(camera, out var due)) return;
+        AmbientDue.Remove(camera);
+        try
+        {
+            if (due.Light == null) return;
+            due.Light.InitAmbientBuffer(due.Settings, camera);
+            due.Light.DrawStencil(due.Settings, camera);
+        }
+        catch (Exception ex)
+        {
+            Plugin.Fail(Plugin.HotPathFixes, ex);
+        }
+    }
+
+    private class AmbientUpdatePatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod() => AccessTools.Method(typeof(AmbientLight), nameof(AmbientLight.method_1));
+
+        [PatchPrefix]
+        private static void Prefix()
+        {
+            if (!Plugin.On(Plugin.HotPathFixes))
+            {
+                // Off: the game records as before; nothing left waiting for a camera.
+                AmbientDue.Clear();
+                return;
+            }
+
+            if (!_ambientHooked)
+            {
+                Camera.onPreCull += AmbientPreCull;
+                _ambientHooked = true;
+            }
+
+            // Cameras that were due but never rendered (a scope put away, a destroyed camera).
+            if (AmbientDue.Count > 16) AmbientDue.Clear();
+            _ambientRecording = true;
+        }
+
+        [PatchFinalizer]
+        private static void Finalizer() => _ambientRecording = false;
+    }
+
+    private class AmbientBufferPatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod() => AccessTools.Method(typeof(AmbientLight), nameof(AmbientLight.InitAmbientBuffer));
+
+        // Only the per-frame recording in LateUpdate waits; set-up and resizes run as they are.
+        [PatchPrefix]
+        private static bool Prefix(AmbientLight __instance, AmbientLight.CamSettings camSettings, Camera currentCamera)
+        {
+            if (!_ambientRecording) return true;
+            AmbientDue[currentCamera] = (__instance, camSettings);
+            return false;
+        }
+    }
+
+    private class AmbientStencilPatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod() => AccessTools.Method(typeof(AmbientLight), nameof(AmbientLight.DrawStencil));
+
+        [PatchPrefix]
+        private static bool Prefix() => !_ambientRecording;
     }
 
     // One of the main menu's backgrounds (VideoEnvironmentUIRoot) is four 2048x1024 60 fps
@@ -59,7 +139,8 @@ internal static class HotPaths
     {
         try
         {
-            var pause = !shown && Plugin.On(Plugin.HotPathFixes);
+            // The A/B switch doesn't bring the videos back (see Plugin.OnEvenWhenPaused).
+            var pause = !shown && Plugin.OnEvenWhenPaused(Plugin.HotPathFixes);
             if (!pause)
             {
                 foreach (var player in PausedMenuVideos)

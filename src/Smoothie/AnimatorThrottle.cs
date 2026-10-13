@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using Random = UnityEngine.Random;
 using System.Runtime.CompilerServices;
@@ -69,6 +70,12 @@ internal static class AnimatorThrottle
     private static bool _hasCamera;
     private static bool _hasOptic;
     private static Vector3 _cameraPosition;
+
+    // Other human players in the raid (Fika), refreshed once a frame. A bot this PC runs
+    // (hosting) has its walk move it through its animator, and the host sends that position
+    // to every client: a bot throttled for the host's camera moves in steps on a client
+    // standing next to it. So bots near another player are animated for that player too.
+    private static readonly List<Vector3> OtherPlayers = new();
     private static float _mainZoom = 1f;
     private static float _opticZoom = 1f;
 
@@ -106,6 +113,10 @@ internal static class AnimatorThrottle
     // once if a Fika update ever starts calling Player.LateUpdate from its own override
     // (both patches would then run).
     private static readonly ConditionalWeakTable<Player, int[]> HandledFrame = new();
+
+    // For the snapshot: did the animation step see this player in the last frame or this one.
+    internal static bool HandledRecently(Player player) =>
+        HandledFrame.TryGetValue(player, out var handled) && handled[0] >= Time.frameCount - 1;
 
     internal static void BeforeLateUpdateSafe(Player player)
     {
@@ -333,6 +344,21 @@ internal static class AnimatorThrottle
         if (ranCleanly) player.ArmsLateUpdate(deltaTime);
     }
 
+    // How far the nearest other human player is from a bot this PC runs; infinity for
+    // anyone else's bots (a Fika client's) and with no other players around.
+    internal static float OtherPlayerDistance(Player player)
+    {
+        if (!player.IsAI || OtherPlayers.Count == 0) return float.PositiveInfinity;
+        var position = player.Position;
+        var nearest = float.PositiveInfinity;
+        foreach (var other in OtherPlayers) nearest = Mathf.Min(nearest, Vector3.Distance(position, other));
+        return nearest;
+    }
+
+    // Hosting: no slower than this for a bot another player is near, so the positions sent
+    // to them (Fika's send rate is 10-30 per second) move smoothly.
+    private const float OtherPlayerRate = 30f;
+
     private static float PickInterval(Player player, out FullRate reason)
     {
         reason = FullRate.Other;
@@ -342,7 +368,17 @@ internal static class AnimatorThrottle
         // The game runs IK on top of the animator's pose here. A held pose would get IK
         // applied a second time, so these animate every frame like vanilla. The same test the
         // IK uses: close bots behind walls skip the IK (Occlusion), so they can be throttled.
-        if (distance <= EFTHardSettings.Instance.CULL_GROUNDER && Occlusion.VisibleForIk(player))
+        // Fika's observed bots run their IK in their own pass, which Smoothie leaves alone, so
+        // for them only the game's own visibility counts.
+        if (distance <= EFTHardSettings.Instance.CULL_GROUNDER
+            && (Occlusion.OwnIkPass(player) ? player.IsVisible : Occlusion.VisibleForIk(player)))
+        {
+            reason = FullRate.InView;
+            return 0f;
+        }
+
+        var otherPlayer = OtherPlayerDistance(player);
+        if (otherPlayer <= Plugin.FullRateDistance.Value)
         {
             reason = FullRate.InView;
             return 0f;
@@ -382,7 +418,9 @@ internal static class AnimatorThrottle
             Plugin.LowestVisibleRate.Value,
             Plugin.OffscreenRate.Value,
             Plugin.FootstepRate.Value);
-        return fighting ? Mathf.Min(interval, 1f / FightingRate) : interval;
+        if (fighting) interval = Mathf.Min(interval, 1f / FightingRate);
+        if (otherPlayer <= Plugin.LowestRateDistance.Value) interval = Mathf.Min(interval, 1f / OtherPlayerRate);
+        return interval;
     }
 
     internal static bool HasCamera => _hasCamera;
@@ -395,6 +433,9 @@ internal static class AnimatorThrottle
         inOptic = _hasOptic && GeometryUtility.TestPlanesAABB(OpticPlanes, bounds);
         return inOptic || GeometryUtility.TestPlanesAABB(MainPlanes, bounds);
     }
+
+    internal static bool InView(Bounds bounds) =>
+        _hasOptic && GeometryUtility.TestPlanesAABB(OpticPlanes, bounds) || GeometryUtility.TestPlanesAABB(MainPlanes, bounds);
 
     internal static float ZoomAt(Vector3 position) => InView(position, out var inOptic) && inOptic ? _opticZoom : _mainZoom;
 
@@ -516,6 +557,15 @@ internal static class AnimatorThrottle
 
         _cameraPosition = camera.transform.position;
         GeometryUtility.CalculateFrustumPlanes(camera, MainPlanes);
+
+        OtherPlayers.Clear();
+        if (Singleton<GameWorld>.Instantiated)
+        {
+            foreach (var other in Singleton<GameWorld>.Instance.AllAlivePlayersList)
+            {
+                if (other != null && !other.IsAI && !other.IsYourPlayer) OtherPlayers.Add(other.Position);
+            }
+        }
 
         var referenceFov = Singleton<SettingsManager>.Instantiated
             ? Singleton<SettingsManager>.Instance.Game.Settings.FieldOfView.Value

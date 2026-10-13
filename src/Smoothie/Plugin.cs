@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using BepInEx;
 using Comfort.Common;
@@ -12,7 +13,7 @@ using UnityEngine;
 
 namespace Smoothie;
 
-[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.1")]
+[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.2")]
 // Optional: when Fika is installed it has to load first, or its types aren't there yet when
 // Smoothie looks for them and its observed bots aren't recognised. Without Fika this does nothing.
 [BepInDependency("com.fika.core", BepInDependency.DependencyFlags.SoftDependency)]
@@ -38,6 +39,11 @@ public class Plugin : BaseUnityPlugin
     internal static ConfigEntry<float> CorpseSettleTime = null!;
     internal static ConfigEntry<bool> HotPathFixes = null!;
     internal static ConfigEntry<bool> NoMuzzleShadows = null!;
+    internal static ConfigEntry<bool> HideCovered = null!;
+    internal static ConfigEntry<bool> ShowDepth = null!;
+    // Shows static level objects behind walls; never loot, players or anything that moves
+    // (those aren't tracked), so it gives away nothing a map doesn't.
+    internal static ConfigEntry<bool> ShowCells = null!;
     internal static ConfigEntry<bool> KeepCleanupPaused = null!;
     internal static ConfigEntry<bool> SpreadProfiles = null!;
     internal static ConfigEntry<bool> ProfilesOffThread = null!;
@@ -49,6 +55,8 @@ public class Plugin : BaseUnityPlugin
     // Time spent in this plugin's own Update and OnGUI (overlay drawing, diagnostics), for
     // the cost overlay's "Smoothie itself" row.
     internal static long OwnTicks;
+    // The part of OwnTicks spent drawing the overlays (OnGUI).
+    internal static long OverlayTicks;
 
     private static ISender? _vanillaSender;
     private static BackendSender? _sender;
@@ -92,7 +100,7 @@ public class Plugin : BaseUnityPlugin
             new AcceptableValueRange<float>(0f, 200f));
 
         CapSpawnAttempts = Bind(SpawnsSection, "Limit spawn attempts to free bot slots", true,
-            "Only matters when the bots run on your PC (hosting, or solo). With high bot counts (Horde mode) the game tries to spawn hundreds of bots at once every 15 seconds, although only a few fit in, and asks the server for a bot profile for each one. That causes heavy stutters and huge memory use. With this on it only tries as many as can actually spawn. The number of bots in the raid stays the same. Switching it off mid-raid lets a flood start within seconds, and it lasts the rest of the raid.", 100);
+            "Only matters when the bots run on your PC (hosting, or solo). With high bot counts (Horde mode) the game tries to spawn hundreds of bots at once every 15 seconds, although only a few fit in, and asks the server for a bot profile for each one. That causes heavy stutters and huge memory use. With this on it only tries as many as can actually spawn. The number of bots in the raid stays the same. Switching it off mid-raid lets a flood start within seconds, and it lasts the rest of the raid. In a raid set to no bots (the menu's \"no bots\", Fika's No AI) it stops the game's spawn check from asking for bots at all.", 100);
         SpreadProfiles = Bind(SpawnsSection, "Load new bots a bit at a time", true,
             "Only matters when the bots run on your PC. Every new bot's gear is built from scratch, and doing many at once freezes the game. With this on, only a little is built per frame: no freeze, and new bots appear a moment later. Also, with the frame rate limit switched off, the game's background work queue (where much of a new bot's setup runs) gets a budget from your display's refresh rate instead of the menu's limit, so a spawn wave no longer drags the frame rate down to the menu's 60.", 90);
         ProfilesOffThread = Bind(SpawnsSection, "Load new bots on another CPU core (experimental)", false,
@@ -103,9 +111,11 @@ public class Plugin : BaseUnityPlugin
             "Dead bodies keep simulating physics until they settle, up to 15 s (30 s in Fika). Ending it sooner saves CPU in big fights; bodies have almost always landed by then.", 100, false,
             new AcceptableValueRange<float>(2f, 30f));
         HotPathFixes = Bind(other, "Remove small CPU waste in game code", true,
-            "Fixes spots where the game or a mod wastes CPU or memory: the main menu's video background is paused while it's hidden (it kept playing through raids, costing 2-3 CPU cores), and bots the game tried to spawn no longer stay in memory until the game is closed. Nothing you can see changes.", 90);
+            "Fixes spots where the game or a mod wastes CPU or memory: the main menu's video background is paused while it's hidden (it kept playing through raids, costing 2-3 CPU cores), bots the game tried to spawn no longer stay in memory until the game is closed, and the indoor lighting is no longer prepared every frame for scope and menu cameras that aren't drawing. Nothing you can see changes.", 90);
         NoMuzzleShadows = Bind(other, "Muzzle flashes of others cast no shadows", true,
             "Each shot lights up the area around the gun, and if that light casts shadows the game redraws everything nearby up to 6 times. In a big fight that more than doubles the shadow work. With this on, other players' and bots' muzzle flashes still light things up, just without shadows. Your own gun is left alone.", 85);
+        HideCovered = Bind(other, "Hide objects covered by nearer ones (experimental)", true,
+            "Most maps have no occlusion culling, so buildings, walls, cars and furniture behind nearer ones are still drawn (on Customs thousands of draw calls). With this on, level objects at least 10 m away stop drawing while the last frame's picture shows them completely covered by something nearer, checked on another CPU core. Shadows don't change: covered objects keep casting theirs. Something coming into view can appear a few frames late (about 1/50 s), only when you move, not when you turn. Doors, loot, players and anything that moves are left alone. Collecting the objects takes a moment 10 seconds into each raid.", 81);
         KeepCleanupPaused = Bind(other, "Prevent memory cleanup stutters in raids", false,
             "On PCs with enough RAM the game pauses memory cleanup during a raid, so it can't stutter in a fight. Opening your inventory (an SPT feature) runs a cleanup and leaves cleanup on for the rest of the raid, which then stutters every minute or two. With this on, that cleanup still runs, then cleanup is paused again; if 4 GB of garbage piles up, one more runs. Only in raids, and only on PCs the game itself pauses cleanup on (the server's RAM limit, 25 GB by default): below that, cleanup stays on as the game wants. If something else switches it back on right after every pause (another mod), it's left on for the rest of that raid.", 75);
         KeepBackendConnection = Bind(other, "Keep server connection open (faster menus)", true,
@@ -113,16 +123,27 @@ public class Plugin : BaseUnityPlugin
 
         // All of it for tracking down problems, so hidden unless "Show advanced settings" is ticked.
         PauseFixes = Bind(OverlaySection, "Turn off all fixes (A/B test)", false,
-            "Runs the game as if Smoothie weren't installed, without touching any of your settings above: switch it on and off and compare with the overlay. The overlay and logs keep working. Switched on before a raid, that raid runs fully without Smoothie, bot spawning fixes included. Switched on during a raid, the bot spawning fixes stay on: without them one moment in a Horde raid can ruin the rest of it. Always starts off when the game starts.", 110, true);
+            "Runs the game as if Smoothie weren't installed, without touching any of your settings above: switch it on and off and compare with the overlay. The overlay and logs keep working. Switched on before a raid, that raid runs fully without Smoothie, bot spawning fixes included. Switched on during a raid, the bot spawning fixes stay on: without them one moment in a Horde raid can ruin the rest of it. The main menu's hidden background videos stay paused either way: that's a game bug costing 2-3 CPU cores, and the comparison would mostly measure it. Always starts off when the game starts.", 110, true);
         // Never left on by accident: the mod would look installed but do nothing.
         PauseFixes.Value = false;
         ShowCosts = Bind(OverlaySection, "Show performance overlay", false,
             "Shows what each frame is spent on (bot animation, AI, scripts, rendering, ...) with a graph for each. Toggle a setting and watch its line change; yellow marks a setting change, red a memory cleanup. Costs a little performance while shown.", 100, true);
         ShowCosts.SettingChanged += (_, _) => Overlay.Apply();
+        // A/B for hiding covered objects: each flip is measured on its own (see MeasureFlip).
+        HideCovered.SettingChanged += (_, _) =>
+        {
+            _flipAt = Time.unscaledTime + 1f;
+            FlipFrames.Clear();
+            _flipDraws = 0;
+        };
         LogDrops = Bind(OverlaySection, "Log stutters and their causes", false,
             "Writes a line to the BepInEx log for every stutter, with what caused it, and a snapshot whenever the frame rate drops and stays down. Useful for bug reports.", 90, true);
         ShowStats = Bind(OverlaySection, "Show text stats panel", false,
             "A text panel with frame timings, memory and bot counts.", 80, true);
+        ShowCells = Bind(OverlaySection, "Show hiding cells and hidden objects (debug)", false,
+            "Draws through walls, within 150 m and in view, every object by its last result: red hidden, yellow something behind it shows (in your scope's view: in the scope's own depth too). Covered objects the game isn't drawing anyway aren't shown. The cells they're sorted into as faint grey outlines. Only static level objects: never loot, players or anything that moves.", 74, true);
+        ShowDepth = Bind(OverlaySection, "Show the depth image hiding uses", false,
+            "Shows the small depth image \"Hide objects covered by nearer ones\" tests against, under the overlay: brighter is nearer, black is sky or far away. Purple: what your scope sees while aiming through one, with a margin; anything there must also be covered in the scope's own depth (shown to the right), or it stays drawn. Only what's already on your screen.", 75, true);
         ProfileScripts = Bind(OverlaySection, "Log time per script (slow)", false,
             "Times every script and every stage of each frame, and writes detailed reports to the log. Costs noticeable performance while on: for tracking down a problem, not for playing.", 70, true);
         ProfileScripts.SettingChanged += (_, _) =>
@@ -155,6 +176,7 @@ public class Plugin : BaseUnityPlugin
         Safely("hot-path fixes", HotPaths.Enable);
         Safely("hidden-bot IK", Occlusion.Enable);
         Safely("bot profile budget", ProfileBudget.Enable);
+        Safely("hiding covered objects", DepthCulling.Enable);
         // Disabled, see Occlusion.ObservedIkVisibilityPatch: Fika's code is left alone.
         // Safely("Fika hidden-bot IK", () =>
         // {
@@ -189,6 +211,12 @@ public class Plugin : BaseUnityPlugin
     internal static bool On(ConfigEntry<bool> feature) =>
         feature.Value && !Broken.Contains(feature) && (Fixing || IgnoresPause(feature));
 
+    // For the menu video pause: the A/B switch leaves it on. It only stops a game bug (the
+    // hidden menu background's videos playing on through raids, 2-3 CPU cores); with it off
+    // the comparison would mostly measure those videos, not Smoothie.
+    internal static bool OnEvenWhenPaused(ConfigEntry<bool> feature) =>
+        feature.Value && !Broken.Contains(feature);
+
     // For settings that aren't on/off switches (corpse settle time).
     internal static bool Fixing => !PauseFixes.Value;
 
@@ -221,6 +249,7 @@ public class Plugin : BaseUnityPlugin
     {
         if (!On(SimplifyDistant)) DistantDetail.RestoreAll();
         if (!On(HideCulledWeapons)) HandsCulling.RestoreAll();
+        if (!On(HideCovered)) DepthCulling.ShowAll();
         HotPaths.ResyncMenuVideos();
         ApplySender();
     }
@@ -284,13 +313,44 @@ public class Plugin : BaseUnityPlugin
     }
 
     private bool _wasInRaid;
+
+    // After each flip of "Hide objects covered by nearer ones": 1 s to settle, then 3 s of frame
+    // times and draw calls averaged into one log line (with logging on), so on and off can be
+    // compared standing still.
+    private static float _flipAt = -1f;
+    private static readonly List<float> FlipFrames = new();
+    private static double _flipDraws;
+
+    private static void MeasureFlip()
+    {
+        if (_flipAt < 0f || Time.unscaledTime < _flipAt) return;
+        if (!Diagnostics.InRaid || !Diagnostics.Logging)
+        {
+            _flipAt = -1f;
+            return;
+        }
+
+        FlipFrames.Add(Time.unscaledDeltaTime * 1000f);
+        _flipDraws += Math.Max(0, Diagnostics.DrawCalls);
+        if (Time.unscaledTime < _flipAt + 3f) return;
+
+        _flipAt = -1f;
+        FlipFrames.Sort();
+        var average = FlipFrames.Average();
+        var median = FlipFrames[FlipFrames.Count / 2];
+        var worst = FlipFrames[(int)(FlipFrames.Count * 0.95f)];
+        var draws = Diagnostics.DrawCalls >= 0 ? $"{_flipDraws / FlipFrames.Count:0}" : "n/a (overlay off)";
+        Log.LogInfo($"A/B hiding covered objects {(On(HideCovered) ? "ON " : "OFF")}: frame {average:0.00} ms (median {median:0.00}, 95% {worst:0.00}, {1000f / average:0} fps), draw calls {draws}" +
+                    (On(HideCovered) ? $", {DepthCulling.Saving} drawn objects hidden, check {DepthCulling.WorkerMs:0.0} ms on a worker" : "") +
+                    (Overlay.PartsSummary() is { Length: > 0 } parts ? $" |{parts.Replace("  overlay, last second:", "")}" : ""));
+    }
     private float _lastSweep;
 
     // Player types that replace Player.LateUpdate without calling it (Fika's observed bots
     // on a client), so the patch on it never runs for them. They're driven from here, once
     // per frame, without touching their code, so no Fika update can break it. Before or
-    // after their own LateUpdate doesn't matter: a bot is only throttled where the game
-    // skips its IK, and a curve read a frame late is a footstep a frame late.
+    // after their own LateUpdate doesn't matter: a bot is only throttled where Fika skips its
+    // IK (AnimatorThrottle.PickInterval), and a curve read a frame late is a footstep a frame late.
     private static readonly Dictionary<Type, bool> OwnLateUpdate = new();
 
     private void LateUpdate()
@@ -343,6 +403,7 @@ public class Plugin : BaseUnityPlugin
             {
                 HandsCulling.RestoreAll();
                 DistantDetail.RestoreAll();
+                DepthCulling.Clear();
                 Occlusion.OnRaidStart();
                 Diagnostics.OnRaidEnd();
             }
@@ -357,7 +418,13 @@ public class Plugin : BaseUnityPlugin
                 Guard(HotPathFixes, HotPaths.ResyncMenuVideos);
             }
 
+            if (inRaid && On(HideCovered))
+            {
+                Guard(HideCovered, DepthCulling.Scan);
+                Guard(HideCovered, DepthCulling.Tick);
+            }
             Guard(KeepCleanupPaused, Diagnostics.KeepCleanupPaused);
+            MeasureFlip();
             Diagnostics.Tick();
         }
         catch (Exception ex)
@@ -383,7 +450,9 @@ public class Plugin : BaseUnityPlugin
         }
         finally
         {
-            OwnTicks += System.Diagnostics.Stopwatch.GetTimestamp() - start;
+            var ticks = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+            OwnTicks += ticks;
+            OverlayTicks += ticks;
         }
     }
 
@@ -391,6 +460,16 @@ public class Plugin : BaseUnityPlugin
     {
         var top = 10f;
         if (On(ShowCosts)) top = Overlay.Draw(10, top) + 6;
+        if (On(ShowDepth) && DepthCulling.Preview is { } depth && Event.current.type == EventType.Repaint)
+        {
+            GUI.DrawTexture(new Rect(10, top, depth.width * 3, depth.height * 3), depth);
+            // The scope's own depth while aiming through one, to the right.
+            if (DepthCulling.ScopePreview is { } scope) GUI.DrawTexture(new Rect(20 + depth.width * 3, top, scope.width * 2, scope.height * 2), scope);
+            top += depth.height * 3 + 2;
+            GUI.Label(new Rect(10, top, depth.width * 3, 22), "purple: your scope's view (with margin); what's there must also be covered in the scope's own depth (right), or stays drawn");
+            top += 24;
+        }
+
         if (!On(ShowStats)) return;
 
         // Rebuilt twice a second; formatting it every frame would show up in the profile.

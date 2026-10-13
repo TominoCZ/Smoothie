@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <AssemblyName>Smoothie</AssemblyName>
     <RootNamespace>Smoothie</RootNamespace>
   </PropertyGroup>
@@ -19,6 +19,7 @@
     <Reference Include="UnityEngine.ParticleSystemModule"><HintPath>$(SptManaged)/UnityEngine.ParticleSystemModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.UIModule"><HintPath>$(SptManaged)/UnityEngine.UIModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.VideoModule"><HintPath>$(SptManaged)/UnityEngine.VideoModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.TerrainModule"><HintPath>$(SptManaged)/UnityEngine.TerrainModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.PhysicsModule"><HintPath>$(SptManaged)/UnityEngine.PhysicsModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Comfort"><HintPath>$(SptManaged)/Comfort.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="BepInEx"><HintPath>$(SptPath)/BepInEx/core/BepInEx.dll</HintPath><Private>false</Private></Reference>

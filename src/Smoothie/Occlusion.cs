@@ -34,7 +34,7 @@ internal static class Occlusion
     private static readonly ConditionalWeakTable<Player, State> States = new();
 
     // What bots use for line of sight, minus grass and foliage, which you can see through.
-    private static readonly int SightMask =
+    internal static readonly int SightMask =
         (1 << LayerMask.NameToLayer("Terrain")) | (1 << LayerMask.NameToLayer("HighPolyCollider"));
 
     // Colliders on the sight layers that don't block the view.
@@ -91,6 +91,13 @@ internal static class Occlusion
             Ms = _ticks * Diagnostics.TickMs;
             _rays = 0;
             _ticks = 0;
+        }
+
+        // Hosting: another player near this bot sees its gun, and its shots start from it.
+        if (AnimatorThrottle.OtherPlayerDistance(player) <= EFTHardSettings.Instance.CULL_GROUNDER)
+        {
+            state.Hidden = false;
+            return false;
         }
 
         // Past the IK distance nothing here changes anything, so no rays.
@@ -157,7 +164,7 @@ internal static class Occlusion
         return false;
     }
 
-    private static bool SeeThrough(Collider collider)
+    internal static bool SeeThrough(Collider collider)
     {
         if (SeeThroughCache.TryGetValue(collider, out var cached)) return cached;
 
@@ -220,6 +227,22 @@ internal static class Occlusion
             matches[0].operand = AccessTools.Method(typeof(Occlusion), nameof(VisibleForIk));
             return list;
         }
+    }
+
+    // Whether the player's IK runs in Fika's ObservedVisualPass instead of Player.VisualPass,
+    // where Smoothie's hidden-bot check doesn't apply.
+    private static System.Type? _observedType;
+    private static bool _observedLooked;
+
+    internal static bool OwnIkPass(Player player)
+    {
+        if (!_observedLooked)
+        {
+            _observedLooked = true;
+            _observedType = ObservedVisualPass()?.DeclaringType;
+        }
+
+        return _observedType != null && _observedType.IsInstanceOfType(player);
     }
 
     // Fika's ObservedVisualPass, when Fika is installed (found by name, no reference). Only the

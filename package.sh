@@ -39,6 +39,11 @@ if [[ -z "${SPT_PATH:-}" ]]; then
 fi
 PROJECT="$HERE/src/Smoothie"
 CONFIGURATION="${CONFIGURATION:-Release}"
+# Debug builds carry the loot culling debug view, which shows loot through walls.
+if [ "$CONFIGURATION" != "Release" ]; then
+    echo "package.sh: only Release builds ship (Debug includes the loot debug view)" >&2
+    exit 1
+fi
 
 # Where the plugin lands when the zip is extracted into the SPT folder.
 DEST="${DEST:-BepInEx/plugins/Smoothie}"

@@ -56,44 +56,50 @@ internal static class Overlay
     private static readonly Row[] Rows =
     {
         new("Frame", () => _frameMs, () => $"{1000f / Math.Max(0.1f, Average(0)):0} fps", false),
-        new("Worst frame", () => _frameMs, () => "longest frame in the last second; spikes here are stutters", false) { Max = true },
+        new("Worst frame", () => _frameMs, () => "spikes here are stutters", false) { Max = true },
         new("Bot animation", () => Stage(_animBegin) + Stage(_animEnd) + (Diagnostics.InRaid ? (float)AnimatorThrottle.StepMs : 0f),
-            () => $"{AnimatorThrottle.Throttled} reduced; full rate: {AnimatorThrottle.FullInView} in view, {AnimatorThrottle.FullFighting} fighting, {AnimatorThrottle.FullOther} close/heard", false, Plugin.ThrottleAnimators)
+            () => $"{AnimatorThrottle.Throttled} reduced; full: {AnimatorThrottle.FullInView} seen, {AnimatorThrottle.FullFighting} fight, {AnimatorThrottle.FullOther} near", false, Plugin.ThrottleAnimators)
             { Color = new Color(0.25f, 0.5f, 0.95f), Short = "Anim" },
         new("Bot IK", () => (float)(_ikFrameTicks * TickMs),
-            () => $"arm and head posing; {Occlusion.HiddenCount} hidden bots skip it", false)
+            () => $"{Occlusion.HiddenCount} hidden bots skip it", false)
             { Color = new Color(0.95f, 0.55f, 0.15f), Short = "IK" },
         new("Bot AI", () => (float)(_aiFrameTicks * TickMs),
-            () => "bot brains, SAIN included; only bots this PC runs", false)
+            () => "bots this PC runs, SAIN included", false)
             { Color = new Color(0.15f, 0.7f, 0.75f), Short = "AI" },
-        new("Bot profiles", () => (float)(_profileFrameTicks * TickMs),
-            () => $"new bots being built; {ProfileBudget.Waiting} waiting", false, Plugin.SpreadProfiles)
+        new("Profiles", () => (float)(_profileFrameTicks * TickMs),
+            () => $"{ProfileBudget.Waiting} new bots waiting", false, Plugin.SpreadProfiles)
             { Color = new Color(0.9f, 0.45f, 0.65f), Short = "Profiles" },
         // Every script's Update/LateUpdate/FixedUpdate and coroutines, the game's and every
         // mod's (SAIN's own components too), minus the parts timed above that run inside them.
-        new("Scripts", ScriptsMs, () => "all other game and mod code", false)
+        new("Scripts", ScriptsMs, Diagnostics.ScriptsNote, false)
             { Color = new Color(0.85f, 0.75f, 0.2f), Short = "Scripts" },
         new("Rendering (CPU)", () => Stage(_render),
-            () => $"CPU preparing the picture; {Diagnostics.ShadowCasters} shadow casters", false, Plugin.SimplifyDistant, Plugin.HideCulledWeapons, Plugin.NoMuzzleShadows)
+            () => $"{Diagnostics.CamerasThisFrame} cameras, {Diagnostics.ShadowCasters} shadow casters", false, Plugin.SimplifyDistant, Plugin.HideCulledWeapons, Plugin.NoMuzzleShadows)
             { Color = new Color(0.6f, 0.35f, 0.85f), Short = "Render" },
         // The game steps physics itself (PhysicsExtensions), so Unity's physics stage is empty.
         // It only simulates while something moves (ragdolls, grenades, dropped loot, doors).
         new("Physics", () => (float)(_physicsFrameTicks * TickMs), PhysicsNote, false)
             { Color = new Color(0.2f, 0.7f, 0.35f), Short = "Phys" },
-        new("GPU wait", () => Stage(_gpuWait), () => "CPU waiting for the graphics card; high = GPU is the limit", false)
+        new("GPU wait", () => Stage(_gpuWait), () => "high = graphics card is the limit", false)
             { Color = new Color(0.75f, 0.2f, 0.25f), Short = "GPU wait" },
         // The frame minus everything above: engine work nothing above times, mostly loading
         // (textures, models) and time outside the game's frame (driver, shader compiling, OS).
-        new("Other", OtherMs, () => $"loading {_loadAverageMs:0.00} ms, outside the game's frame {_outsideAverageMs:0.00} ms; plus sound, UI...", false)
+        new("Other", OtherMs, () => $"loading {_loadAverageMs:0.00}, outside frame {_outsideAverageMs:0.00} ms", false)
             { Color = new Color(0.4f, 0.4f, 0.4f), Short = "Other" },
         // Collections that finished, per second; the note has the heap and how fast it grows.
         new("Memory cleanups", () => _gcThisFrame, () => _gcNote ?? "", true, Plugin.KeepCleanupPaused) { Total = true },
         // Videos playing anywhere (counted once a second); the note has the hidden menu
         // background's videos Smoothie paused, which played through raids before.
-        new("Videos playing", () => _playingVideos, () => $"{HotPaths.PausedMenuVideoCount} hidden menu background videos paused", true, Plugin.HotPathFixes),
-        new("Draw calls", () => Diagnostics.DrawCalls, () => $"{DistantDetail.SimplifiedBots} far bots simplified", true, Plugin.SimplifyDistant, Plugin.HideCulledWeapons),
+        new("Videos playing", () => _playingVideos, () => $"{HotPaths.PausedMenuVideoCount} menu videos paused", true, Plugin.HotPathFixes),
+        new("Draw calls", () => Diagnostics.DrawCalls, () => $"{Diagnostics.SetPassCalls} SetPass; {DistantDetail.SimplifiedBots} far bots simplified", true, Plugin.SimplifyDistant, Plugin.HideCulledWeapons),
+        // How many are hidden right now; "were drawn": Unity was drawing them when they were
+        // hidden, the real saving. The work behind it is in "Smoothie itself".
+        // Only the ones that were being drawn: most far objects the game's baked visibility
+        // already switches off, and hiding those again saves nothing.
+        new("Hidden objects", () => Plugin.On(Plugin.HideCovered) ? DepthCulling.Saving : 0,
+            () => $"check {DepthCulling.WorkerMs:0.0} ms; {DepthCulling.Hidden} hidden of {DepthCulling.CoveredCount} covered (the rest the game isn't drawing){(DepthCulling.Waiting > 0 ? $", {DepthCulling.Waiting} waiting for a try" : "")}; {DepthCulling.Status}", true, Plugin.HideCovered),
         new("Smoothie itself", () => (float)(_ownFrameTicks * TickMs) + (Diagnostics.InRaid ? (float)(AnimatorThrottle.StepMs + Occlusion.Ms) : 0f),
-            () => $"its own work and this overlay; {Occlusion.Rays} sight rays", false),
+            () => $"incl. this overlay {_overlayAverageMs:0.00}, hiding {DepthCulling.Ms:0.00} (worst {DepthCulling.PeakMs:0.00}: {DepthCulling.PeakNote}) ms; {Occlusion.Rays} bot rays", false),
     };
 
     // Which samples a setting changed in; the newest sample is at _head - 1.
@@ -122,8 +128,8 @@ internal static class Overlay
     private static float _barTotalMs = 1f;
     private static string _frameLabel = "", _worstLabel = "";
     private static int _preloading = -1;
-    private static double _loadSum, _outsideSum;
-    private static float _loadAverageMs, _outsideAverageMs;
+    private static double _loadSum, _outsideSum, _overlaySum;
+    private static float _loadAverageMs, _outsideAverageMs, _overlayAverageMs;
 
     private static float OtherMs()
     {
@@ -204,7 +210,9 @@ internal static class Overlay
     // worker builds profiles off it, and they don't cost the frame.
     private static void ProfileBegin()
     {
-        if (System.Threading.Thread.CurrentThread == _mainThread && _profileDepth++ == 0) _profileStart = Stopwatch.GetTimestamp();
+        if (System.Threading.Thread.CurrentThread != _mainThread || _profileDepth++ != 0) return;
+        _profileStart = Stopwatch.GetTimestamp();
+        Diagnostics.NoteProfileBuilt();
     }
 
     private static void ProfileEnd()
@@ -242,7 +250,7 @@ internal static class Overlay
             else other++;
         }
 
-        return $"step {_simAverageMs:0.00} + collider sync {_syncAverageMs:0.00} ms; moving: {corpses} corpse, {loot} loot, {other} other";
+        return $"step {_simAverageMs:0.00} + sync {_syncAverageMs:0.00} ms; moving {corpses + loot + other}";
     }
 
     private static void AiEnd(long __state)
@@ -320,6 +328,8 @@ internal static class Overlay
             _profileTicks = 0;
             _ownFrameTicks = Plugin.OwnTicks;
             Plugin.OwnTicks = 0;
+            _overlaySum += Plugin.OverlayTicks * TickMs;
+            Plugin.OverlayTicks = 0;
             foreach (var row in Rows)
             {
                 var v = row.Value();
@@ -354,7 +364,8 @@ internal static class Overlay
         _syncAverageMs = (float)(_syncSum / Math.Max(1, _frames));
         _loadAverageMs = (float)(_loadSum / Math.Max(1, _frames));
         _outsideAverageMs = (float)(_outsideSum / Math.Max(1, _frames));
-        _simSum = _syncSum = _loadSum = _outsideSum = 0;
+        _overlayAverageMs = (float)(_overlaySum / Math.Max(1, _frames));
+        _simSum = _syncSum = _loadSum = _outsideSum = _overlaySum = 0;
         _frames = 0;
         _head = (_head + 1) % Samples;
 
@@ -363,7 +374,7 @@ internal static class Overlay
         {
             var heap = UnityEngine.Profiling.Profiler.GetMonoUsedSizeLong();
             var growth = _lastHeapAt > 0f ? (heap - _lastHeap) / (1024.0 * 1024.0) / (Time.unscaledTime - _lastHeapAt) : 0.0;
-            _gcNote = $"per second; memory in use {heap >> 20} MB ({growth:+0;-0} MB/s), auto cleanup {(UnityEngine.Scripting.GarbageCollector.GCMode == UnityEngine.Scripting.GarbageCollector.Mode.Disabled ? "off" : "on")}";
+            _gcNote = $"{heap >> 20} MB ({growth:+0;-0} MB/s), auto {(UnityEngine.Scripting.GarbageCollector.GCMode == UnityEngine.Scripting.GarbageCollector.Mode.Disabled ? "off" : "on")}";
             _lastHeap = heap;
             _lastHeapAt = Time.unscaledTime;
             _playingVideos = UnityEngine.Object.FindObjectsOfType<UnityEngine.Video.VideoPlayer>().Count(v => v.isPlaying);
@@ -409,7 +420,7 @@ internal static class Overlay
         if (!Plugin.On(Plugin.ShowCosts)) return "";
         var parts = "";
         foreach (var i in SegmentRows) parts += (parts.Length > 0 ? ", " : "") + $"{Rows[i].Short} {Rows[i].Shown}";
-        return $"  overlay, last second: frame {Rows[0].Shown} = {parts} (Other: loading {_loadAverageMs:0.00}, outside the frame {_outsideAverageMs:0.00})";
+        return $"  overlay, last second: frame {Rows[0].Shown} = {parts} (Other: loading {_loadAverageMs:0.00}, outside the frame {_outsideAverageMs:0.00}) | Smoothie itself {Rows[Rows.Length - 1].Shown} (this overlay {_overlayAverageMs:0.00} ms)";
     }
 
     // Highest of the last second of samples.
