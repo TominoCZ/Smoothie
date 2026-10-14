@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using EFT;
@@ -227,6 +228,12 @@ internal static class DepthCulling
     private static bool[] _lampTest = Array.Empty<bool>(), _lampWant = Array.Empty<bool>(), _lampOff = Array.Empty<bool>();
     private static byte[] _lampStreak = Array.Empty<byte>();
     private static int[] _lampMaskWas = Array.Empty<int>();
+    // Whether each lamp is on (active and enabled), asked LampsPerRound at a time: Streets has
+    // ~3,800 lamps, and asking all of them every round cost the main thread ~0.4 ms. A lamp the
+    // game just switched on is only skipped once it's been asked again, about a second later.
+    private static bool[] _lampActive = Array.Empty<bool>();
+    private static int _lampCursor;
+    private const int LampsPerRound = 256;
     // A lamp's lit area on the round's screen (0-1, may reach past it; the worker's), and for a
     // skipped one as its result was applied, with that round's view: a turn may bring in the part
     // past the screen's edge, which wasn't checked (KeepLampsInView).
@@ -430,10 +437,16 @@ internal static class DepthCulling
         _lampOff = new bool[n];
         _lampStreak = new byte[n];
         _lampMaskWas = new int[n];
+        _lampActive = new bool[n];
+        _lampCursor = 0;
         _lampRect = new Vector4[n];
         _lampSkipRect = new Vector4[n];
         _lampsPastEdge = 0;
-        for (var l = 0; l < n; l++) TakeLampBox(l);
+        for (var l = 0; l < n; l++)
+        {
+            TakeLampBox(l);
+            _lampActive[l] = lamps[l] != null && lamps[l].isActiveAndEnabled;
+        }
     }
 
     // A lamp's box and where it was taken: at the scan, then one lamp per round (a lamp that moved
@@ -472,6 +485,9 @@ internal static class DepthCulling
         _lampView = _roundViewProjection;
         for (var l = 0; l < _lamps.Length; l++)
         {
+            // Most lamps: not skipped and not wanted, nothing to do (no call into the engine).
+            var wanted = on && _lampTest[l] && _lampWant[l];
+            if (!wanted && !_lampOff[l]) continue;
             var light = _lamps[l];
             if (light == null)
             {
@@ -479,7 +495,7 @@ internal static class DepthCulling
                 continue;
             }
 
-            var want = on && _lampTest[l] && _lampWant[l] && (light.transform.position - _lampAt[l]).sqrMagnitude < 1e-4f;
+            var want = wanted && (light.transform.position - _lampAt[l]).sqrMagnitude < 1e-4f;
             if (want && !_lampOff[l] && light.cullingMask != 0)
             {
                 _lampMaskWas[l] = light.cullingMask;
@@ -1042,12 +1058,19 @@ internal static class DepthCulling
         _roundReachMinus = Vector3.Min(_eyeSpeedMinus * latency, Vector3.one * MaxDrift);
         _roundReach = Vector3.Max(_roundReachPlus, _roundReachMinus);
         _roundLamps = Plugin.On(Plugin.SkipCoveredLamps);
-        if (_lamps.Length > 0) TakeLampBox(_roundId % _lamps.Length);
-        for (var l = 0; l < _lamps.Length; l++)
+        var lampCount = _lamps.Length;
+        if (lampCount > 0)
         {
-            var light = _lamps[l];
-            _lampTest[l] = _roundLamps && light != null && light.isActiveAndEnabled;
+            TakeLampBox(_roundId % lampCount);
+            for (var k = Math.Min(LampsPerRound, lampCount); k > 0; k--)
+            {
+                var light = _lamps[_lampCursor];
+                _lampActive[_lampCursor] = light != null && light.isActiveAndEnabled;
+                if (++_lampCursor >= lampCount) _lampCursor = 0;
+            }
         }
+
+        for (var l = 0; l < lampCount; l++) _lampTest[l] = _roundLamps && _lampActive[l];
         _tanX = 1f / Mathf.Abs(_projection.m00);
         _tanY = 1f / Mathf.Abs(_projection.m11);
         _texelAngleX = 2f * _tanX / _width;
@@ -1432,6 +1455,7 @@ internal static class DepthCulling
             _movingGrow = 0f;
             _movingCover = float.MaxValue;
             SetPlanes(Planes, ref m);
+            TakePlanes();
             set.Want.Clear();
             set.Try.Clear();
             set.Stale.Clear();
@@ -1595,13 +1619,21 @@ internal static class DepthCulling
     // Covered but not drawn by the game when Apply last asked (most covered objects): nothing
     // to hide or show, so not checked until it's asked again; then it's checked in that round,
     // so the answer it's hidden on is fresh.
-    private static bool Due(Set set, int i, Vector3 eye, float now) =>
-        (set.Off[i] != null || set.RetryAt[i] <= _roundGameTime)
-        && (now >= set.NextCheck[i] || set.Streak[i] != 0 && (eye - set.CheckedFrom[i]).sqrMagnitude >= set.Slack[i]);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool Due(Set set, int i, Vector3 eye, float now)
+    {
+        if (set.Off[i] == null && set.RetryAt[i] > _roundGameTime) return false;
+        if (now >= set.NextCheck[i]) return true;
+        if (set.Streak[i] == 0) return false;
+        var from = set.CheckedFrom[i];
+        float dx = eye.x - from.x, dy = eye.y - from.y, dz = eye.z - from.z;
+        return dx * dx + dy * dy + dz * dz >= set.Slack[i];
+    }
 
     // The current cell's due objects (worker only).
     private static readonly List<int> DueNow = new();
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Wanted(Set set, int i, int round)
     {
         set.Want.Add(i);
@@ -1645,17 +1677,24 @@ internal static class DepthCulling
 
     // How far the eye may move before the nearest cover (its depth, reversed: d = p23 / v - p22)
     // shifts by a texel.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float Slack(float coverDepth)
     {
         var cover = coverDepth + _p22;
         return cover > 0f ? _p23 / cover * _texelAngle : 0f;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool Near(Vector3 min, Vector3 max, Vector3 eye)
     {
-        var dx = Math.Max(Math.Max(min.x - eye.x, eye.x - max.x), 0f);
-        var dy = Math.Max(Math.Max(min.y - eye.y, eye.y - max.y), 0f);
-        var dz = Math.Max(Math.Max(min.z - eye.z, eye.z - max.z), 0f);
+        // Distance from the eye to the box: zero along an axis the eye is within.
+        float dx = 0f, dy = 0f, dz = 0f;
+        if (eye.x < min.x) dx = min.x - eye.x;
+        else if (eye.x > max.x) dx = eye.x - max.x;
+        if (eye.y < min.y) dy = min.y - eye.y;
+        else if (eye.y > max.y) dy = eye.y - max.y;
+        if (eye.z < min.z) dz = min.z - eye.z;
+        else if (eye.z > max.z) dz = eye.z - max.z;
         return dx * dx + dy * dy + dz * dz < _minDistance * _minDistance;
     }
 
@@ -1672,7 +1711,33 @@ internal static class DepthCulling
         planes[3] = new Vector4(m.m30 - m.m10, m.m31 - m.m11, m.m32 - m.m12, m.m33 - m.m13);
     }
 
-    private static bool OutOfView(Vector3 min, Vector3 max) => OutOfView(Planes, min, max);
+    // The worker's planes (SetPlanes on Planes, every round) as fields with their normals'
+    // absolute values worked out once: tested for every box of every round.
+    private static Vector4 _plane0, _plane1, _plane2, _plane3;
+    private static Vector3 _abs0, _abs1, _abs2, _abs3;
+
+    private static void TakePlanes()
+    {
+        _plane0 = Planes[0];
+        _plane1 = Planes[1];
+        _plane2 = Planes[2];
+        _plane3 = Planes[3];
+        _abs0 = new Vector3(Math.Abs(_plane0.x), Math.Abs(_plane0.y), Math.Abs(_plane0.z));
+        _abs1 = new Vector3(Math.Abs(_plane1.x), Math.Abs(_plane1.y), Math.Abs(_plane1.z));
+        _abs2 = new Vector3(Math.Abs(_plane2.x), Math.Abs(_plane2.y), Math.Abs(_plane2.z));
+        _abs3 = new Vector3(Math.Abs(_plane3.x), Math.Abs(_plane3.y), Math.Abs(_plane3.z));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool OutOfView(Vector3 min, Vector3 max)
+    {
+        float cx = (min.x + max.x) * 0.5f, cy = (min.y + max.y) * 0.5f, cz = (min.z + max.z) * 0.5f;
+        float ex = (max.x - min.x) * 0.5f, ey = (max.y - min.y) * 0.5f, ez = (max.z - min.z) * 0.5f;
+        return _plane0.x * cx + _plane0.y * cy + _plane0.z * cz + _plane0.w + _abs0.x * ex + _abs0.y * ey + _abs0.z * ez < 0f
+            || _plane1.x * cx + _plane1.y * cy + _plane1.z * cz + _plane1.w + _abs1.x * ex + _abs1.y * ey + _abs1.z * ez < 0f
+            || _plane2.x * cx + _plane2.y * cy + _plane2.z * cz + _plane2.w + _abs2.x * ex + _abs2.y * ey + _abs2.z * ez < 0f
+            || _plane3.x * cx + _plane3.y * cy + _plane3.z * cz + _plane3.w + _abs3.x * ex + _abs3.y * ey + _abs3.z * ez < 0f;
+    }
 
     // The box against the left, right, bottom and top planes of a view (SetPlanes). Together
     // they also leave out what's wholly behind the eye.

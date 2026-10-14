@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Version>1.0.4</Version>
     <AssemblyName>Smoothie</AssemblyName>
     <RootNamespace>Smoothie</RootNamespace>

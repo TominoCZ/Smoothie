@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <OutputType>Exe</OutputType>
     <!-- The plugin targets the game's Mono; the maths it checks has no Unity types. -->
     <TargetFramework>net10.0</TargetFramework>
