@@ -6,12 +6,14 @@ using System.Runtime.CompilerServices;
 using Comfort.Common;
 using EFT;
 using EFT.Animations;
+using EFT.CameraControl;
 using EFT.Interactive;
 using EFT.UI;
 using HarmonyLib;
 using SPT.Reflection.Patching;
 using Systems.Effects;
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.Video;
 
 namespace Smoothie;
@@ -19,6 +21,30 @@ namespace Smoothie;
 // Small per-frame waste in vanilla code. Each one keeps the game's behaviour.
 internal static class HotPaths
 {
+    // The main camera draws opaque objects grouped by material instead of front to back:
+    // fewer shader switches (SetPass) for the CPU and render thread, some more overdraw for
+    // the GPU (near objects no longer hide what's behind them before it's shaded). Customs,
+    // 2026-10-13: ~80 SetPass and ~0.05 ms saved; Streets 2026-10-14: ~270 SetPass and
+    // ~0.09 ms. On by default: Tarkov is CPU-bound. The camera's own mode goes back when off.
+    private static Camera? _sortCamera;
+    private static OpaqueSortMode _sortWas;
+
+    internal static void SortByMaterial()
+    {
+        var camera = CameraManager.Instance.Camera;
+        var on = Plugin.On(Plugin.SortByMaterial) && camera != null;
+        if (_sortCamera != null && (!on || _sortCamera != camera))
+        {
+            if (_sortCamera.opaqueSortMode == OpaqueSortMode.NoDistanceSort) _sortCamera.opaqueSortMode = _sortWas;
+            _sortCamera = null;
+        }
+
+        if (!on || _sortCamera != null) return;
+        _sortWas = camera!.opaqueSortMode;
+        camera.opaqueSortMode = OpaqueSortMode.NoDistanceSort;
+        _sortCamera = camera;
+    }
+
     internal static void Enable()
     {
         new FovCoroutinePatch().Enable();
@@ -276,7 +302,7 @@ internal static class HotPaths
         [PatchPostfix]
         private static void Postfix(float timePass, ref bool __result)
         {
-            if (Plugin.Fixing && !__result && timePass >= Plugin.CorpseSettleTime.Value) __result = true;
+            if (Plugin.Fixing && !__result && timePass >= Plugin.CorpseSettleTime.Value && !RuptureInstalled) __result = true;
         }
     }
 
@@ -293,9 +319,26 @@ internal static class HotPaths
         [PatchPostfix]
         private static void Postfix(ObservedCorpse __instance, float timePass, ref bool __result)
         {
-            if (!Plugin.Fixing || __result || timePass < Plugin.CorpseSettleTime.Value) return;
+            if (!Plugin.Fixing || __result || timePass < Plugin.CorpseSettleTime.Value || RuptureInstalled) return;
             __result = true;
             IsStill(__instance) = true;
+        }
+    }
+
+    // Rupture answers "not still" for good on purpose: it moves corpses in its own physics
+    // scene and keeps the game's ragdoll as a shell bullets can still hit, wake and cut. "Still"
+    // makes the game take that shell apart, so with Rupture installed corpses are left alone.
+    // Looked up on first use, once every plugin has loaded.
+    private static bool? _ruptureInstalled;
+
+    private static bool RuptureInstalled
+    {
+        get
+        {
+            if (_ruptureInstalled is { } installed) return installed;
+            _ruptureInstalled = BepInEx.Bootstrap.Chainloader.PluginInfos.ContainsKey("com.rootdarkarchon.rupture");
+            if (_ruptureInstalled.Value) Plugin.Log.LogInfo("Rupture is installed: corpses are left to it (\"Corpses stop moving after\" is off).");
+            return _ruptureInstalled.Value;
         }
     }
 

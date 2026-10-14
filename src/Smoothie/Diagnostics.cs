@@ -351,6 +351,7 @@ internal static class Diagnostics
     internal static void OnRaidEnd()
     {
         _raidEndAt = SeenPlayers.Count > 0 ? Time.unscaledTime : -1f;
+        _physicsKeepers = "";
         // The raid's objects are gone; their instance ids could be reused.
         LooksById.Clear();
     }
@@ -1310,6 +1311,29 @@ internal static class Diagnostics
     }
 
     // Once per frame, from the plugin's Update.
+    // What keeps the game's whole-scene physics step running (it runs while any body it was told
+    // about is active and, if it has a visibility check, seen): logged when that set changes, by
+    // the bodies' root objects, so a Phys bar that jumps (a corpse, the BTR) names its cause.
+    private static float _physicsCheckAt;
+    private static string _physicsKeepers = "";
+
+    private static void LogPhysicsKeepers()
+    {
+        var roots = new SortedDictionary<string, int>();
+        foreach (var body in PhysicsExtensions.UpdateController._rigidbodies)
+        {
+            if (body.rigidbody == null || !body.rigidbody.gameObject.activeInHierarchy) continue;
+            if (body.visibilityChecker != null && !body.visibilityChecker.IsVisible) continue;
+            var name = $"{body.rigidbody.transform.root.name}/{body.rigidbody.name}{(body.rigidbody.isKinematic ? " (kinematic)" : "")}";
+            roots[name] = roots.TryGetValue(name, out var n) ? n + 1 : 1;
+        }
+
+        var keepers = string.Join(", ", roots.Select(r => r.Value > 1 ? $"{r.Key} x{r.Value}" : r.Key));
+        if (keepers == _physicsKeepers) return;
+        _physicsKeepers = keepers;
+        Plugin.Log.LogInfo($"{DateTime.Now:HH:mm:ss.fff} physics step {(keepers.Length > 0 ? $"kept running by: {keepers}" : "idle")}");
+    }
+
     internal static void Tick()
     {
         // Measured between our own calls, the same span the script timings cover (Unity's
@@ -1318,6 +1342,12 @@ internal static class Diagnostics
         var ms = _lastTickStamp == 0 ? Time.unscaledDeltaTime * 1000f : (float)((stamp - _lastTickStamp) * 1000.0 / Stopwatch.Frequency);
         _lastTickStamp = stamp;
         if (FrameTimes.Count < 4096) FrameTimes.Add(ms);
+        if (Logging && InRaid && Time.unscaledTime - _physicsCheckAt >= 1f)
+        {
+            _physicsCheckAt = Time.unscaledTime;
+            LogPhysicsKeepers();
+        }
+
         if (Time.unscaledTime - _pacingStart >= 5f)
         {
             _pacingStart = Time.unscaledTime;

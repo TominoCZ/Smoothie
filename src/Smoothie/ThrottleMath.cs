@@ -226,6 +226,66 @@ public static class DepthCover
 // DepthCover.Test's on the fine image.
 public sealed class DepthPyramid
 {
+    // Texels a covered box must grow by so its cover's edge can't slide off it while the eye
+    // moves `reach` metres: parallax r * (1/cover - 1/far), with 1/distance of a depth value d
+    // being (d + p22) / p23 (larger d is nearer). Taken at the box's farthest point, it also
+    // holds for every box inside a bigger one (their cover is no nearer, their far point no farther).
+    public static float MoveGrowTexels(float reach, float coverDepth, float farDepth, float p23, float texelAngle, float cap) =>
+        Math.Min(Math.Max(0f, reach * (coverDepth - farDepth) / p23 / texelAngle), cap);
+
+    // Behind gear that moves with the eye (the player's gun): the gear's edge stays put on screen,
+    // what's behind it shifts by its own parallax only, r / distance, largest at its nearest point.
+    public static float OwnShiftTexels(float reach, float nearestDepth, float p22, float p23, float texelAngle, float cap) =>
+        Math.Min(Math.Max(0f, reach * (nearestDepth + p22) / p23 / texelAngle), cap);
+
+    // Parts of the player's own gear on screen: a texel inside a part's box whose depth lies within
+    // that part's depth range is the part, not the world. Such cover isn't taken as NearestCover,
+    // only noted in GearCover. Worked out once per Build, into every level (the world's nearest
+    // depth in each block, and whether gear is in it), so a test costs the same with gear as without.
+    private readonly List<(float XMin, float YMin, float XMax, float YMax, float Near, float Far)> _gearOnScreen = new();
+    private bool[] _gearMask = Array.Empty<bool>();
+    private float[] _nearWorld0 = Array.Empty<float>();
+    private readonly List<float[]> _nearWorld = new();
+    private readonly List<bool[]> _gearAny = new();
+
+    public void ClearGear() => _gearOnScreen.Clear();
+
+    // Screen box 0-1 and the depth of its nearest and farthest point (larger is nearer), placed at
+    // the next Build, with 10% to spare on the depth (the parts' boxes are loose already).
+    public void AddGear(float xMin, float yMin, float xMax, float yMax, float near, float far) =>
+        _gearOnScreen.Add((xMin, yMin, xMax, yMax, near * 1.1f, far * 0.9f));
+
+    // After a Covered result: whether some of the cover under the box was gear.
+    public bool GearCover { get; private set; }
+
+    // The fine level: which texels are gear, and the depth with gear left out (none: MinValue).
+    private void PlaceGear(float[] depth, int width, int height)
+    {
+        var n = width * height;
+        if (_gearMask.Length != n)
+        {
+            _gearMask = new bool[n];
+            _nearWorld0 = new float[n];
+        }
+
+        Array.Clear(_gearMask, 0, n);
+        foreach (var g in _gearOnScreen)
+        {
+            if (g.XMax <= 0f || g.YMax <= 0f || g.XMin >= 1f || g.YMin >= 1f) continue;
+            int x0 = Math.Max(0, (int)Math.Floor(g.XMin * width)), x1 = Math.Min(width - 1, (int)Math.Ceiling(g.XMax * width) - 1);
+            int y0 = Math.Max(0, (int)Math.Floor(g.YMin * height)), y1 = Math.Min(height - 1, (int)Math.Ceiling(g.YMax * height) - 1);
+            // Rows as stored: upside down.
+            for (var r = height - 1 - y1; r <= height - 1 - y0; r++)
+            for (var x = x0; x <= x1; x++)
+            {
+                var d = depth[r * width + x];
+                if (d <= g.Near && d >= g.Far) _gearMask[r * width + x] = true;
+            }
+        }
+
+        for (var i = 0; i < n; i++) _nearWorld0[i] = _gearMask[i] ? float.MinValue : depth[i];
+    }
+
     private readonly List<float[]> _far = new();
     private readonly List<float[]> _near = new();
     private readonly List<int> _widths = new();
@@ -237,8 +297,10 @@ public sealed class DepthPyramid
     {
         _depth = depth;
         _levels = 1;
+        PlaceGear(depth, width, height);
         int w = width, h = height;
-        float[] far = depth, near = depth;
+        float[] far = depth, near = depth, nearWorld = _nearWorld0;
+        var gearAny = _gearMask;
         while (w > 1 || h > 1)
         {
             int pw = (w + 1) / 2, ph = (h + 1) / 2;
@@ -246,6 +308,8 @@ public sealed class DepthPyramid
             {
                 _far.Add(Array.Empty<float>());
                 _near.Add(Array.Empty<float>());
+                _nearWorld.Add(Array.Empty<float>());
+                _gearAny.Add(Array.Empty<bool>());
                 _widths.Add(0);
                 _heights.Add(0);
             }
@@ -255,13 +319,17 @@ public sealed class DepthPyramid
             {
                 _far[level] = new float[pw * ph];
                 _near[level] = new float[pw * ph];
+                _nearWorld[level] = new float[pw * ph];
+                _gearAny[level] = new bool[pw * ph];
             }
 
-            float[] pf = _far[level], pn = _near[level];
+            float[] pf = _far[level], pn = _near[level], pnw = _nearWorld[level];
+            var pg = _gearAny[level];
             for (var r = 0; r < ph; r++)
             for (var x = 0; x < pw; x++)
             {
-                float lo = float.MaxValue, hi = float.MinValue;
+                float lo = float.MaxValue, hi = float.MinValue, hiWorld = float.MinValue;
+                var anyGear = false;
                 for (var dr = 0; dr < 2; dr++)
                 for (var dx = 0; dx < 2; dx++)
                 {
@@ -270,16 +338,22 @@ public sealed class DepthPyramid
                     var i = cr * w + cx;
                     lo = Math.Min(lo, far[i]);
                     hi = Math.Max(hi, near[i]);
+                    hiWorld = Math.Max(hiWorld, nearWorld[i]);
+                    anyGear |= gearAny[i];
                 }
 
                 pf[r * pw + x] = lo;
                 pn[r * pw + x] = hi;
+                pnw[r * pw + x] = hiWorld;
+                pg[r * pw + x] = anyGear;
             }
 
             _widths[level] = pw;
             _heights[level] = ph;
             far = pf;
             near = pn;
+            nearWorld = pnw;
+            gearAny = pg;
             w = pw;
             h = ph;
             _levels++;
@@ -312,6 +386,7 @@ public sealed class DepthPyramid
         _r1 = height - 1 - y0;
         _boxNearest = boxNearest;
         NearestCover = 0f;
+        GearCover = false;
 
         // Start where the box spans at most 4x4 texels, and look closer only inside texels that
         // can't decide: the work follows the edges of the cover, not the area of the box.
@@ -331,9 +406,11 @@ public sealed class DepthPyramid
     {
         if (level == 0)
         {
-            var d = _depth[r * Width + x];
+            var i = r * Width + x;
+            var d = _depth[i];
             if (d <= _boxNearest) return true;
-            if (d > NearestCover) NearestCover = d;
+            if (_gearMask[i]) GearCover = true;
+            else if (d > NearestCover) NearestCover = d;
             return false;
         }
 
@@ -342,8 +419,9 @@ public sealed class DepthPyramid
         // Everything below is nearer than the box: covered.
         if (_far[level - 1][t] > _boxNearest)
         {
-            var near = _near[level - 1][t];
+            var near = _nearWorld[level - 1][t];
             if (near > NearestCover) NearestCover = near;
+            if (_gearAny[level - 1][t]) GearCover = true;
             return false;
         }
 

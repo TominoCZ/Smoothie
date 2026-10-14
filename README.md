@@ -17,8 +17,9 @@ bullets all work like before.
 | Close bots you can't see (behind walls, behind you) | full hand and head aiming | skipped until you have a line of sight |
 | Small gear on far bots (sights, pouches, patches) | always drawn | skipped past 60 m; lasers and lights stay |
 | Gun of a bot the game already hid | still drawn | hidden with the bot |
-| Corpses | ragdoll for 15–30 s | settle after 5 s |
-| Buildings, walls and furniture behind nearer ones | drawn | not drawn past 10 m when fully covered (checked against your scope's view too) |
+| Corpses | ragdoll for 15–30 s | settle after 5 s (left to Rupture when it's installed) |
+| Buildings, walls and furniture behind nearer ones | drawn, shadows too | not drawn past 3 m when fully covered, shadows included (checked against your scope's view too) |
+| Lamps lighting only rooms you can't see | light and shadows drawn | skipped until any of their light may come into view |
 | Huge bot counts when you host | hundreds of spawn attempts every 15 s, freezes | only as many as fit, gear built a bit per frame |
 | Requests to the SPT server | a new connection every time | one connection kept open |
 
@@ -29,19 +30,24 @@ On top of that, a few things the game wastes every frame are fixed: a coroutine 
 every bot every frame, dead bots' brains still being updated, the main menu's background
 video playing through your whole raid, and muzzle smoke lighting recalculated for every gun.
 
-## What's new in 1.0.3
+## What's new in 1.0.4
 
-- Hiding covered objects is cheaper and reacts faster. The time it costs per frame is about
-  halved and the worst spikes are gone.
-- Raising a scope no longer flashes hidden objects back on, and more stays hidden while aiming.
-- Hidden objects behind you stay hidden while you walk and come back the moment you turn
-  around.
+- Far fewer draw calls indoors. Most of what a building costs is shadows: covered objects no
+  longer draw their shadows, and lamps whose whole lit area is behind walls are skipped. On
+  Factory that is over a thousand draw calls a frame in some spots.
+- Less pop-in while moving: what's about to come out from behind cover is drawn a little before
+  it does, more the faster you move and the nearer the cover.
+- Hiding now starts at 3 m instead of 10 m, adjustable from 1 to 10 m.
+- Level objects are drawn grouped by material: fewer material switches for your CPU.
+- Works with Rupture: corpses are left to it, so they keep reacting to hits after they land.
 
 ## Compatibility
 
 - **Client-side only.** Nothing goes on the server.
 - **Fika is optional.** Smoothie works offline, as a Fika host and as a Fika client, and doesn't
   touch any of Fika's code. On a Fika client, hidden bots keep their aiming.
+- **Works with Rupture.** Rupture keeps corpses reacting to hits, so Smoothie's corpse settle
+  time switches itself off when Rupture is installed.
 - **Works with AI Limit.** AI Limit switches far bots off completely; Smoothie makes the ones
   still running cheaper. Use both if you like.
 
@@ -55,7 +61,7 @@ Extract the zip into your SPT folder, so you end up with:
 <SPT>/BepInEx/plugins/Smoothie/Smoothie.dll
 ```
 
-To check it loaded, look for `Loading [Smoothie 1.0.3]` in `BepInEx/LogOutput.log`. As a Fika
+To check it loaded, look for `Loading [Smoothie 1.0.4]` in `BepInEx/LogOutput.log`. As a Fika
 client you'll also see this once you're in a raid:
 
 ```
@@ -80,10 +86,14 @@ what I'd recommend. Tick **Show advanced settings** to see the sliders and the t
 | Load new bots a bit at a time | on | builds new bots' gear over several frames instead of freezing; spawn waves no longer drag raids down to 60 fps when your frame limit is off |
 | *advanced:* Load new bots on another CPU core (experimental) | off | builds that gear on another core instead |
 | **3. Other fixes** | | |
-| Corpses stop moving after | 5 s | vanilla is 15 s (30 s in Fika) |
+| Corpses stop moving after | 5 s | vanilla is 15 s (30 s in Fika). Off automatically with Rupture installed |
 | Remove small CPU waste in game code | on | the per-frame waste listed above, plus bots the game failed to spawn no longer stay in memory until you quit |
 | Muzzle flashes of others cast no shadows | on | other players' and bots' flashes still light things up, just without shadows; that more than doubled the shadow work in fights. Your own gun is untouched |
-| Hide objects covered by nearer ones (experimental) | on | level objects 10 m+ away aren't drawn while something nearer completely covers them. Their shadows stay. Something coming into view can show up a few frames late, only while you move. Doors, loot, players and anything that moves are never hidden |
+| Hide objects covered by nearer ones (experimental) | on | level objects aren't drawn while something nearer completely covers them. Something coming into view can show up a few frames late, only while you move; the faster you move, the earlier it's drawn. Doors, loot, players and anything that moves are never hidden |
+| Hide covered objects only beyond (m) | 3 m | everything nearer stays drawn; 1–10 m |
+| Covered objects also stop casting shadows | on | covered objects aren't drawn into shadow maps either, nor the game's separate shadow-only meshes when covered. Off: their shadows stay, always right but costs those draws |
+| Skip lamps lighting only covered areas | on | a lamp whose whole lit area is behind nearer things lights nothing you can see, so it stops lighting and drawing its shadows until any of that area may come into view. The sun and moon are left alone |
+| Draw level objects grouped by material | on | fewer material switches for the CPU, a little more work for the graphics card; if the overlay shows GPU wait going up, switch it off |
 | Prevent memory cleanup stutters in raids | off | opening your inventory turns memory cleanup back on for the rest of the raid, which stutters every minute or two; this lets it finish and then pauses it again. Only on PCs with enough RAM for the game to pause it in the first place (25 GB by default) |
 | Keep server connection open (faster menus) | on | one open connection to the SPT server instead of a new one per request |
 | **4. Overlay and logs** (advanced) | | all off by default |
@@ -92,7 +102,7 @@ what I'd recommend. Tick **Show advanced settings** to see the sliders and the t
 | Log stutters and their causes | off | writes every stutter and what caused it to the log |
 | Log time per script (slow) | off | names the script behind each stutter; costs frame time while on |
 | Show text stats panel | off | frame timings, memory and bot counts |
-| Show hiding cells and hidden objects (debug) | off | outlines level objects within 150 m: red hidden, yellow drawn because something behind it shows. While aiming: magenta shows in the scope's view, cyan kept next to it, orange the scope has no depth of its own |
+| Show hiding cells and hidden objects (debug) | off | outlines level objects within 150 m: red hidden, yellow drawn because something behind it shows, green kept drawn because you're moving, blue the lit area of a skipped lamp. While aiming: magenta shows in the scope's view, cyan kept next to it, orange the scope has no depth of its own |
 | Show the depth image hiding uses | off | the small depth image the hiding checks against, plus the scope's while aiming |
 
 Settings were renamed in 1.0.1, so if you're coming from 1.0.0 they reset to the defaults once.

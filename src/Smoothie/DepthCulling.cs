@@ -27,18 +27,38 @@ namespace Smoothie;
 // find it covered, shown on the first one that doesn't: something coming into view appears a
 // couple of frames late, and only when moving (turning doesn't change what covers what).
 //
-// Shadows never change: a covered object that casts shadows becomes shadows-only (still in the
-// shadow map, not on screen), others are switched off with forceRenderingOff. Only renderers
-// this switched itself are put back, and only if nobody changed them since. The game writes
-// shadowCastingMode only on loot, player gear and at map load, none of which are tracked.
+// A covered object is switched off with forceRenderingOff, its shadow with it, and so are the
+// game's shadow-only meshes when covered (Plugin.HideShadows). With that off, shadows never
+// change: a covered object that casts shadows becomes shadows-only (still in the shadow map,
+// not on screen). Only renderers this switched itself are put back, and only if nobody changed
+// them since. The game writes shadowCastingMode only on loot, player gear and at map load, none
+// of which are tracked. Lamps whose whole lit area is covered get an empty culling mask the same
+// way (Plugin.SkipCoveredLamps).
 // Everything on screen counts as cover: the player's gun and hands, a bush in their face (the
 // gun moving off a box shows it within a round). While aiming through a scope, what's in the
 // optic camera's view (the main camera only sees the lens there) must also be covered in the
 // optic camera's own depth, or it stays drawn.
 internal static class DepthCulling
 {
-    // Nearer than this an object is always drawn: a late reveal there would be large on screen.
-    private const float MinDistance = 10f;
+    // Nearer than this (m, the setting, taken each round) an object is always drawn: a late reveal
+    // there would be large on screen. Was a fixed 10 m before covered boxes were grown by the eye's
+    // movement (which is what made a near reveal late).
+    private static float _minDistance = 3f;
+    // Each box on screen grown by this many texels of the depth image on every side before the
+    // main view's test (~0.5°): only what's covered with that much to spare hides, so moving
+    // past cover shows what's behind its edge a little before it peeks out, not a round after.
+    private const float BoxGrowTexels = 1f;
+    // While moving, a covered box is grown further by how far its nearest cover's edge can slide
+    // across it before the next result replaces this one (the eye's speed times how long results
+    // take to land and be replaced, both measured): what's about to peek out past cover is drawn
+    // before it does, not a few frames after. Never more than this angle (~20°): sprinting past a
+    // corner a metre away needs about that for what's a few metres behind it.
+    // ponytail: the gun and hands count as near cover here although they move with the eye, so
+    // while moving the band along their outline hits this cap; masking their screen area would
+    // keep that hidden.
+    private const float MaxMoveGrowAngle = 0.35f;
+    // Eye speeds above this (m/s) are a teleport or a vehicle, not a step.
+    private const float MaxEyeSpeed = 15f;
     private static bool _scoped, _recheckAll;
     // The scope's area on the main screen this round (0-1), if aiming through one.
     private static bool _roundScoped;
@@ -147,6 +167,13 @@ internal static class DepthCulling
     // having it, how old a result is in frames when it's applied, frames between results.
     private static float _arriveFrames, _arriveMs, _appliedAge, _resultEvery;
     private static int _lastApplyFrame;
+    // The same two in seconds, and the eye's speed (m/s) along the camera's right, up and forward
+    // axes, the positive and negative directions apart (each up at once, down slowly): how far the
+    // eye travels before the next result lands is what a round grows covered boxes by.
+    private static float _appliedSeconds, _resultSeconds, _lastApplyTime;
+    private static double _speedTime = -1.0;
+    private static int _speedFrame;
+    private static Vector3 _speedEye, _eyeSpeedPlus, _eyeSpeedMinus;
     private static bool _resetStreaks;
     private static Exception? _error;
 
@@ -168,6 +195,45 @@ internal static class DepthCulling
     private static Matrix4x4 _roundViewProjection;
     private static Vector3 _roundEye;
     private static float _roundTime, _roundGameTime, _p22, _p23, _texelAngle;
+    // How far (m) the eye may travel right, up and forward before this round's result is replaced,
+    // the view's half-width and half-height as tangents, one texel across as an angle, and how
+    // many covered boxes the reach kept drawn (overlay).
+    private static Vector3 _roundReach, _roundReachPlus, _roundReachMinus;
+    private static float _tanX, _tanY, _texelAngleX;
+    // Of the boxes kept drawn for movement this round: the widest growth (texels) and the nearest
+    // cover it was sized from (m). Overlay, to tell a fast eye from near cover.
+    private static float _movingGrow, _movingCover;
+    // Whatever the player holds (gun, knife, grenade, meds; nothing with empty hands): its parts'
+    // renderers, fetched again when the item or hands controller changes and every couple of
+    // seconds (attachments changed in a raid), put on the round's screen part by part for the
+    // pyramid's gear mask (DepthPyramid.AddGear). A part not listed yet only gets the full margin.
+    private static GameObject? _gearRoot;
+    private static object? _gearHands;
+    private static float _gearAt;
+    private static Renderer[] _gearParts = Array.Empty<Renderer>();
+    internal static int GearParts;
+    private static int _movingRound;
+    internal static int MovingKept;
+
+    // Lamps: the level's spot and point lights that don't move. One whose lit area (its range,
+    // for a spot only the cone) is covered wherever it's on screen lights nothing you can see: it
+    // gets an empty culling mask (no object lit, nothing drawn into its shadow map) until any of
+    // that area may show, and the frame a turn brings in a part that wasn't checked. The game never writes a level light's culling mask (only the weapon-modding preview,
+    // on its own lights). Boxes and positions are taken each round on the main thread; Streak and
+    // Want are the worker's; the rest the main thread's.
+    private static Light[] _lamps = Array.Empty<Light>();
+    private static Vector3[] _lampMin = Array.Empty<Vector3>(), _lampMax = Array.Empty<Vector3>(), _lampAt = Array.Empty<Vector3>();
+    private static bool[] _lampTest = Array.Empty<bool>(), _lampWant = Array.Empty<bool>(), _lampOff = Array.Empty<bool>();
+    private static byte[] _lampStreak = Array.Empty<byte>();
+    private static int[] _lampMaskWas = Array.Empty<int>();
+    // A lamp's lit area on the round's screen (0-1, may reach past it; the worker's), and for a
+    // skipped one as its result was applied, with that round's view: a turn may bring in the part
+    // past the screen's edge, which wasn't checked (KeepLampsInView).
+    private static Vector4[] _lampRect = Array.Empty<Vector4>(), _lampSkipRect = Array.Empty<Vector4>();
+    private static Matrix4x4 _lampView;
+    private static int _lampsPastEdge;
+    private static bool _roundLamps;
+    internal static int LampsOff;
     private static readonly DepthPyramid Pyramid = new();
     internal static int Tested, Cells, CellsOut, CellsCovered;
     // Found covered in the last check (hidden or not: the game may not be drawing them anyway).
@@ -254,8 +320,8 @@ internal static class DepthCulling
         Seal();
     }
 
-    // Every static mesh of the level: not on a player, loot, sky, border-wall or trigger layer, not shadow-only, not
-    // switched by the game's distance stand-ins (or anyone) with forceRenderingOff, and nothing
+    // Every static mesh of the level, shadow-only ones included: not on a player, loot, sky,
+    // border-wall or trigger layer, not switched by the game's distance stand-ins (or anyone) with forceRenderingOff, and nothing
     // that moves or can be used. A LOD group is one object (all its levels hide together).
     private static IEnumerator<bool> ScanLevel()
     {
@@ -314,8 +380,7 @@ internal static class DepthCulling
                     foreach (var member in level.renderers)
                     {
                         if (member == null || unit.Contains(member)) continue;
-                        // A group the game switches is not ours; billboards and shadow-only
-                        // proxies are left alone.
+                        // A group the game switches is not ours; billboards are left alone.
                         if (gameSwitched.Contains(member) || member.forceRenderingOff)
                         {
                             ok = false;
@@ -340,15 +405,175 @@ internal static class DepthCulling
             PendingBounds.Add(bounds);
             Tracked++;
         }
+
+        var lamps = new List<Light>();
+        foreach (var light in UnityEngine.Object.FindObjectsByType<Light>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            if ((light.type == LightType.Spot || light.type == LightType.Point)
+                && (skipLayers & (1 << light.gameObject.layer)) == 0 && !Moves(light.transform, moving)) lamps.Add(light);
+        }
+
+        SetLamps(lamps.ToArray());
+    }
+
+    private static void SetLamps(Light[] lamps)
+    {
+        RestoreLamps();
+        _lamps = lamps;
+        var n = lamps.Length;
+        _lampMin = new Vector3[n];
+        _lampMax = new Vector3[n];
+        _lampAt = new Vector3[n];
+        _lampTest = new bool[n];
+        _lampWant = new bool[n];
+        _lampOff = new bool[n];
+        _lampStreak = new byte[n];
+        _lampMaskWas = new int[n];
+        _lampRect = new Vector4[n];
+        _lampSkipRect = new Vector4[n];
+        _lampsPastEdge = 0;
+    }
+
+    // The space a lamp can light: its range around it; for a spot only the cone out to its range
+    // (a box around the apex and the far end's disk), unless it's so wide the sphere is smaller.
+    private static void LampBox(Light light, out Vector3 min, out Vector3 max)
+    {
+        var t = light.transform;
+        var p = t.position;
+        var r = light.range;
+        min = p - Vector3.one * r;
+        max = p + Vector3.one * r;
+        if (light.type != LightType.Spot || light.spotAngle >= 120f) return;
+        var end = p + t.forward * r;
+        var disk = Vector3.one * (r * Mathf.Tan(light.spotAngle * 0.5f * Mathf.Deg2Rad));
+        min = Vector3.Max(min, Vector3.Min(p, end - disk));
+        max = Vector3.Min(max, Vector3.Max(p, end + disk));
+    }
+
+    // Main thread, after a result is applied. A lamp is switched off only while its last round
+    // wants it and it hasn't moved since; everything else gets its mask back (unless someone
+    // changed it meanwhile).
+    private static void ApplyLamps(bool fits)
+    {
+        var on = fits && _roundLamps && Plugin.On(Plugin.SkipCoveredLamps);
+        int off = 0, pastEdge = 0;
+        _lampView = _roundViewProjection;
+        for (var l = 0; l < _lamps.Length; l++)
+        {
+            var light = _lamps[l];
+            if (light == null)
+            {
+                _lampOff[l] = false;
+                continue;
+            }
+
+            var want = on && _lampTest[l] && _lampWant[l] && (light.transform.position - _lampAt[l]).sqrMagnitude < 1e-4f;
+            if (want && !_lampOff[l] && light.cullingMask != 0)
+            {
+                _lampMaskWas[l] = light.cullingMask;
+                light.cullingMask = 0;
+                _lampOff[l] = true;
+            }
+            else if (!want && _lampOff[l])
+            {
+                if (light.cullingMask == 0) light.cullingMask = _lampMaskWas[l];
+                _lampOff[l] = false;
+            }
+
+            if (_lampOff[l])
+            {
+                off++;
+                _lampSkipRect[l] = _lampRect[l];
+                if (!OnScreen(_lampRect[l])) pastEdge++;
+            }
+        }
+
+        LampsOff = off;
+        _lampsPastEdge = pastEdge;
+    }
+
+    private static bool OnScreen(Vector4 rect) => rect.x >= 0f && rect.y >= 0f && rect.z <= 1f && rect.w <= 1f;
+
+    // Every frame before culling, while a skipped lamp's lit area reached past the screen's edge
+    // when it was checked: where the view is now, on that check's screen (the current view's
+    // corners 50 m out, put through that check's view; a turn moves them, a step barely). If the
+    // lamp's area there reaches past what was checked, its light is put back before this frame is
+    // drawn, so a turn never shows an unlit area. Turned around more than that: all of them back.
+    private static void KeepLampsInView(Camera camera)
+    {
+        float xMin = float.MaxValue, yMin = float.MaxValue, xMax = float.MinValue, yMax = float.MinValue;
+        var everywhere = false;
+        var m = _lampView;
+        for (var c = 0; c < 4; c++)
+        {
+            var p = camera.ViewportToWorldPoint(new Vector3(c & 1, c >> 1, 50f));
+            var w = m.m30 * p.x + m.m31 * p.y + m.m32 * p.z + m.m33;
+            if (w <= 0.01f)
+            {
+                everywhere = true;
+                break;
+            }
+
+            var sx = (m.m00 * p.x + m.m01 * p.y + m.m02 * p.z + m.m03) / w * 0.5f + 0.5f;
+            var sy = (m.m10 * p.x + m.m11 * p.y + m.m12 * p.z + m.m13) / w * 0.5f + 0.5f;
+            xMin = Math.Min(xMin, sx);
+            xMax = Math.Max(xMax, sx);
+            yMin = Math.Min(yMin, sy);
+            yMax = Math.Max(yMax, sy);
+        }
+
+        // Up to a texel of the depth image past the checked edge is let through, as every box is
+        // grown by a texel anyway: without it rounding, weapon sway and breathing put such lamps
+        // back every frame.
+        float slackX = BoxGrowTexels / _width, slackY = BoxGrowTexels / _height;
+        var pastEdge = 0;
+        for (var l = 0; l < _lamps.Length; l++)
+        {
+            if (!_lampOff[l] || OnScreen(_lampSkipRect[l])) continue;
+            var r = _lampSkipRect[l];
+            float x0 = Math.Max(r.x, xMin), y0 = Math.Max(r.y, yMin), x1 = Math.Min(r.z, xMax), y1 = Math.Min(r.w, yMax);
+            if (everywhere || x0 < x1 && y0 < y1 && (x0 < -slackX || y0 < -slackY || x1 > 1f + slackX || y1 > 1f + slackY))
+            {
+                ReleaseLamp(l);
+                LampsOff--;
+            }
+            else pastEdge++;
+        }
+
+        _lampsPastEdge = pastEdge;
+    }
+
+    // Its mask back, unless someone changed it since.
+    private static void ReleaseLamp(int l)
+    {
+        if (!_lampOff[l]) return;
+        _lampOff[l] = false;
+        var light = _lamps[l];
+        if (light != null && light.cullingMask == 0) light.cullingMask = _lampMaskWas[l];
+    }
+
+    private static void RestoreLamps()
+    {
+        for (var l = 0; l < _lamps.Length; l++)
+        {
+            ReleaseLamp(l);
+        }
+
+        Array.Clear(_lampStreak, 0, _lampStreak.Length);
+        LampsOff = _lampsPastEdge = 0;
     }
 
     // Not renderer.enabled: the game's room zones and baked visibility switch level objects
     // with it, so both apply and neither undoes the other.
     private static bool Candidate(Renderer renderer) =>
-        renderer.shadowCastingMode != ShadowCastingMode.ShadowsOnly
-        && (_skipLayers & (1 << renderer.gameObject.layer)) == 0
+        (_skipLayers & (1 << renderer.gameObject.layer)) == 0
         && !renderer.forceRenderingOff
         && (_gameSwitched.Count == 0 || !_gameSwitched.Contains(renderer));
+
+    // Plugin.HideShadows: a covered object is switched off whole, its shadow with it, and the
+    // game's shadow-only meshes (tracked like any other object) too. Off, a covered object only
+    // stops drawing on screen and shadow-only meshes are left alone.
+    private static bool HidesShadows => Plugin.On(Plugin.HideShadows);
 
     // Anything that can move or be used: physics bodies, animated parts, doors and other
     // interactive objects, players. Remembered per transform, since objects share parents.
@@ -369,7 +594,6 @@ internal static class DepthCulling
     private static string NotTracked(Renderer renderer)
     {
         if ((_skipLayers & (1 << renderer.gameObject.layer)) != 0) return $"not tracked: on a left-out layer ({LayerMask.LayerToName(renderer.gameObject.layer)})";
-        if (renderer.shadowCastingMode == ShadowCastingMode.ShadowsOnly) return "not tracked: shadow-only";
         if (renderer is not MeshRenderer) return "not tracked: not a mesh renderer";
         if (_gameSwitched.Contains(renderer)) return "not tracked: switched by the game's distance stand-ins";
         if (Moves(renderer.transform, new Dictionary<Transform, bool>())) return "not tracked: moves or can be used";
@@ -507,10 +731,16 @@ internal static class DepthCulling
                 {
                     var applyStart = Stopwatch.GetTimestamp();
                     Apply(set, camera.transform.position);
+                    ApplyLamps((camera.transform.position - _roundEye).sqrMagnitude <= MaxDrift * MaxDrift);
                     PartTicks[PartApply] += Stopwatch.GetTimestamp() - applyStart;
                     _appliedAge = _appliedAge * 0.9f + (Time.frameCount - _requestFrame) * 0.1f;
                     if (_lastApplyFrame > 0) _resultEvery = _resultEvery * 0.9f + (Time.frameCount - _lastApplyFrame) * 0.1f;
                     _lastApplyFrame = Time.frameCount;
+                    var applied = Time.realtimeSinceStartup;
+                    // Up at once, down slowly: the margin is for the slow rounds, not the average one.
+                    _appliedSeconds = Rise(_appliedSeconds, applied - _roundTime);
+                    if (_lastApplyTime > 0f) _resultSeconds = Rise(_resultSeconds, applied - _lastApplyTime);
+                    _lastApplyTime = applied;
                 }
             }
 
@@ -521,10 +751,27 @@ internal static class DepthCulling
                 PartTicks[PartApply] += Stopwatch.GetTimestamp() - staleStart;
             }
 
+            if (_lampsPastEdge > 0) KeepLampsInView(camera);
+
             _projection = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
             _viewProjection = _projection * camera.worldToCameraMatrix;
             _viewEye = camera.transform.position;
             _viewFrame = Time.frameCount;
+            // Once a frame (a second render of the camera in the same frame would read as a jump).
+            if (_speedFrame != Time.frameCount)
+            {
+                _speedFrame = Time.frameCount;
+                var now = Time.realtimeSinceStartupAsDouble;
+                if (_speedTime > 0.0 && now > _speedTime)
+                {
+                    var v = camera.transform.InverseTransformDirection(_viewEye - _speedEye) / (float)(now - _speedTime);
+                    _eyeSpeedPlus = new Vector3(TrackSpeed(_eyeSpeedPlus.x, v.x), TrackSpeed(_eyeSpeedPlus.y, v.y), TrackSpeed(_eyeSpeedPlus.z, v.z));
+                    _eyeSpeedMinus = new Vector3(TrackSpeed(_eyeSpeedMinus.x, -v.x), TrackSpeed(_eyeSpeedMinus.y, -v.y), TrackSpeed(_eyeSpeedMinus.z, -v.z));
+                }
+
+                _speedEye = _viewEye;
+                _speedTime = now;
+            }
         }
         catch (Exception ex)
         {
@@ -535,6 +782,43 @@ internal static class DepthCulling
             _frameTicks += Stopwatch.GetTimestamp() - start;
         }
     }
+
+    // Main thread, while no check runs (the pyramid is the worker's then).
+    private static void TakeGear(ref Matrix4x4 m)
+    {
+        Pyramid.ClearGear();
+        GearParts = 0;
+        var hands = Comfort.Common.Singleton<GameWorld>.Instance?.MainPlayer?.HandsController;
+        var root = hands != null ? hands.ControllerGameObject : null;
+        if (root == null) return;
+        if (!ReferenceEquals(root, _gearRoot) || !ReferenceEquals(hands, _gearHands) || Time.unscaledTime - _gearAt > 2f)
+        {
+            _gearRoot = root;
+            _gearHands = hands;
+            _gearAt = Time.unscaledTime;
+            var parts = new List<Renderer>();
+            foreach (var renderer in root.GetComponentsInChildren<Renderer>(true))
+            {
+                if (renderer is MeshRenderer or SkinnedMeshRenderer) parts.Add(renderer);
+            }
+
+            _gearParts = parts.ToArray();
+        }
+
+        foreach (var part in _gearParts)
+        {
+            if (part == null || !part.enabled || !part.gameObject.activeInHierarchy) continue;
+            var bounds = part.bounds;
+            if (!Project(bounds.min, bounds.max, ref m, out var xMin, out var yMin, out var xMax, out var yMax, out var near, out var far)) continue;
+            Pyramid.AddGear(xMin, yMin, xMax, yMax, near, far);
+            GearParts++;
+        }
+    }
+
+    // Speed in one direction: up at once (a sprint starts), down slowly (a pause in a stride isn't a stop).
+    private static float TrackSpeed(float was, float velocity) => Rise(was, Math.Min(Math.Max(velocity, 0f), MaxEyeSpeed));
+
+    private static float Rise(float was, float value) => value > was ? value : was * 0.9f + value * 0.1f;
 
     // Every frame in raid while the setting is on: keeps track of the main camera and hands
     // errors from the camera callbacks and the worker to the caller (which switches it off).
@@ -733,11 +1017,30 @@ internal static class DepthCulling
         _height = Mathf.Max(1, texture.height >> mip);
         _roundViewProjection = _viewProjection;
         _roundEye = _viewEye;
+        TakeGear(ref _roundViewProjection);
+        _minDistance = Plugin.HideBeyond.Value;
         _roundScoped = ScopeArea();
         _p22 = _projection.m22;
         _p23 = _projection.m23;
         // One texel of the depth image, as an angle: how far the nearest cover may shift.
         _texelAngle = 2f / (Mathf.Abs(_projection.m11) * _height);
+        var latency = _appliedSeconds + _resultSeconds;
+        _roundReachPlus = Vector3.Min(_eyeSpeedPlus * latency, Vector3.one * MaxDrift);
+        _roundReachMinus = Vector3.Min(_eyeSpeedMinus * latency, Vector3.one * MaxDrift);
+        _roundReach = Vector3.Max(_roundReachPlus, _roundReachMinus);
+        _roundLamps = Plugin.On(Plugin.SkipCoveredLamps);
+        for (var l = 0; l < _lamps.Length; l++)
+        {
+            var light = _lamps[l];
+            var test = _roundLamps && light != null && light.isActiveAndEnabled;
+            _lampTest[l] = test;
+            if (!test) continue;
+            LampBox(light!, out _lampMin[l], out _lampMax[l]);
+            _lampAt[l] = light!.transform.position;
+        }
+        _tanX = 1f / Mathf.Abs(_projection.m00);
+        _tanY = 1f / Mathf.Abs(_projection.m11);
+        _texelAngleX = 2f * _tanX / _width;
         _roundEpoch = _epoch;
         _roundTime = Time.realtimeSinceStartup;
         _roundGameTime = Time.time;
@@ -750,7 +1053,7 @@ internal static class DepthCulling
     }
 
     // Debug view (Plugin.ShowCells, in Release too: static level objects only), through walls, within DebugRange, in view: every object by
-    // its last result (red hidden, yellow something behind it shows), cells as faint outlines. Covered objects the game isn't
+    // its last result (red hidden, yellow something behind it shows, green kept drawn while moving). Covered objects the game isn't
     // drawing anyway aren't shown.
     private const float DebugRange = 150f;
     private static Material? _lineMaterial;
@@ -776,8 +1079,6 @@ internal static class DepthCulling
         for (var c = 0; c < set.CellState.Length; c++)
         {
             if (set.CellState[c] == CellOut || !InRange(set.CellMin[c], set.CellMax[c], eye)) continue;
-            GL.Color(new Color(0.7f, 0.7f, 0.7f, 0.06f));
-            Box(set.CellMin[c], set.CellMax[c]);
             for (var i = set.CellStart[c]; i < set.CellStart[c + 1]; i++)
             {
                 if (!InRange(set.Min[i], set.Max[i], eye)) continue;
@@ -787,9 +1088,17 @@ internal static class DepthCulling
                 else if (why == WhyScopeShows) GL.Color(new Color(1f, 0.2f, 1f, 0.35f));
                 else if (why == WhyScopeAhead) GL.Color(new Color(0.2f, 0.9f, 1f, 0.3f));
                 else if (why == WhyScopeNoDepth) GL.Color(new Color(1f, 0.5f, 0f, 0.35f));
+                else if (why == WhyMoving) GL.Color(new Color(0.2f, 1f, 0.3f, 0.35f));
                 else continue;
                 Box(set.Min[i], set.Max[i]);
             }
+        }
+
+        // Lamps switched off for lighting only covered space: their lit area in blue.
+        GL.Color(new Color(0.3f, 0.5f, 1f, 0.5f));
+        for (var l = 0; l < _lamps.Length; l++)
+        {
+            if (_lampOff[l] && InRange(_lampMin[l], _lampMax[l], eye)) Box(_lampMin[l], _lampMax[l]);
         }
 
         GL.End();
@@ -892,16 +1201,18 @@ internal static class DepthCulling
 
     // While aiming through a scope: where on the main screen the world may show through it. The
     // optic camera doesn't see the gun, the hands or the scope, so what they cover on screen
-    // may be in its view: its lens, and everything inside the optic camera's view (at 10 m and
-    // 1 km, for the parallax between it and the eye), grown by a texel. False without a scope.
+    // may be in its view: its lens, and everything inside the optic camera's view (at _minDistance
+    // and 1 km, for the parallax between it and the eye), grown by a texel. False without a scope.
     // Zoomed in, a small flick sweeps the scope across a lot, and what comes into it must
-    // already be drawn rather than appear a few frames late. Behind the lens, outside the
-    // scope's picture, nobody sees: there ScopeCovers keeps drawn what's within ScopeMargin
-    // degrees of the scope's view (the start of a turn, a change of direction; degrees, not a
-    // share of the view, which is only a few degrees wide zoomed in), and what it will reach
-    // ScopeLead seconds ahead at the rate it's turning (a result is in use until about then),
-    // at most ScopeMaxLead degrees.
-    private const float ScopeMargin = 1f;
+    // already be drawn rather than appear a few frames late. Around the scope's picture the
+    // main view sees the scope itself (its tube, the gun), not the world, so its depth says
+    // nothing there: ScopeCovers keeps drawn what's within ScopeMargin degrees of the scope's
+    // view (the first frames of a flick, before its rate is known, a change of direction;
+    // degrees, so the zoomed-in view, only a few degrees wide, gets a ring many times its own
+    // size), and what it will reach ScopeLead seconds ahead at the rate it's turning (a result
+    // is in use until about then), at most ScopeMaxLead degrees. A bounded cone around where
+    // the scope points; outside it the main depth decides as everywhere else.
+    private const float ScopeMargin = 5f;
     private const float ScopeLead = 0.1f;
     private const float ScopeMaxLead = 30f;
     private const float TurningShare = 0.1f;
@@ -914,8 +1225,6 @@ internal static class DepthCulling
     // For the status line: the optic camera's vertical view and this round's turn lead.
     internal static float ScopeFov, ScopeLeadDegrees;
     private static float _scopeReachX, _scopeReachY, _scopeShiftX, _scopeShiftY;
-    private static bool _hasLens;
-    private static float _lensXMin, _lensYMin, _lensXMax, _lensYMax;
     // A turn of 90 degrees and more: everything may come into view.
     private const float MaxShift = 1000f;
     private static bool ScopeArea()
@@ -981,13 +1290,6 @@ internal static class DepthCulling
             }
         }
 
-        // Where the main view sees the lens: its depth there is the lens, not the world.
-        _hasLens = xMin <= xMax;
-        _lensXMin = xMin - 1f / _width;
-        _lensXMax = xMax + 1f / _width;
-        _lensYMin = yMin - 1f / _height;
-        _lensYMax = yMax + 1f / _height;
-
         // The view's edges ScopeMargin degrees further out, in viewport units (0-1 is the view).
         var halfV = Mathf.Atan(1f / projection.m11);
         var halfH = Mathf.Atan(1f / projection.m00);
@@ -1013,15 +1315,16 @@ internal static class DepthCulling
             }
             else _scopeShiftX = _scopeShiftY = MaxShift;
         }
-        // Plus the scope's own view as it is now (a low zoom sees past the lens's edge). Not the
-        // margin or the turn: outside the lens the main depth is the world, seen from almost the
-        // same spot, so what it shows covered stays covered when the scope swings over it. Only
-        // behind the lens is it blind, and ScopeCovers keeps what may swing in from there drawn.
+        // Plus everything the scope sees now or may soon: its view grown by the margin and the
+        // turn lead (a low zoom sees past the lens's edge; around the lens the main view sees
+        // the scope's tube and the gun, so what's there is ScopeCovers' to judge).
+        float nx0 = -2f * reachX + 2f * Math.Min(0f, _scopeShiftX), nx1 = 2f * reachX + 2f * Math.Max(0f, _scopeShiftX);
+        float ny0 = -2f * reachY + 2f * Math.Min(0f, _scopeShiftY), ny1 = 2f * reachY + 2f * Math.Max(0f, _scopeShiftY);
         for (var c = 0; c < 8; c++)
         {
-            var d = (c & 4) == 0 ? MinDistance : 1000f;
+            var d = (c & 4) == 0 ? _minDistance : 1000f;
             // Camera space looks down -z.
-            var p = camToWorld.MultiplyPoint3x4(new Vector3(((c & 1) == 0 ? -d : d) / projection.m00, ((c & 2) == 0 ? -d : d) / projection.m11, -d));
+            var p = camToWorld.MultiplyPoint3x4(new Vector3(((c & 1) == 0 ? nx0 : nx1) * d / projection.m00, ((c & 2) == 0 ? ny0 : ny1) * d / projection.m11, -d));
             var clip = new Vector3(m.m00 * p.x + m.m01 * p.y + m.m02 * p.z + m.m03, m.m10 * p.x + m.m11 * p.y + m.m12 * p.z + m.m13, m.m30 * p.x + m.m31 * p.y + m.m32 * p.z + m.m33);
             if (clip.z > Front) Extend(clip, ref xMin, ref yMin, ref xMax, ref yMax);
         }
@@ -1094,6 +1397,7 @@ internal static class DepthCulling
         {
             Array.Clear(set.Streak, 0, set.Streak.Length);
             Array.Clear(set.NextCheck, 0, set.NextCheck.Length);
+            Array.Clear(_lampStreak, 0, _lampStreak.Length);
             _resetStreaks = false;
         }
 
@@ -1114,6 +1418,9 @@ internal static class DepthCulling
             Pyramid.Build(_depth, _width, _height);
             if (_roundScopeDepth) ScopePyramid.Build(_scopeDepth, _scopeWidth, _scopeHeight);
             _scopeTestedRound = 0;
+            _movingRound = 0;
+            _movingGrow = 0f;
+            _movingCover = float.MaxValue;
             SetPlanes(Planes, ref m);
             set.Want.Clear();
             set.Try.Clear();
@@ -1186,11 +1493,11 @@ internal static class DepthCulling
                 {
                     tested++;
                     var why = cellNear && Near(set.Min[i], set.Max[i], eye) ? WhyNear : BoxWhy(set.Min[i], set.Max[i], ref m);
-                    // Behind the lens next to the scope's picture nobody sees it, but it got there
-                    // from somewhere one of the views did (the open view, or the scope's picture):
-                    // its last verdict stands. The same while the scope's depth is late (a round
-                    // without it every so often). Only what was last seen showing is kept drawn.
-                    if ((why == WhyScopeAhead || why == WhyScopeNoDepth) && set.Streak[i] != 0) why = WhyCovered;
+                    // While the scope's depth is late (a round without it every so often) the last
+                    // verdict stands: only what was last seen showing is kept drawn. Next to the
+                    // scope's picture it's always drawn: the last verdict there may have come from
+                    // the main depth seeing the scope itself.
+                    if (why == WhyScopeNoDepth && set.Streak[i] != 0) why = WhyCovered;
                     if (why == WhyCovered)
                     {
                         MarkCovered(set, i, eye, now, _usedScope ? 0f : Slack(Pyramid.NearestCover), round, true);
@@ -1206,12 +1513,24 @@ internal static class DepthCulling
                         continue;
                     }
 
+                    if (why == WhyMoving) _movingRound++;
                     set.Why[i] = why;
                     set.Streak[i] = 0;
                     set.NextCheck[i] = now + VisibleRecheck * (0.75f + (i & 15) / 30f);
                     // Covered again later, it's asked at once (Apply), not as a retry.
                     set.RetryAt[i] = 0f;
                 }
+            }
+
+            // Lamps: covered HideAfter rounds in a row (as objects), shown on the first that isn't.
+            // Only the part on screen is checked; where the box lands is kept for the turn check.
+            for (var l = 0; l < _lamps.Length; l++)
+            {
+                var covered = _lampTest[l] && BoxWhy(_lampMin[l], _lampMax[l], ref m) == WhyCovered;
+                if (covered && Project(_lampMin[l], _lampMax[l], ref m, out var lx0, out var ly0, out var lx1, out var ly1, out _, out _))
+                    _lampRect[l] = new Vector4(lx0, ly0, lx1, ly1);
+                _lampStreak[l] = covered ? (byte)Math.Min(_lampStreak[l] + 1, HideAfter) : (byte)0;
+                _lampWant[l] = _lampStreak[l] >= HideAfter;
             }
 
             CellsOut = outCells;
@@ -1223,8 +1542,11 @@ internal static class DepthCulling
             WorkerMs = (Stopwatch.GetTimestamp() - start) * Diagnostics.TickMs;
             Rounds++;
             ScopeTested = _scopeTestedRound;
+            MovingKept = _movingRound;
             Status = $"{_width}x{_height} depth (arrives after {_arriveFrames:0.0} frames, {_arriveMs:0.0} ms; results applied {_appliedAge:0.0} frames old, one every {_resultEvery:0.0} frames), "
                      + $"{Tested} tested; cells: {CellsOut} of {Cells} out of view, {CellsCovered} covered whole"
+                     + (_roundReach.sqrMagnitude > 0.0001f ? $"; moving {_roundReach.x:0.00} m sideways, {_roundReach.y:0.00} up, {_roundReach.z:0.00} forward before the next result, {MovingKept} kept drawn for it, {GearParts} parts of what you hold not counted as sliding cover" + (MovingKept > 0 ? $" (grown up to {_movingGrow:0.0} texels, cover as near as {_movingCover:0.0} m)" : "") : "")
+                     + (_roundLamps ? $"; lamps: {LampsOff} of {_lamps.Length} skipped (their lit area covered)" : "")
                      + (_roundScoped ? _roundScopeDepth ? $"; scope: {_scopeWidth}x{_scopeHeight} depth, {ScopeTested} checked against it, view {ScopeFov:0.0}°, lead {ScopeLeadDegrees:0.0}°" : "; scope: no depth of its own, its view stays drawn" : "");
         }
         catch (Exception ex)
@@ -1236,14 +1558,15 @@ internal static class DepthCulling
     }
 
     private const byte WhyCovered = 1, WhyNear = 2, WhyOutOfView = 3, WhyBehindCamera = 4, WhyShowsBehind = 5,
-        WhyScopeShows = 6, WhyScopeAhead = 7, WhyScopeNoDepth = 8;
+        WhyScopeShows = 6, WhyScopeAhead = 7, WhyScopeNoDepth = 8, WhyMoving = 9;
 
     private static readonly string[] WhyText =
     {
-        "not checked yet", "covered", "nearer than 10 m", "out of view",
+        "not checked yet", "covered", "nearer than hiding starts", "out of view",
         "partly behind the camera", "something farther (or sky) shows somewhere in its box",
-        "something farther shows in the scope's own depth", "next to the scope's view where nobody sees it, last seen showing",
+        "something farther shows in the scope's own depth", "within reach of the scope's view (it may swing in), kept drawn",
         "in the scope's view, which has no depth of its own",
+        "covered, but you're moving and its cover's edge could slide off it before the next check, kept drawn",
     };
 
     // For the renderer census (profiling only): what the hiding makes of a drawn renderer.
@@ -1323,7 +1646,7 @@ internal static class DepthCulling
         var dx = Math.Max(Math.Max(min.x - eye.x, eye.x - max.x), 0f);
         var dy = Math.Max(Math.Max(min.y - eye.y, eye.y - max.y), 0f);
         var dz = Math.Max(Math.Max(min.z - eye.z, eye.z - max.z), 0f);
-        return dx * dx + dy * dy + dz * dz < MinDistance * MinDistance;
+        return dx * dx + dy * dy + dz * dz < _minDistance * _minDistance;
     }
 
     // The left, right, bottom and top planes of the round's view, worked out once per round:
@@ -1363,17 +1686,54 @@ internal static class DepthCulling
     {
         _usedScope = false;
         if (OutOfView(min, max)) return WhyOutOfView;
-        if (!Project(min, max, ref m, out var xMin, out var yMin, out var xMax, out var yMax, out var nearest)) return WhyBehindCamera;
-        var result = Pyramid.Test(xMin, yMin, xMax, yMax, nearest);
+        if (!Project(min, max, ref m, out var xMin, out var yMin, out var xMax, out var yMax, out var nearest, out var farthest)) return WhyBehindCamera;
+        float growX = BoxGrowTexels / _width, growY = BoxGrowTexels / _height;
+        var result = Pyramid.Test(xMin - growX, yMin - growY, xMax + growX, yMax + growY, nearest);
         if (result == DepthCover.OffScreen) return WhyOutOfView;
         if (result != DepthCover.Covered) return WhyShowsBehind;
-        if (!_roundScoped || xMax < _scopeXMin || xMin > _scopeXMax || yMax < _scopeYMin || yMin > _scopeYMax) return WhyCovered;
-        _usedScope = true;
-        var scope = ScopeCovers(min, max);
-        // Not seen by the scope yet, but outside the lens on the main screen: there the main
-        // depth is the world from almost the same spot, and it found the box covered.
-        if (scope == WhyScopeAhead && (!_hasLens || xMax < _lensXMin || xMin > _lensXMax || yMax < _lensYMin || yMin > _lensYMax)) return WhyCovered;
-        return scope;
+        if (_roundScoped && xMax >= _scopeXMin && xMin <= _scopeXMax && yMax >= _scopeYMin && yMin <= _scopeYMax)
+        {
+            // The scope's area has its own lead (ScopeCovers); the main depth only sees the scope there.
+            _usedScope = true;
+            return ScopeCovers(min, max);
+        }
+
+        // Moving: grown by how far the nearest cover under it can slide across it before the next
+        // result, only on the side that can open up. Moving right, near cover slides left past
+        // what's behind it, so a gap on the box's right comes towards it (left: the other way).
+        // Forward, near cover spreads out from the middle faster, so a gap on the box's side
+        // towards the middle comes towards it (back: the outer side). Up and down: both sides
+        // (which way is up on the depth image isn't worth getting wrong).
+        if (_roundReach == Vector3.zero) return WhyCovered;
+        // World cover only: the player's gun moves with the eye, so its edge doesn't slide; behind it
+        // things only shift by their own parallax (OwnShiftTexels).
+        var cover = Pyramid.NearestCover;
+        var gear = Pyramid.GearCover;
+        var outX = Math.Min(1f, Math.Max(Math.Abs(2f * xMin - 1f), Math.Abs(2f * xMax - 1f))) * _tanX;
+        var outY = Math.Min(1f, Math.Max(Math.Abs(2f * yMin - 1f), Math.Abs(2f * yMax - 1f))) * _tanY;
+        var rightOfMiddle = xMin + xMax > 1f;
+        float forward = _roundReachPlus.z * outX, back = _roundReachMinus.z * outX;
+        float reachRight = _roundReachPlus.x + (rightOfMiddle ? back : forward), reachLeft = _roundReachMinus.x + (rightOfMiddle ? forward : back);
+        var reachY = _roundReach.y + _roundReach.z * outY;
+        float capX = MaxMoveGrowAngle / _texelAngleX, capY = MaxMoveGrowAngle / _texelAngle;
+        var slideRight = DepthPyramid.MoveGrowTexels(reachRight, cover, farthest, _p23, _texelAngleX, capX);
+        var slideLeft = DepthPyramid.MoveGrowTexels(reachLeft, cover, farthest, _p23, _texelAngleX, capX);
+        var slideY = DepthPyramid.MoveGrowTexels(reachY, cover, farthest, _p23, _texelAngle, capY);
+        if (gear)
+        {
+            slideRight = Math.Max(slideRight, DepthPyramid.OwnShiftTexels(reachRight, nearest, _p22, _p23, _texelAngleX, capX));
+            slideLeft = Math.Max(slideLeft, DepthPyramid.OwnShiftTexels(reachLeft, nearest, _p22, _p23, _texelAngleX, capX));
+            slideY = Math.Max(slideY, DepthPyramid.OwnShiftTexels(reachY, nearest, _p22, _p23, _texelAngle, capY));
+        }
+
+        if (slideRight <= BoxGrowTexels && slideLeft <= BoxGrowTexels && slideY <= BoxGrowTexels) return WhyCovered;
+        float growRight = Math.Max(slideRight, BoxGrowTexels) / _width, growLeft = Math.Max(slideLeft, BoxGrowTexels) / _width;
+        growY = Math.Max(slideY, BoxGrowTexels) / _height;
+        if (Pyramid.Test(xMin - growLeft, yMin - growY, xMax + growRight, yMax + growY, nearest) == DepthCover.Covered) return WhyCovered;
+        // For the status line (built on this worker).
+        _movingGrow = Math.Max(_movingGrow, Math.Max(Math.Max(slideRight, slideLeft), slideY));
+        if (cover > 0f && cover + _p22 > 0f) _movingCover = Math.Min(_movingCover, _p23 / (cover + _p22));
+        return WhyMoving;
     }
 
     // In the scope's own depth: wholly inside its picture (part outside may swing in) and
@@ -1384,7 +1744,7 @@ internal static class DepthCulling
         // only the scope itself, so the main depth's answer stands. The lens covers far more
         // than a zoomed scope's view, and all of that used to stay drawn.
         var view = _roundScopeView;
-        if (Project(min, max, ref view, out var vxMin, out var vyMin, out var vxMax, out var vyMax, out _)
+        if (Project(min, max, ref view, out var vxMin, out var vyMin, out var vxMax, out var vyMax, out _, out _)
             && (vxMax < 0.5f - _scopeReachX + Math.Min(0f, _scopeShiftX) || vxMin > 0.5f + _scopeReachX + Math.Max(0f, _scopeShiftX)
                 || vyMax < 0.5f - _scopeReachY + Math.Min(0f, _scopeShiftY) || vyMin > 0.5f + _scopeReachY + Math.Max(0f, _scopeShiftY))) return WhyCovered;
         if (!_roundScopeDepth) return WhyScopeNoDepth;
@@ -1396,7 +1756,7 @@ internal static class DepthCulling
         // turning by more than a tenth of the scope's view per lead time: then it must not stick
         // out on the side the scope is turning towards, so what's about to sweep in is already
         // drawn (zoomed in, a smaller turn counts).
-        if (!Project(min, max, ref m, out var xMin, out var yMin, out var xMax, out var yMax, out var nearest)) return WhyScopeAhead;
+        if (!Project(min, max, ref m, out var xMin, out var yMin, out var xMax, out var yMax, out var nearest, out _)) return WhyScopeAhead;
         if (_scopeShiftX > TurningShare && xMax > 1f || _scopeShiftX < -TurningShare && xMin < 0f
             || _scopeShiftY > TurningShare && yMax > 1f || _scopeShiftY < -TurningShare && yMin < 0f) return WhyScopeAhead;
         return ScopePyramid.Test(xMin, yMin, xMax, yMax, nearest) switch
@@ -1409,9 +1769,9 @@ internal static class DepthCulling
 
     // The box on screen (0-1) and the depth of its nearest corner (larger is nearer); false
     // when part of it is behind the camera.
-    private static bool Project(Vector3 min, Vector3 max, ref Matrix4x4 m, out float xMin, out float yMin, out float xMax, out float yMax, out float nearest)
+    private static bool Project(Vector3 min, Vector3 max, ref Matrix4x4 m, out float xMin, out float yMin, out float xMax, out float yMax, out float nearest, out float farthest)
     {
-        xMin = yMin = float.MaxValue;
+        xMin = yMin = farthest = float.MaxValue;
         xMax = yMax = nearest = float.MinValue;
         for (var c = 0; c < 8; c++)
         {
@@ -1428,6 +1788,7 @@ internal static class DepthCulling
             yMin = Math.Min(yMin, sy);
             yMax = Math.Max(yMax, sy);
             nearest = Math.Max(nearest, sz);
+            farthest = Math.Min(farthest, sz);
         }
 
         return true;
@@ -1542,8 +1903,14 @@ internal static class DepthCulling
             var renderer = renderers[n];
             if (renderer == null) continue;
             var mode = renderer.shadowCastingMode;
-            if (mode == ShadowCastingMode.ShadowsOnly) continue;
-            if (mode != ShadowCastingMode.Off)
+            if (HidesShadows)
+            {
+                if (renderer.forceRenderingOff) continue;
+                renderer.forceRenderingOff = true;
+                was[n] = ShadowCastingMode.ShadowsOnly;
+            }
+            else if (mode == ShadowCastingMode.ShadowsOnly) continue;
+            else if (mode != ShadowCastingMode.Off)
             {
                 renderer.shadowCastingMode = ShadowCastingMode.ShadowsOnly;
                 was[n] = mode;
@@ -1668,12 +2035,14 @@ internal static class DepthCulling
         _epoch++;
         _resetStreaks = true;
         if (_set != null) ShowHidden(_set);
+        RestoreLamps();
     }
 
     // Leaving a raid: its objects are gone with the scene.
     internal static void Clear()
     {
         ShowAll();
+        SetLamps(Array.Empty<Light>());
         _set = null;
         PendingRenderers.Clear();
         PendingBounds.Clear();
@@ -1682,6 +2051,10 @@ internal static class DepthCulling
         _gameSwitched = new HashSet<Renderer>();
         Rounds = 0;
         _lastApplyFrame = 0;
+        _lastApplyTime = 0f;
+        _speedTime = -1.0;
+        _eyeSpeedPlus = _eyeSpeedMinus = Vector3.zero;
+        MovingKept = 0;
         Waiting = 0;
         _applyFrom = 0;
         Status = "waiting for the scan";

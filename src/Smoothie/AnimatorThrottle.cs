@@ -160,8 +160,11 @@ internal static class AnimatorThrottle
 
         if (player.HealthController?.IsAlive != true)
         {
-            // Player.OnDead has already switched the animators off for the ragdoll.
-            if (state != null) States.Remove(player);
+            // Player.OnDead has already switched the animators off for the ragdoll. Died
+            // mid-step: put the game's speeds back, or the sped-up one stays on the animator.
+            if (state == null) return;
+            if (state.StepScale > 0f) FinishUnityStep(state, 0f);
+            States.Remove(player);
             return;
         }
 

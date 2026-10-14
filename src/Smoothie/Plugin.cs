@@ -13,7 +13,7 @@ using UnityEngine;
 
 namespace Smoothie;
 
-[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.3")]
+[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.4")]
 // Optional: when Fika is installed it has to load first, or its types aren't there yet when
 // Smoothie looks for them and its observed bots aren't recognised. Without Fika this does nothing.
 [BepInDependency("com.fika.core", BepInDependency.DependencyFlags.SoftDependency)]
@@ -40,7 +40,12 @@ public class Plugin : BaseUnityPlugin
     internal static ConfigEntry<bool> HotPathFixes = null!;
     internal static ConfigEntry<bool> NoMuzzleShadows = null!;
     internal static ConfigEntry<bool> HideCovered = null!;
+    internal static ConfigEntry<float> HideBeyond = null!;
+    internal static ConfigEntry<bool> HideShadows = null!;
+    internal static ConfigEntry<bool> SkipCoveredLamps = null!;
+    internal static ConfigEntry<bool> SortByMaterial = null!;
     internal static ConfigEntry<bool> ShowDepth = null!;
+
     // Shows static level objects behind walls; never loot, players or anything that moves
     // (those aren't tracked), so it gives away nothing a map doesn't.
     internal static ConfigEntry<bool> ShowCells = null!;
@@ -108,14 +113,23 @@ public class Plugin : BaseUnityPlugin
 
         const string other = "3. Other fixes";
         CorpseSettleTime = Bind(other, "Corpses stop moving after (s)", 5f,
-            "Dead bodies keep simulating physics until they settle, up to 15 s (30 s in Fika). Ending it sooner saves CPU in big fights; bodies have almost always landed by then.", 100, false,
+            "Dead bodies keep simulating physics until they settle, up to 15 s (30 s in Fika). Ending it sooner saves CPU in big fights; bodies have almost always landed by then. Off automatically when Rupture is installed: its bodies react to hits after they land, and this would freeze them for good.", 100, false,
             new AcceptableValueRange<float>(2f, 30f));
         HotPathFixes = Bind(other, "Remove small CPU waste in game code", true,
             "Fixes spots where the game or a mod wastes CPU or memory: the main menu's video background is paused while it's hidden (it kept playing through raids, costing 2-3 CPU cores), bots the game tried to spawn no longer stay in memory until the game is closed, and the indoor lighting is no longer prepared every frame for scope and menu cameras that aren't drawing. Nothing you can see changes.", 90);
         NoMuzzleShadows = Bind(other, "Muzzle flashes of others cast no shadows", true,
             "Each shot lights up the area around the gun, and if that light casts shadows the game redraws everything nearby up to 6 times. In a big fight that more than doubles the shadow work. With this on, other players' and bots' muzzle flashes still light things up, just without shadows. Your own gun is left alone.", 85);
         HideCovered = Bind(other, "Hide objects covered by nearer ones (experimental)", true,
-            "Most maps have no occlusion culling, so buildings, walls, cars and furniture behind nearer ones are still drawn (on Customs thousands of draw calls). With this on, level objects at least 10 m away stop drawing while the last frame's picture shows them completely covered by something nearer, checked on another CPU core. Shadows don't change: covered objects keep casting theirs. Something coming into view can appear a few frames late (about 1/50 s), only when you move, not when you turn. Doors, loot, players and anything that moves are left alone. Collecting the objects takes a moment 10 seconds into each raid.", 81);
+            "Most maps have no occlusion culling, so buildings, walls, cars and furniture behind nearer ones are still drawn (on Customs thousands of draw calls). With this on, level objects beyond the distance set below (3 m by default) stop drawing while the last frame's picture shows them completely covered by something nearer, checked on another CPU core. Covered objects' shadows: see \"Covered objects also stop casting shadows\". Something coming into view can appear a few frames late (about 1/50 s), only when you move, not when you turn. Doors, loot, players and anything that moves are left alone. Collecting the objects takes a moment 10 seconds into each raid.", 84);
+        HideBeyond = Bind(other, "Hide covered objects only beyond (m)", 3f,
+            "With \"Hide objects covered by nearer ones\" on: everything nearer than this stays drawn, all around you (behind you the game doesn't draw anyway). Lower hides more close by, like the room next to yours; higher is safer if something close ever shows up late, where it's big on screen.", 83, false,
+            new AcceptableValueRange<float>(1f, 10f));
+        SkipCoveredLamps = Bind(other, "Skip lamps lighting only covered areas", true,
+            "With \"Hide objects covered by nearer ones\" on: a lamp whose whole lit area is hidden behind nearer things (the next room, the other side of a wall) lights nothing you can see, so it stops lighting and drawing its shadows until any of that area may come into view. Each lamp with shadows draws everything around it again for its shadow (on Factory up to ~100 draw calls each). Its light can come on a moment late when the area comes into view, like hidden objects. The sun and moon are left alone.", 81);
+        HideShadows = Bind(other, "Covered objects also stop casting shadows", true,
+            "With \"Hide objects covered by nearer ones\" on: a covered object isn't drawn into shadow maps either, and the game's separate shadow-only meshes (simplified shadow casters for big structures) are checked and switched off when covered too. In buildings most of what's drawn is shadows: on Factory over a thousand draw calls a frame. Off: covered objects keep casting their shadows, which is always right but costs those draws.", 82);
+        SortByMaterial = Bind(other, "Draw level objects grouped by material", true,
+            "Draws everything solid grouped by material instead of nearest first, so the game switches materials less often (on Streets ~270 fewer switches a frame). That moves a little work from your CPU, which Tarkov is almost always waiting on, to your graphics card (things hidden behind nearer ones get shaded too). Nothing you see changes. If the overlay shows GPU wait going up with this on, your graphics card is the limit: switch it off.", 79);
         KeepCleanupPaused = Bind(other, "Prevent memory cleanup stutters in raids", false,
             "On PCs with enough RAM the game pauses memory cleanup during a raid, so it can't stutter in a fight. Opening your inventory (an SPT feature) runs a cleanup and leaves cleanup on for the rest of the raid, which then stutters every minute or two. With this on, that cleanup still runs, then cleanup is paused again; if 4 GB of garbage piles up, one more runs. Only in raids, and only on PCs the game itself pauses cleanup on (the server's RAM limit, 25 GB by default): below that, cleanup stays on as the game wants. If something else switches it back on right after every pause (another mod), it's left on for the rest of that raid.", 75);
         KeepBackendConnection = Bind(other, "Keep server connection open (faster menus)", true,
@@ -131,12 +145,20 @@ public class Plugin : BaseUnityPlugin
         ShowCosts.SettingChanged += (_, _) => Overlay.Apply();
         // A/B for hiding covered objects: each flip is measured on its own (see MeasureFlip).
         HideCovered.SettingChanged += (_, _) => StartFlip(HideCovered, "hiding covered objects");
+        SortByMaterial.SettingChanged += (_, _) => StartFlip(SortByMaterial, "grouping by material");
+        SkipCoveredLamps.SettingChanged += (_, _) => StartFlip(SkipCoveredLamps, "skipping covered lamps");
+        // Shown and checked again from scratch, so each state is measured on its own.
+        HideShadows.SettingChanged += (_, _) =>
+        {
+            DepthCulling.ShowAll();
+            StartFlip(HideShadows, "covered objects without shadows");
+        };
         LogDrops = Bind(OverlaySection, "Log stutters and their causes", false,
             "Writes a line to the BepInEx log for every stutter, with what caused it, and a snapshot whenever the frame rate drops and stays down. Useful for bug reports.", 90, true);
         ShowStats = Bind(OverlaySection, "Show text stats panel", false,
             "A text panel with frame timings, memory and bot counts.", 80, true);
         ShowCells = Bind(OverlaySection, "Show hiding cells and hidden objects (debug)", false,
-            "Draws through walls, within 150 m and in view, every object by its last result: red hidden, yellow something behind it shows; while aiming, magenta something behind it shows in the scope's own depth, cyan next to the scope's view where nobody sees it, kept drawn because it was last seen showing, orange the scope has no depth of its own. Covered objects the game isn't drawing anyway aren't shown. The cells they're sorted into as faint grey outlines. Only static level objects: never loot, players or anything that moves.", 74, true);
+            "Draws through walls, within 150 m and in view, every object by its last result: red hidden, yellow something behind it shows; while aiming, magenta something behind it shows in the scope's own depth, cyan close enough to the scope's view that a flick may swing it in, kept drawn, orange the scope has no depth of its own; green covered, but kept drawn because you're moving and its cover's edge could slide off it before the next check. Covered objects the game isn't drawing anyway aren't shown. Only static level objects: never loot, players or anything that moves.", 74, true);
         ShowDepth = Bind(OverlaySection, "Show the depth image hiding uses", false,
             "Shows the small depth image \"Hide objects covered by nearer ones\" tests against, under the overlay: brighter is nearer, black is sky or far away. Purple: what your scope sees while aiming through one, with a margin; anything there must also be covered in the scope's own depth (shown to the right), or it stays drawn. Only what's already on your screen.", 75, true);
         ProfileScripts = Bind(OverlaySection, "Log time per script (slow)", false,
@@ -349,7 +371,7 @@ public class Plugin : BaseUnityPlugin
         var draws = Diagnostics.DrawCalls >= 0 ? $"{_flipDraws / FlipFrames.Count:0} ({_flipSetPass / FlipFrames.Count:0} SetPass)" : "n/a (overlay off)";
         Log.LogInfo($"A/B {_flipName} {(On(_flipSetting) ? "ON " : "OFF")}: frame {average:0.00} ms (median {median:0.00}, 95% {worst:0.00}, {1000f / average:0} fps), draw calls {draws}" +
                     (_flipSetting == HideCovered && On(HideCovered) ? $", {DepthCulling.Saving} drawn objects hidden, check {DepthCulling.WorkerMs:0.0} ms on a worker" : "") +
-                    (Overlay.PartsSummary() is { Length: > 0 } parts ? $" |{parts.Replace("  overlay, last second:", "")}" : ""));
+                    (Overlay.PartsSummary() is { Length: > 0 } parts ? $" |{parts.Replace("  overlay, last second:", " overlay, last second (not this A/B window):")}" : ""));
     }
     private float _lastSweep;
 
@@ -416,6 +438,7 @@ public class Plugin : BaseUnityPlugin
             }
 
             _wasInRaid = inRaid;
+            if (inRaid) Guard(SortByMaterial, HotPaths.SortByMaterial);
             if (!inRaid) _pausedBeforeRaid = PauseFixes.Value;
             if (inRaid && Time.unscaledTime - _lastSweep > 5f)
             {

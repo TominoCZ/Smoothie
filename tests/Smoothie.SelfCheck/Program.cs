@@ -197,6 +197,43 @@ pyramid.Build(image, pw, ph);
 Check(pyramid.Test(0.05f, 0.05f, 0.95f, 0.95f, 0.1f) == DepthCover.Covered && Math.Abs(pyramid.NearestCover - 0.4f) < 1e-6f,
     $"nearest cover under a covered box is {pyramid.NearestCover}, not 0.4");
 
+// The player's gun: a block of near texels (0.9) in front of a wall (0.3). Registered as gear,
+// it still covers but isn't the nearest cover; a wall texel inside the gun's box (outside its
+// depth range) still is.
+for (var i = 0; i < image.Length; i++) image[i] = 0.3f;
+for (var r = 2; r < 8; r++)
+for (var x = 2; x < 10; x++) image[r * pw + x] = 0.9f;
+pyramid.Build(image, pw, ph);
+Check(pyramid.Test(0.05f, 0.05f, 0.95f, 0.95f, 0.1f) == DepthCover.Covered && Math.Abs(pyramid.NearestCover - 0.9f) < 1e-6f && !pyramid.GearCover,
+    $"without a gear mask the gun isn't the nearest cover ({pyramid.NearestCover})");
+// Rows are stored upside down: rows 2-7 are screen y from (ph - 8) / ph to (ph - 2) / ph.
+pyramid.AddGear(2f / pw, (ph - 8f) / ph, 10f / pw, (ph - 2f) / ph, 0.95f, 0.85f);
+pyramid.Build(image, pw, ph);
+Check(pyramid.Test(0.05f, 0.05f, 0.95f, 0.95f, 0.1f) == DepthCover.Covered && Math.Abs(pyramid.NearestCover - 0.3f) < 1e-6f && pyramid.GearCover,
+    $"gear taken as the nearest cover ({pyramid.NearestCover}, gear {pyramid.GearCover})");
+image[4 * pw + 4] = 0.5f;                                     // a wall texel inside the gun's box
+pyramid.Build(image, pw, ph);
+Check(pyramid.Test(0.05f, 0.05f, 0.95f, 0.95f, 0.1f) == DepthCover.Covered && Math.Abs(pyramid.NearestCover - 0.5f) < 1e-6f,
+    $"a wall texel inside the gun's box was taken for gear ({pyramid.NearestCover})");
+pyramid.ClearGear();
+pyramid.Build(image, pw, ph);
+Check(Math.Abs(pyramid.Test(0.05f, 0.05f, 0.95f, 0.95f, 0.1f) == DepthCover.Covered ? pyramid.NearestCover - 0.9f : 1f) < 1e-6f, "gear mask survived ClearGear");
+
+// Growth while moving: reversed-Z projection with near 0.05 m, far 10 km; depth of a distance z
+// is p23 / z - p22. Cover at 2 m, the box's far point at 20 m, eye 0.18 m: 0.18 * (1/2 - 1/20)
+// = 0.081 rad, about 8.9 texels of 0.0091 rad.
+const float zn = 0.05f, zf = 10000f;
+float p22 = zn / (zf - zn), p23 = zf * zn / (zf - zn);
+float DepthAt(float z) => p23 / z - p22;
+var grow = DepthPyramid.MoveGrowTexels(0.18f, DepthAt(2f), DepthAt(20f), p23, 0.0091f, 100f);
+Check(Math.Abs(grow - 8.9f) < 0.1f, $"growth for cover at 2 m, box at 20 m, 0.18 m of movement is {grow} texels, not ~8.9");
+Check(DepthPyramid.MoveGrowTexels(0.18f, DepthAt(2f), DepthAt(20f), p23, 0.0091f, 5f) == 5f, "growth isn't capped");
+Check(DepthPyramid.MoveGrowTexels(0f, DepthAt(2f), DepthAt(20f), p23, 0.0091f, 12f) == 0f, "standing still still grows");
+Check(DepthPyramid.MoveGrowTexels(0.18f, DepthAt(19.9f), DepthAt(20f), p23, 0.0091f, 12f) < 0.1f, "cover right in front of the box grows it much");
+// Behind the gun: only the object's own shift, 0.2 m at 20 m = 0.01 rad, about 1.1 texels.
+var own = DepthPyramid.OwnShiftTexels(0.2f, DepthAt(20f), p22, p23, 0.0091f, 100f);
+Check(Math.Abs(own - 1.1f) < 0.05f, $"own shift behind the gun is {own} texels, not ~1.1");
+
 if (failures.Count > 0)
 {
     Console.Error.WriteLine($"FAIL ({failures.Count}):");
