@@ -1452,6 +1452,7 @@ internal static class DepthCulling
             if (_roundScopeDepth) ScopePyramid.Build(_scopeDepth, _scopeWidth, _scopeHeight);
             _scopeTestedRound = 0;
             _movingRound = 0;
+            _deepRound = 0;
             _movingGrow = 0f;
             _movingCover = float.MaxValue;
             SetPlanes(Planes, ref m);
@@ -1505,7 +1506,7 @@ internal static class DepthCulling
                 {
                     coveredCells++;
                     set.CellState[c] = CellCovered;
-                    var slack = _usedScope ? 0f : Slack(Pyramid.NearestCover);
+                    var slack = _usedScope ? 0f : CoveredSlack();
                     foreach (var i in DueNow)
                     {
                         if (cellNear && Near(set.Min[i], set.Max[i], eye))
@@ -1534,7 +1535,7 @@ internal static class DepthCulling
                     if (why == WhyScopeNoDepth && set.Streak[i] != 0) why = WhyCovered;
                     if (why == WhyCovered)
                     {
-                        MarkCovered(set, i, eye, now, _usedScope ? 0f : Slack(Pyramid.NearestCover), round, true);
+                        MarkCovered(set, i, eye, now, _usedScope ? 0f : CoveredSlack(), round, true);
                         continue;
                     }
 
@@ -1558,15 +1559,21 @@ internal static class DepthCulling
 
             // Lamps: covered HideAfter rounds in a row (as objects), shown on the first that isn't.
             // Only the part on screen is checked; where the box lands is kept for the turn check.
+            int lampsOn = 0, lampsInView = 0;
             for (var l = 0; l < _lamps.Length; l++)
             {
-                var covered = _lampTest[l] && BoxWhy(_lampMin[l], _lampMax[l], ref m) == WhyCovered;
+                var why = _lampTest[l] ? BoxWhy(_lampMin[l], _lampMax[l], ref m) : WhyOutOfView;
+                var covered = why == WhyCovered;
+                if (_lampTest[l]) lampsOn++;
+                if (_lampTest[l] && why != WhyOutOfView) lampsInView++;
                 if (covered && Project(_lampMin[l], _lampMax[l], ref m, out var lx0, out var ly0, out var lx1, out var ly1, out _, out _))
                     _lampRect[l] = new Vector4(lx0, ly0, lx1, ly1);
                 _lampStreak[l] = covered ? (byte)Math.Min(_lampStreak[l] + 1, HideAfter) : (byte)0;
                 _lampWant[l] = _lampStreak[l] >= HideAfter;
             }
 
+            LampsOn = lampsOn;
+            LampsInView = lampsInView;
             CellsOut = outCells;
             CellsCovered = coveredCells;
             Cells = cells;
@@ -1577,8 +1584,9 @@ internal static class DepthCulling
             Rounds++;
             ScopeTested = _scopeTestedRound;
             MovingKept = _movingRound;
+            CoveredDeep = _deepRound;
             Status = $"{_width}x{_height} depth (arrives after {_arriveFrames:0.0} frames, {_arriveMs:0.0} ms; results applied {_appliedAge:0.0} frames old, one every {_resultEvery:0.0} frames), "
-                     + $"{Tested} tested; cells: {CellsOut} of {Cells} out of view, {CellsCovered} covered whole"
+                     + $"{Tested} tested ({CoveredDeep} covered deep, checked again later); cells: {CellsOut} of {Cells} out of view, {CellsCovered} covered whole"
                      + (_roundReach.sqrMagnitude > 0.0001f ? $"; moving {_roundReach.x:0.00} m sideways, {_roundReach.y:0.00} up, {_roundReach.z:0.00} forward before the next result, {MovingKept} kept drawn for it, {GearParts} parts of what you hold not counted as sliding cover" + (MovingKept > 0 ? $" (grown up to {_movingGrow:0.0} texels, cover as near as {_movingCover:0.0} m)" : "") : "")
                      + (_roundLamps ? $"; lamps: {LampsOff} of {_lamps.Length} skipped (their lit area covered)" : "")
                      + (_roundScoped ? _roundScopeDepth ? $"; scope: {_scopeWidth}x{_scopeHeight} depth, {ScopeTested} checked against it, view {ScopeFov:0.0}°, lead {ScopeLeadDegrees:0.0}°" : "; scope: no depth of its own, its view stays drawn" : "");
@@ -1677,6 +1685,45 @@ internal static class DepthCulling
 
     // How far the eye may move before the nearest cover (its depth, reversed: d = p23 / v - p22)
     // shifts by a texel.
+    // The last box BoxWhy put on screen (0-1) and its nearest depth, for CoveredSlack.
+    private static float _testedX0, _testedY0, _testedX1, _testedY1, _testedNearest;
+    // Boxes found covered this round with room to spare, so checked again later (overlay).
+    private static int _deepRound;
+    internal static int CoveredDeep;
+    // For the overlay's short rows (the full picture is Status, in the log).
+    internal static float ResultEvery => _resultEvery;
+    internal static float ResultAge => _appliedAge;
+    internal static int LampCount => _lamps.Length;
+    // Lamps switched on, and of those, the ones whose lit area reaches into the view (the only
+    // ones that cost anything: Unity already leaves out the rest).
+    internal static int LampsOn, LampsInView;
+    internal static float MovingGrow => _movingGrow;
+    private static readonly float[] SpareTexels = { 6f, 18f };
+
+    // How far the eye may move before a box BoxWhy just found covered needs checking again: as
+    // far as its nearest cover can slide a texel, or, if the box grown by a few more texels on
+    // every side is still covered, that many texels (with the nearest cover under the grown box).
+    // The deeper inside its cover, the longer it holds: most hidden objects sit well inside
+    // walls, and moving re-checked all of them every round. A grown box reaching past the
+    // screen's edge stops there (what's past it wasn't checked). Cover that includes what the
+    // player holds: checked every round, it moves on its own.
+    private static float CoveredSlack()
+    {
+        if (Pyramid.GearCover) return 0f;
+        var slack = Slack(Pyramid.NearestCover);
+        float x0 = _testedX0, y0 = _testedY0, x1 = _testedX1, y1 = _testedY1;
+        foreach (var spare in SpareTexels)
+        {
+            float gx = spare / _width, gy = spare / _height;
+            if (x0 - gx < 0f || y0 - gy < 0f || x1 + gx > 1f || y1 + gy > 1f) break;
+            if (Pyramid.Test(x0 - gx, y0 - gy, x1 + gx, y1 + gy, _testedNearest) != DepthCover.Covered || Pyramid.GearCover) break;
+            slack = Slack(Pyramid.NearestCover) * spare;
+            if (spare == SpareTexels[0]) _deepRound++;
+        }
+
+        return slack;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float Slack(float coverDepth)
     {
@@ -1762,6 +1809,11 @@ internal static class DepthCulling
         _usedScope = false;
         if (OutOfView(min, max)) return WhyOutOfView;
         if (!Project(min, max, ref m, out var xMin, out var yMin, out var xMax, out var yMax, out var nearest, out var farthest)) return WhyBehindCamera;
+        _testedX0 = xMin;
+        _testedY0 = yMin;
+        _testedX1 = xMax;
+        _testedY1 = yMax;
+        _testedNearest = nearest;
         float growX = BoxGrowTexels / _width, growY = BoxGrowTexels / _height;
         var result = Pyramid.Test(xMin - growX, yMin - growY, xMax + growX, yMax + growY, nearest);
         if (result == DepthCover.OffScreen) return WhyOutOfView;

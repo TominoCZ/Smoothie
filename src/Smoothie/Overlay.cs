@@ -97,7 +97,15 @@ internal static class Overlay
         // Only the ones that were being drawn: most far objects the game's baked visibility
         // already switches off, and hiding those again saves nothing.
         new("Hidden objects", () => Plugin.On(Plugin.HideCovered) ? DepthCulling.Saving : 0,
-            () => $"check {DepthCulling.WorkerMs:0.0} ms; {DepthCulling.Hidden} hidden of {DepthCulling.CoveredCount} covered (the rest the game isn't drawing){(DepthCulling.Waiting > 0 ? $", {DepthCulling.Waiting} waiting for a try" : "")}{(DepthCulling.StaleCount > 0 ? $", {DepthCulling.StaleCount} out of view kept hidden" : "")}; {DepthCulling.Status}", true, Plugin.HideCovered),
+            () => $"{DepthCulling.Hidden} of {DepthCulling.CoveredCount} covered (rest not drawn anyway){(DepthCulling.StaleCount > 0 ? $", {DepthCulling.StaleCount} out of view" : "")}", true, Plugin.HideCovered),
+        // The hiding's check on its worker: how long one takes, how often and how old results
+        // land, and how many boxes it tested (the full status line is in the log's snapshot).
+        new("Hiding check (worker ms)", () => Plugin.On(Plugin.HideCovered) ? (float)DepthCulling.WorkerMs : 0f,
+            () => $"every {DepthCulling.ResultEvery:0.0} frames, {DepthCulling.ResultAge:0.0} old; {DepthCulling.Tested} tested, {DepthCulling.CoveredDeep} deep", false, Plugin.HideCovered),
+        new("Kept drawn while moving", () => Plugin.On(Plugin.HideCovered) ? DepthCulling.MovingKept : 0,
+            () => DepthCulling.MovingKept > 0 ? $"margin up to {DepthCulling.MovingGrow:0.0} texels" : "", true, Plugin.HideCovered),
+        new("Lamps skipped", () => Plugin.On(Plugin.HideCovered) && Plugin.On(Plugin.SkipCoveredLamps) ? DepthCulling.LampsOff : 0,
+            () => $"of {DepthCulling.LampsInView} lit in view ({DepthCulling.LampsOn} on, {DepthCulling.LampCount} on the map)", true, Plugin.SkipCoveredLamps),
         new("Smoothie itself", () => (float)(_ownFrameTicks * TickMs) + (Diagnostics.InRaid ? (float)(AnimatorThrottle.StepMs + Occlusion.Ms) : 0f),
             () => $"incl. this overlay {_overlayAverageMs:0.00}, hiding {DepthCulling.Ms:0.00} (worst {DepthCulling.PeakMs:0.00}: {DepthCulling.PeakNote}) ms; {Occlusion.Rays} bot rays", false),
     };
