@@ -2,117 +2,123 @@
 
 A client-side performance mod for SPT. Bots stay sharp, your frame rate stays smooth.
 
-Tarkov spends most of your CPU on bots: a full-speed animator for a scav 200 m behind a
-wall, and hand IK for someone in the next room. Smoothie cuts that waste without
-changing what bots do. AI, sounds and bullets work as before.
+Most of what eats your CPU in Tarkov is bots. The game animates a scav 200 m behind a wall
+at full speed and works out hand and head positions for someone in the next room you can't
+even see. Smoothie cuts that waste without changing what bots actually do: AI, sounds and
+bullets all work like before.
 
 ## What it does
 
-| | Vanilla | Smoothie |
+| | Vanilla | With Smoothie |
 |---|---|---|
-| Bots far away or outside your field of view | animate every frame | **lower rate**: on screen it slides down to 15 Hz at 200 m, off screen 10 Hz |
-| Bots in a fight (with you or each other) | every frame | **every frame** in view, at least **30 Hz** out of view |
-| Bots within hearing range | every frame | at least **30 Hz**, so every footstep lands |
-| Close bots you can't see (behind walls, behind you) | full hand/head IK | **no IK** until a sightline opens |
-| Small gear on distant bots (sights, pouches, patches) | always drawn | **skipped** beyond 60 m; lasers and lights stay |
-| Weapon of a bot the game has culled | still drawn | **hidden** with the body |
-| Corpse ragdolls | simulate 15–30 s | settle after **5 s** |
-| Buildings, walls and furniture hidden behind nearer ones (most maps) | drawn | **not drawn** beyond 10 m, checked against the last frame's depth (your scope's view too) |
-| Horde-sized bot counts when you host | hundreds of spawn attempts every 15 s, freezes | **only as many as fit**, gear built a little per frame |
-| Backend requests | new TLS connection each time | **one kept-alive connection** |
+| Bots far away or off screen | animated every frame | fewer updates: down to 15 per second on screen at 200 m, 10 off screen |
+| Bots in a fight | every frame | every frame while you can see them, at least 30 per second when you can't |
+| Bots you can hear | every frame | at least 30 per second, so footsteps stay on time |
+| Close bots you can't see (behind walls, behind you) | full hand and head aiming | skipped until you have a line of sight |
+| Small gear on far bots (sights, pouches, patches) | always drawn | skipped past 60 m; lasers and lights stay |
+| Gun of a bot the game already hid | still drawn | hidden with the bot |
+| Corpses | ragdoll for 15–30 s | settle after 5 s |
+| Buildings, walls and furniture behind nearer ones | drawn | not drawn past 10 m when fully covered (checked against your scope's view too) |
+| Huge bot counts when you host | hundreds of spawn attempts every 15 s, freezes | only as many as fit, gear built a bit per frame |
+| Requests to the SPT server | a new connection every time | one connection kept open |
 
-Your scope zoom is part of the distance: through a 4x scope, a bot 200 m away counts as
-about 50 m, so whatever you're looking at stays smooth.
+Your scope zoom counts too: through a 4x scope a bot 200 m away is treated like one at 50 m,
+so whatever you're looking at stays smooth.
 
-A few vanilla per-frame wastes are fixed too: a coroutine started for every bot every frame,
-dead bots' brains kept in the AI update list, and muzzle-smoke lighting recomputed once per
-gun per frame.
+On top of that, a few things the game wastes every frame are fixed: a coroutine started for
+every bot every frame, dead bots' brains still being updated, the main menu's background
+video playing through your whole raid, and muzzle smoke lighting recalculated for every gun.
+
+## What's new in 1.0.3
+
+- Hiding covered objects is cheaper and reacts faster. The time it costs per frame is about
+  halved and the worst spikes are gone.
+- Raising a scope no longer flashes hidden objects back on, and more stays hidden while aiming.
+- Hidden objects behind you stay hidden while you walk and come back the moment you turn
+  around.
 
 ## Compatibility
 
 - **Client-side only.** Nothing goes on the server.
-- **Fika: optional.** It works offline, as a Fika host and as a Fika client. Smoothie
-  doesn't change any of Fika's code; with the performance overlay on, it only times Fika's
-  observed-bot pass. Hidden bots on a Fika client keep their IK.
-  Everything else keeps working.
-- **AI Limit: stack them.** AI Limit switches far bots off entirely; Smoothie makes the
-  ones still running cheaper. They don't touch each other.
+- **Fika is optional.** Smoothie works offline, as a Fika host and as a Fika client, and doesn't
+  touch any of Fika's code. On a Fika client, hidden bots keep their aiming.
+- **Works with AI Limit.** AI Limit switches far bots off completely; Smoothie makes the ones
+  still running cheaper. Use both if you like.
 
 ## Install
 
-Requires SPT `4.1.6`.
+Needs SPT `4.1.6`.
 
-Extract the release zip into your SPT folder. That puts `Smoothie.dll` here:
+Extract the zip into your SPT folder, so you end up with:
 
 ```
-<SPT>/BepInEx/plugins/Smoothie/
+<SPT>/BepInEx/plugins/Smoothie/Smoothie.dll
 ```
 
-`BepInEx/LogOutput.log` shows `Loading [Smoothie 1.0.2]` at startup. In raid as a Fika
-client it also logs:
+To check it loaded, look for `Loading [Smoothie 1.0.3]` in `BepInEx/LogOutput.log`. As a Fika
+client you'll also see this once you're in a raid:
 
 ```
 [Info   :  Smoothie] ObservedPlayer has its own LateUpdate, throttling it from Smoothie's
 ```
 
-## Configuring
+## Settings
 
-Everything is in the F12 menu under **Smoothie**, applied live. The defaults are what most
-people want. Tick **Show advanced settings** in the F12 menu to see the fine-tuning sliders
-and experimental options.
+Everything is in the F12 menu under **Smoothie** and applies straight away. The defaults are
+what I'd recommend. Tick **Show advanced settings** to see the sliders and the testing tools.
 
 | Setting | Default | What it does |
 |---|---|---|
 | **1. Bots** | | |
-| Fewer animation updates for far or unseen bots | on | far-away and unseen bots get fewer animation updates; close, fighting and audible bots stay smooth |
-| Skip arm and head aiming for unseen bots nearby | on | close bots behind you or behind walls skip hand/head/gun positioning |
-| Hide tiny gear details on far-away bots | on | tiny gear details aren't drawn on distant bots |
-| Hide guns of bots that are not drawn | on | the gun disappears along with the bot it belongs to |
-| *advanced:* simplify distance, animation distances and rates, hearing distance | 60 m · 40/200 m · 15/10/30 per s · 60 m | fine-tuning for the above |
+| Fewer animation updates for far or unseen bots | on | far and unseen bots animate less often; close, fighting and audible bots stay smooth |
+| Skip arm and head aiming for unseen bots nearby | on | close bots behind you or behind walls skip hand, head and gun positioning |
+| Hide tiny gear details on far-away bots | on | small gear isn't drawn on distant bots |
+| Hide guns of bots that are not drawn | on | the gun disappears along with its bot |
+| *advanced:* distances, update rates, hearing distance, "Update far bots on all CPU cores" | 60 m · 40/200 m · 15/10/30 per s · 60 m · on | fine-tuning for the above |
 | **2. Bot spawning (when you host)** | | only matters when bots run on your PC |
-| Limit spawn attempts to free bot slots | on | stops the game trying to spawn hundreds of bots at once (Horde mode), and from asking for bots at all in a raid set to no bots (Fika's No AI) |
-| Load new bots a bit at a time | on | builds new bots' gear a little per frame instead of freezing; with the frame rate limit off, sizes the game's work queue by the display's refresh rate instead of the menu's limit (spawn waves no longer pull raids down to 60 fps) |
-| *advanced:* Load new bots on another CPU core (experimental) | off | experimental: does that on another CPU core |
+| Limit spawn attempts to free bot slots | on | stops the game trying to spawn hundreds of bots at once (Horde mode), or any bots in a raid set to no bots |
+| Load new bots a bit at a time | on | builds new bots' gear over several frames instead of freezing; spawn waves no longer drag raids down to 60 fps when your frame limit is off |
+| *advanced:* Load new bots on another CPU core (experimental) | off | builds that gear on another core instead |
 | **3. Other fixes** | | |
-| Corpses stop moving after | 5 s | vanilla 15 s (30 s in Fika) |
-| Remove small CPU waste in game code | on | removes per-frame waste in the game's own code; pauses the main menu's video background while it's hidden (it kept playing through raids, 2-3 CPU cores under Proton); stops every bot the game tried to spawn from staying in memory until the game is closed; prepares the indoor lighting only for cameras that are actually drawing (it was redone every frame for scope and menu cameras too) |
-| Muzzle flashes of others cast no shadows | on | other players' and bots' muzzle flashes light things up without casting shadows; shadow work more than doubled in fights. Your own gun is untouched |
-| Hide objects covered by nearer ones (experimental) | on | level objects at least 10 m away stop drawing while last frame's depth shows them completely covered by something nearer; checked on another CPU core against a small copy of the depth the grass system already builds. Shadows don't change (covered objects keep casting theirs). Something coming into view can appear a few frames late, only when you move. While you aim through a scope, what the scope sees must be covered in its own view too. Doors, loot, players and anything that moves are left alone |
-| Prevent memory cleanup stutters in raids | off | SPT turns memory cleanup back on when you open your inventory and leaves it on, which stutters every minute or two; this lets that cleanup finish, then pauses it again (one more runs if 4 GB of garbage piles up). Does nothing on PCs below the game's own RAM limit for pausing cleanup (25 GB by default), and gives up for the raid if something else switches cleanup back on right after every pause (inventory opens don't count) |
-| Keep server connection open (faster menus) | on | one kept-open connection to the SPT server |
-| **4. Overlay and logs** (advanced) | | all off by default, shown with "Show advanced settings" |
-| Turn off all fixes (A/B test) | off | runs the game as without Smoothie, leaving your settings alone; overlay and logs keep working. Switched on mid-raid, the bot spawning fixes stay on for that raid; the hidden menu background videos stay paused either way. Always starts off |
-| Show performance overlay | off | what each frame is spent on, with a graph per part; toggle a setting and watch it change |
-| Log stutters and their causes | off | writes each stutter and its cause to the BepInEx log |
-| Log time per script (slow) | off | names the script behind each stutter in the log; costs frame time while on |
-| Show text stats panel | off | a text panel with frame timings, memory and bot counts |
-| Show hiding cells and hidden objects (debug) | off | outlines static level objects within 150 m: red hidden, yellow something behind it shows. Never loot, players or anything that moves |
-| Show the depth image hiding uses | off | the small depth image the hiding tests against, and the scope's own while aiming |
+| Corpses stop moving after | 5 s | vanilla is 15 s (30 s in Fika) |
+| Remove small CPU waste in game code | on | the per-frame waste listed above, plus bots the game failed to spawn no longer stay in memory until you quit |
+| Muzzle flashes of others cast no shadows | on | other players' and bots' flashes still light things up, just without shadows; that more than doubled the shadow work in fights. Your own gun is untouched |
+| Hide objects covered by nearer ones (experimental) | on | level objects 10 m+ away aren't drawn while something nearer completely covers them. Their shadows stay. Something coming into view can show up a few frames late, only while you move. Doors, loot, players and anything that moves are never hidden |
+| Prevent memory cleanup stutters in raids | off | opening your inventory turns memory cleanup back on for the rest of the raid, which stutters every minute or two; this lets it finish and then pauses it again. Only on PCs with enough RAM for the game to pause it in the first place (25 GB by default) |
+| Keep server connection open (faster menus) | on | one open connection to the SPT server instead of a new one per request |
+| **4. Overlay and logs** (advanced) | | all off by default |
+| Turn off all fixes (A/B test) | off | runs the game as if Smoothie weren't there, without touching your settings, so you can compare. Always starts off |
+| Show performance overlay | off | shows what each frame is spent on, with a graph per part |
+| Log stutters and their causes | off | writes every stutter and what caused it to the log |
+| Log time per script (slow) | off | names the script behind each stutter; costs frame time while on |
+| Show text stats panel | off | frame timings, memory and bot counts |
+| Show hiding cells and hidden objects (debug) | off | outlines level objects within 150 m: red hidden, yellow drawn because something behind it shows. While aiming: magenta shows in the scope's view, cyan kept next to it, orange the scope has no depth of its own |
+| Show the depth image hiding uses | off | the small depth image the hiding checks against, plus the scope's while aiming |
 
-Settings were renamed in 1.0.1, so values saved by 1.0.0 reset to these defaults once.
+Settings were renamed in 1.0.1, so if you're coming from 1.0.0 they reset to the defaults once.
 
 ## Building
 
-Needs the .NET 10 SDK and the path to your SPT folder (the one with `EscapeFromTarkov.exe`
+You need the .NET 10 SDK and the path to your SPT folder (the one with `EscapeFromTarkov.exe`
 and `BepInEx/`).
 
-`package.sh` picks the path up from `.env`:
+For the release zip, put the path in `.env`:
 
 ```bash
-cp .env.example .env    # then edit SPT_PATH
-./package.sh            # builds the release zip
+cp .env.example .env    # then set SPT_PATH
+./package.sh            # builds Smoothie_<version>.zip
 ```
 
-Everything else needs it as a real environment variable, since MSBuild can't read `.env`:
+Everything else needs it as an environment variable, since MSBuild doesn't read `.env`:
 
 ```bash
 export SPT_PATH=/path/to/SPT
 
 dotnet build                                    # compile
-dotnet build -p:SptDeploy=true                  # install into your game
+dotnet build -p:SptDeploy=true                  # compile and install into your game
 dotnet run --project tests/Smoothie.SelfCheck   # run the checks
 ```
 
 ## Licence
 
-[CC BY-NC-SA 4.0](LICENSE), matching SPT and Fika.
+[CC BY-NC-SA 4.0](LICENSE), same as SPT and Fika.

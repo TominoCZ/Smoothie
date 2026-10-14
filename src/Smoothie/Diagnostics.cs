@@ -726,10 +726,17 @@ internal static class Diagnostics
     {
         (typeof(BotOwner), nameof(BotOwner.PreActivate)),
         (typeof(BotOwner), nameof(BotOwner.method_10)),
+#if DEBUG
+        // Debug builds only: the hooks stay until the game closes, and a death sequence rebuilt
+        // by Harmony (OnDead, everything it calls, every mod's death handler) is too much to
+        // risk for players who switch the profiler on once.
         (typeof(Player), nameof(Player.OnDead)),
+#endif
     };
 
+#if DEBUG
     private static readonly string[] DeathEvents = { "OnPlayerDead", "OnPlayerDeadStatic", "OnPlayerDeadOrUnspawn", "OnIPlayerDeadOrUnspawn" };
+#endif
     private static readonly HashSet<MethodBase> Inner = new();
     // How deep inside an opened-up method (spawn and death steps) and a drilled one we are;
     // kept apart so one doesn't count the other's parts.
@@ -751,7 +758,9 @@ internal static class Diagnostics
         var opened = Opened.SelectMany(o => AccessTools.AllTypes().Where(t => o.Type.IsAssignableFrom(t))
             .SelectMany(t => AccessTools.GetDeclaredMethods(t).Where(m => m.Name == o.Method && !m.IsAbstract)));
         foreach (var parent in opened.ToList()) OpenUp(parent);
+#if DEBUG
         TimeHandlers(null);
+#endif
     }
 
     private static void OpenUp(MethodInfo parent)
@@ -932,6 +941,7 @@ internal static class Diagnostics
         if (TimeStep(Steps, method, name) != null) Inner.Add(method);
     }
 
+#if DEBUG
     // The death events' handlers: game code, Fika and other mods. Per player, so scanned
     // again as players spawn; null for the static one.
     private static void TimeHandlers(Player? player)
@@ -949,6 +959,7 @@ internal static class Diagnostics
             }
         }
     }
+#endif
 
     private static void Enter() => _inside++;
 
@@ -1111,6 +1122,7 @@ internal static class Diagnostics
         {
             Plugin.Log.LogInfo($"profiler: now timing {Buckets.Count} script methods (+{patched}, {failed} skipped) in {watch.ElapsedMilliseconds} ms");
         }
+#if DEBUG
         // Death handlers are added as players spawn (bots' brains, mods watching kills).
         if (InRaid)
         {
@@ -1119,6 +1131,7 @@ internal static class Diagnostics
                 if (player != null) TimeHandlers(player);
             }
         }
+#endif
     }
 
     internal static void StopProfiling()

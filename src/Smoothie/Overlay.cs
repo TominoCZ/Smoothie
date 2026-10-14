@@ -97,7 +97,7 @@ internal static class Overlay
         // Only the ones that were being drawn: most far objects the game's baked visibility
         // already switches off, and hiding those again saves nothing.
         new("Hidden objects", () => Plugin.On(Plugin.HideCovered) ? DepthCulling.Saving : 0,
-            () => $"check {DepthCulling.WorkerMs:0.0} ms; {DepthCulling.Hidden} hidden of {DepthCulling.CoveredCount} covered (the rest the game isn't drawing){(DepthCulling.Waiting > 0 ? $", {DepthCulling.Waiting} waiting for a try" : "")}; {DepthCulling.Status}", true, Plugin.HideCovered),
+            () => $"check {DepthCulling.WorkerMs:0.0} ms; {DepthCulling.Hidden} hidden of {DepthCulling.CoveredCount} covered (the rest the game isn't drawing){(DepthCulling.Waiting > 0 ? $", {DepthCulling.Waiting} waiting for a try" : "")}{(DepthCulling.StaleCount > 0 ? $", {DepthCulling.StaleCount} out of view kept hidden" : "")}; {DepthCulling.Status}", true, Plugin.HideCovered),
         new("Smoothie itself", () => (float)(_ownFrameTicks * TickMs) + (Diagnostics.InRaid ? (float)(AnimatorThrottle.StepMs + Occlusion.Ms) : 0f),
             () => $"incl. this overlay {_overlayAverageMs:0.00}, hiding {DepthCulling.Ms:0.00} (worst {DepthCulling.PeakMs:0.00}: {DepthCulling.PeakNote}) ms; {Occlusion.Rays} bot rays", false),
     };

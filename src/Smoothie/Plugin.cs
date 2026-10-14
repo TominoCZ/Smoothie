@@ -13,7 +13,7 @@ using UnityEngine;
 
 namespace Smoothie;
 
-[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.2")]
+[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.3")]
 // Optional: when Fika is installed it has to load first, or its types aren't there yet when
 // Smoothie looks for them and its observed bots aren't recognised. Without Fika this does nothing.
 [BepInDependency("com.fika.core", BepInDependency.DependencyFlags.SoftDependency)]
@@ -130,18 +130,13 @@ public class Plugin : BaseUnityPlugin
             "Shows what each frame is spent on (bot animation, AI, scripts, rendering, ...) with a graph for each. Toggle a setting and watch its line change; yellow marks a setting change, red a memory cleanup. Costs a little performance while shown.", 100, true);
         ShowCosts.SettingChanged += (_, _) => Overlay.Apply();
         // A/B for hiding covered objects: each flip is measured on its own (see MeasureFlip).
-        HideCovered.SettingChanged += (_, _) =>
-        {
-            _flipAt = Time.unscaledTime + 1f;
-            FlipFrames.Clear();
-            _flipDraws = 0;
-        };
+        HideCovered.SettingChanged += (_, _) => StartFlip(HideCovered, "hiding covered objects");
         LogDrops = Bind(OverlaySection, "Log stutters and their causes", false,
             "Writes a line to the BepInEx log for every stutter, with what caused it, and a snapshot whenever the frame rate drops and stays down. Useful for bug reports.", 90, true);
         ShowStats = Bind(OverlaySection, "Show text stats panel", false,
             "A text panel with frame timings, memory and bot counts.", 80, true);
         ShowCells = Bind(OverlaySection, "Show hiding cells and hidden objects (debug)", false,
-            "Draws through walls, within 150 m and in view, every object by its last result: red hidden, yellow something behind it shows (in your scope's view: in the scope's own depth too). Covered objects the game isn't drawing anyway aren't shown. The cells they're sorted into as faint grey outlines. Only static level objects: never loot, players or anything that moves.", 74, true);
+            "Draws through walls, within 150 m and in view, every object by its last result: red hidden, yellow something behind it shows; while aiming, magenta something behind it shows in the scope's own depth, cyan next to the scope's view where nobody sees it, kept drawn because it was last seen showing, orange the scope has no depth of its own. Covered objects the game isn't drawing anyway aren't shown. The cells they're sorted into as faint grey outlines. Only static level objects: never loot, players or anything that moves.", 74, true);
         ShowDepth = Bind(OverlaySection, "Show the depth image hiding uses", false,
             "Shows the small depth image \"Hide objects covered by nearer ones\" tests against, under the overlay: brighter is nearer, black is sky or far away. Purple: what your scope sees while aiming through one, with a margin; anything there must also be covered in the scope's own depth (shown to the right), or it stays drawn. Only what's already on your screen.", 75, true);
         ProfileScripts = Bind(OverlaySection, "Log time per script (slow)", false,
@@ -314,12 +309,23 @@ public class Plugin : BaseUnityPlugin
 
     private bool _wasInRaid;
 
-    // After each flip of "Hide objects covered by nearer ones": 1 s to settle, then 3 s of frame
-    // times and draw calls averaged into one log line (with logging on), so on and off can be
-    // compared standing still.
+    // After each flip of an A/B setting: 1 s to settle, then 3 s of frame times, draw calls and
+    // SetPass averaged into one log line (with logging on), so on and off can be compared
+    // standing still.
     private static float _flipAt = -1f;
     private static readonly List<float> FlipFrames = new();
-    private static double _flipDraws;
+    private static double _flipDraws, _flipSetPass;
+    private static ConfigEntry<bool> _flipSetting = null!;
+    private static string _flipName = "";
+
+    private static void StartFlip(ConfigEntry<bool> setting, string name)
+    {
+        _flipSetting = setting;
+        _flipName = name;
+        _flipAt = Time.unscaledTime + 1f;
+        FlipFrames.Clear();
+        _flipDraws = _flipSetPass = 0;
+    }
 
     private static void MeasureFlip()
     {
@@ -332,6 +338,7 @@ public class Plugin : BaseUnityPlugin
 
         FlipFrames.Add(Time.unscaledDeltaTime * 1000f);
         _flipDraws += Math.Max(0, Diagnostics.DrawCalls);
+        _flipSetPass += Math.Max(0, Diagnostics.SetPassCalls);
         if (Time.unscaledTime < _flipAt + 3f) return;
 
         _flipAt = -1f;
@@ -339,9 +346,9 @@ public class Plugin : BaseUnityPlugin
         var average = FlipFrames.Average();
         var median = FlipFrames[FlipFrames.Count / 2];
         var worst = FlipFrames[(int)(FlipFrames.Count * 0.95f)];
-        var draws = Diagnostics.DrawCalls >= 0 ? $"{_flipDraws / FlipFrames.Count:0}" : "n/a (overlay off)";
-        Log.LogInfo($"A/B hiding covered objects {(On(HideCovered) ? "ON " : "OFF")}: frame {average:0.00} ms (median {median:0.00}, 95% {worst:0.00}, {1000f / average:0} fps), draw calls {draws}" +
-                    (On(HideCovered) ? $", {DepthCulling.Saving} drawn objects hidden, check {DepthCulling.WorkerMs:0.0} ms on a worker" : "") +
+        var draws = Diagnostics.DrawCalls >= 0 ? $"{_flipDraws / FlipFrames.Count:0} ({_flipSetPass / FlipFrames.Count:0} SetPass)" : "n/a (overlay off)";
+        Log.LogInfo($"A/B {_flipName} {(On(_flipSetting) ? "ON " : "OFF")}: frame {average:0.00} ms (median {median:0.00}, 95% {worst:0.00}, {1000f / average:0} fps), draw calls {draws}" +
+                    (_flipSetting == HideCovered && On(HideCovered) ? $", {DepthCulling.Saving} drawn objects hidden, check {DepthCulling.WorkerMs:0.0} ms on a worker" : "") +
                     (Overlay.PartsSummary() is { Length: > 0 } parts ? $" |{parts.Replace("  overlay, last second:", "")}" : ""));
     }
     private float _lastSweep;

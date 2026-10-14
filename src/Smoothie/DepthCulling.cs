@@ -7,6 +7,8 @@ using System.Threading.Tasks;
 using EFT;
 using EFT.CameraControl;
 using GPUInstancer;
+using Koenigz.PerfectCulling;
+using Koenigz.PerfectCulling.EFT;
 using HarmonyLib;
 using SPT.Reflection.Patching;
 using UnityEngine;
@@ -65,19 +67,21 @@ internal static class DepthCulling
     // them are, without testing each.
     private const int CellTestMin = 6;
     private const byte CellOut = 0, CellIdle = 1, CellCovered = 2, CellTested = 3;
-    // Per check: objects asked whether the game draws them (one call per part, stopping at
-    // the first yes), and objects actually hidden (a switch per part). Turning towards
-    // thousands of covered objects spreads them over a few checks instead of stalling a frame.
-    // The next check carries on where this one stopped, so nothing waits behind the same few.
-    private const int DrawnChecksPerCheck = 4000;
+    // Per check: time spent re-asking objects the game wasn't drawing whether it draws them
+    // now (one call per part; a crowd of them all coming due used to spend a millisecond
+    // finding nothing), and objects actually hidden (a switch per part). Objects asked for
+    // the first time aren't budgeted. The next check carries on where this one stopped, so
+    // nothing waits behind the same few.
+    private static readonly long RetryBudget = (long)(0.1 / Diagnostics.TickMs);
     private const int HidesPerCheck = 600;
     private static int _applyFrom;
     // Covered objects in view that the last check had no budget left to look at (overlay).
     internal static int Waiting;
     // Covered and in view but not drawn by the game (its own culling): asked again after about
-    // this long. Only objects in view are asked, and the question is one call per part, so
-    // half a second stays cheap without starving the ones the game does draw.
+    // this long, or at once when the game's baked visibility switches its group back on
+    // (BakedSwitchPatch), the usual way such an object starts being drawn.
     private const float NotDrawnRetry = 0.5f;
+    private const float BakedOffRetry = 5f;
     private const int MaxWidth = 192;
     // The eye moved this far between the depth's frame and applying its result: show everything
     // (a fall, a vehicle, a teleport), the result no longer fits the view.
@@ -108,16 +112,27 @@ internal static class DepthCulling
         // Of those, the ones Apply may try to hide: in view, not hidden yet, not waiting to
         // retry. Built by the worker, so Apply doesn't walk every covered object.
         public readonly List<int> Try = new();
+        // Of the wanted ones, hidden ones out of view whose last check no longer holds (the eye
+        // moved): kept hidden until they come back into view (StaleUnits). Built by the worker.
+        public readonly List<int> Stale = new();
         // The round each unit was last wanted hidden (written with Want), and what Hide
         // switched off (main thread).
         public int[] WantedIn = null!;
+        // Hidden: the unit's renderers, else null.
         public Renderer[]?[] Off = null!;
-        // Per switched renderer: the shadow mode it had (made shadows-only), or ShadowsOnly
-        // when it was switched off with forceRenderingOff instead.
+        // Per renderer: the shadow mode it had (made shadows-only), ShadowsOnly when it was
+        // switched off with forceRenderingOff instead, or NotSwitched. Made on a unit's first
+        // hide and reused.
         public ShadowCastingMode[]?[] Was = null!;
         public bool[] Saving = null!;
-        // Covered but not drawn by the game anyway (its baked visibility): left alone until then.
+        // Covered but not drawn by the game anyway (its baked visibility): left alone until
+        // then. 0 when it hasn't been asked since it last showed.
         public float[] RetryAt = null!;
+        // The part found drawn last time (a LOD group draws one level at a time): asked first.
+        public byte[] DrawnPart = null!;
+        // The game's baked visibility group holding all of a unit's parts, if one does: while
+        // it's switched off the game draws none of them, which Apply can tell without asking.
+        public PerfectCullingBakeGroup?[] BakeGroup = null!;
     }
 
     private static readonly List<Renderer[]> PendingRenderers = new();
@@ -186,6 +201,7 @@ internal static class DepthCulling
         Camera.onPostRender += DrawCells;
         new PyramidBuiltPatch(nameof(GPUInstancerHiZOcclusionGenerator.OnEndCameraRendering)).Enable();
         new PyramidBuiltPatch(nameof(GPUInstancerHiZOcclusionGenerator.OnEndCameraRenderingBlit)).Enable();
+        new BakedSwitchPatch().Enable();
     }
 
     // The grass system just built this frame's depth pyramid (one of the two, depending on
@@ -399,6 +415,7 @@ internal static class DepthCulling
             Was = new ShadowCastingMode[count][],
             Saving = new bool[count],
             RetryAt = new float[count],
+            DrawnPart = new byte[count],
         };
         var starts = new List<int>();
         var cellMin = new List<Vector3>();
@@ -426,6 +443,37 @@ internal static class DepthCulling
                 // Destroyed during the scan (it runs over several seconds): Hide skips it.
                 if (renderer != null) set.UnitOf[renderer] = i;
             }
+        }
+
+        // The baked groups live on each scene's PerfectCullingCrossSceneGroup (see the census).
+        set.BakeGroup = new PerfectCullingBakeGroup?[count];
+        var inGroup = new int[count];
+        foreach (var crossScene in UnityEngine.Object.FindObjectsByType<PerfectCullingCrossSceneGroup>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            if (crossScene.bakeGroups == null) continue;
+            foreach (var group in crossScene.bakeGroups)
+            {
+                if (group?.renderers == null) continue;
+                foreach (var renderer in group.renderers)
+                {
+                    if (renderer == null || !set.UnitOf.TryGetValue(renderer, out var i)) continue;
+                    // Parts in different groups: -1, never counted as wholly in one.
+                    if (set.BakeGroup[i] == null && inGroup[i] == 0) set.BakeGroup[i] = group;
+                    else if (!ReferenceEquals(set.BakeGroup[i], group)) inGroup[i] = -1;
+                    if (inGroup[i] >= 0) inGroup[i]++;
+                }
+            }
+        }
+
+        for (var i = 0; i < count; i++)
+        {
+            var parts = 0;
+            foreach (var renderer in set.Renderers[i])
+            {
+                if (renderer != null) parts++;
+            }
+
+            if (inGroup[i] != parts) set.BakeGroup[i] = null;
         }
 
         starts.Add(count);
@@ -464,6 +512,13 @@ internal static class DepthCulling
                     if (_lastApplyFrame > 0) _resultEvery = _resultEvery * 0.9f + (Time.frameCount - _lastApplyFrame) * 0.1f;
                     _lastApplyFrame = Time.frameCount;
                 }
+            }
+
+            if (StaleUnits.Count > 0)
+            {
+                var staleStart = Stopwatch.GetTimestamp();
+                ShowEntering(set, camera);
+                PartTicks[PartApply] += Stopwatch.GetTimestamp() - staleStart;
             }
 
             _projection = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
@@ -508,10 +563,10 @@ internal static class DepthCulling
             _secondStart = Time.unscaledTime;
         }
         if (_set == null) return;
-        // The scope's view switching on: what the gun covered may now be seen through it. Shown
-        // at once (it's behind the gun on screen, so nobody sees the extra drawing), the round
-        // in flight dropped, and everything checked again in the next one, so only what's
-        // outside the scope's view is hidden again.
+        // The scope's view switching on: what the gun covered may now be seen through it. The
+        // round in flight (judged without the scope) is dropped and everything is checked again
+        // in the next one; what the scope's depth then shows is shown, while the game is still
+        // fading the lens in. Not shown all at once: that flashed everything back on every aim.
         var scoped = Scoped(out _, out var opticCamera);
         _scopeCamera = scoped ? ScopeCamera(opticCamera) : null;
         if (scoped != _scoped)
@@ -521,10 +576,6 @@ internal static class DepthCulling
             {
                 _epoch++;
                 _recheckAll = true;
-                var showStart = Stopwatch.GetTimestamp();
-                ShowHidden(_set);
-                _frameTicks += Stopwatch.GetTimestamp() - showStart;
-                PartTicks[PartApply] += Stopwatch.GetTimestamp() - showStart;
             }
         }
 
@@ -626,6 +677,11 @@ internal static class DepthCulling
     // Right after the scope's depth pyramid is built: read back if none is in flight.
     private static void RequestScope(GPUInstancerHiZOcclusionGenerator generator, Camera camera)
     {
+        // As it was just drawn (ScopeArea reads it too: at other times the camera may be elsewhere).
+        _scopeRenderView = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true) * camera.worldToCameraMatrix;
+        _scopeCamToWorld = camera.cameraToWorldMatrix;
+        _scopeProjection = camera.projectionMatrix;
+        _scopeRenderFrame = Time.frameCount;
         // One in flight at a time; one that never came back is given up on after 30 frames.
         if (_set == null || _scopeReading && Time.frameCount - _scopeRequestFrame < 30) return;
         var texture = generator.hiZDepthTexture;
@@ -644,8 +700,7 @@ internal static class DepthCulling
         while (mip < texture.mipmapCount - 1 && (texture.width >> mip) > MaxWidth) mip++;
         var width = Mathf.Max(1, texture.width >> mip);
         var height = Mathf.Max(1, texture.height >> mip);
-        // As it was just drawn.
-        var viewProjection = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true) * camera.worldToCameraMatrix;
+        var viewProjection = _scopeRenderView;
         _scopeReading = true;
         _scopeRequestFrame = Time.frameCount;
         AsyncGPUReadback.Request(texture, mip, TextureFormat.RFloat, request =>
@@ -729,6 +784,9 @@ internal static class DepthCulling
                 var why = set.Why[i];
                 if (set.Off[i] != null) GL.Color(new Color(1f, 0.1f, 0.1f, 0.55f));
                 else if (why == WhyShowsBehind) GL.Color(new Color(1f, 0.9f, 0f, 0.18f));
+                else if (why == WhyScopeShows) GL.Color(new Color(1f, 0.2f, 1f, 0.35f));
+                else if (why == WhyScopeAhead) GL.Color(new Color(0.2f, 0.9f, 1f, 0.3f));
+                else if (why == WhyScopeNoDepth) GL.Color(new Color(1f, 0.5f, 0f, 0.35f));
                 else continue;
                 Box(set.Min[i], set.Max[i]);
             }
@@ -837,16 +895,29 @@ internal static class DepthCulling
     // may be in its view: its lens, and everything inside the optic camera's view (at 10 m and
     // 1 km, for the parallax between it and the eye), grown by a texel. False without a scope.
     // Zoomed in, a small flick sweeps the scope across a lot, and what comes into it must
-    // already be drawn rather than appear a few frames late: the view is taken ScopeMargin
-    // degrees wider on every side (the start of a turn, a change of direction; degrees, not a
-    // share of the view, which is only a few degrees wide zoomed in), and also where it will
-    // be ScopeLead seconds ahead at the rate it's turning (a result is in use until about
-    // then), at most ScopeMaxLead degrees.
-    private const float ScopeMargin = 3f;
+    // already be drawn rather than appear a few frames late. Behind the lens, outside the
+    // scope's picture, nobody sees: there ScopeCovers keeps drawn what's within ScopeMargin
+    // degrees of the scope's view (the start of a turn, a change of direction; degrees, not a
+    // share of the view, which is only a few degrees wide zoomed in), and what it will reach
+    // ScopeLead seconds ahead at the rate it's turning (a result is in use until about then),
+    // at most ScopeMaxLead degrees.
+    private const float ScopeMargin = 1f;
     private const float ScopeLead = 0.1f;
     private const float ScopeMaxLead = 30f;
+    private const float TurningShare = 0.1f;
     private static Quaternion _scopeRotation;
     private static float _scopeAt = -1f;
+    // The optic camera's view this round and how far from its centre it may see soon, in its
+    // viewport units (0.5 is its edge): the margin and the turn lead on every side.
+    private static Matrix4x4 _roundScopeView, _scopeRenderView, _scopeCamToWorld, _scopeProjection;
+    private static int _scopeRenderFrame = -1000;
+    // For the status line: the optic camera's vertical view and this round's turn lead.
+    internal static float ScopeFov, ScopeLeadDegrees;
+    private static float _scopeReachX, _scopeReachY, _scopeShiftX, _scopeShiftY;
+    private static bool _hasLens;
+    private static float _lensXMin, _lensYMin, _lensXMax, _lensYMax;
+    // A turn of 90 degrees and more: everything may come into view.
+    private const float MaxShift = 1000f;
     private static bool ScopeArea()
     {
         if (!Scoped(out var sight, out var opticCamera))
@@ -855,34 +926,44 @@ internal static class DepthCulling
             return false;
         }
 
-        // The turn since the last round, carried ScopeLead ahead.
-        var rotation = opticCamera.transform.rotation;
+        // The turn since the last round, carried ScopeLead ahead: the eye's (the scope turns
+        // with it), since the optic camera's own transform isn't steady from round to round.
+        var rotation = _camera != null ? _camera.transform.rotation : opticCamera.transform.rotation;
         var now = Time.unscaledTime;
         var ahead = Quaternion.identity;
+        var lead = 0f;
         if (_scopeAt >= 0f && now > _scopeAt)
         {
             (rotation * Quaternion.Inverse(_scopeRotation)).ToAngleAxis(out var angle, out var axis);
             if (angle > 180f) angle -= 360f;
-            if (Mathf.Abs(angle) > 0.01f) ahead = Quaternion.AngleAxis(Mathf.Clamp(angle / (now - _scopeAt) * ScopeLead, -ScopeMaxLead, ScopeMaxLead), axis);
+            lead = Mathf.Clamp(angle / (now - _scopeAt) * ScopeLead, -ScopeMaxLead, ScopeMaxLead);
+            if (Mathf.Abs(angle) > 0.01f) ahead = Quaternion.AngleAxis(lead, axis);
         }
 
+        ScopeLeadDegrees = Mathf.Abs(lead);
         _scopeRotation = rotation;
         _scopeAt = now;
-        var origin = opticCamera.transform.position;
+        // The optic camera as it last rendered: the game moves it into place for its own
+        // render only, so read at any other time it can be somewhere else entirely.
+        var fresh = Time.frameCount - _scopeRenderFrame <= 30;
+        var camToWorld = fresh ? _scopeCamToWorld : opticCamera.cameraToWorldMatrix;
+        var projection = fresh ? _scopeProjection : opticCamera.projectionMatrix;
+        Vector3 origin = camToWorld.GetColumn(3);
 
         var m = _roundViewProjection;
         float xMin = float.MaxValue, yMin = float.MaxValue, xMax = float.MinValue, yMax = float.MinValue;
         var lens = sight.LensRenderer;
         if (lens != null && lens.enabled && lens.isVisible && !lens.bounds.Contains(_roundEye))
         {
-            var min = lens.bounds.min;
-            var max = lens.bounds.max;
+            // The lens's own box turned with it (the world-aligned one, this close to the eye,
+            // covers far more of the screen than the lens).
+            var min = lens.localBounds.min;
+            var max = lens.localBounds.max;
+            var toWorld = lens.localToWorldMatrix;
             for (var c = 0; c < 8; c++)
             {
-                var x = (c & 1) == 0 ? min.x : max.x;
-                var y = (c & 2) == 0 ? min.y : max.y;
-                var z = (c & 4) == 0 ? min.z : max.z;
-                Clip[c] = new Vector3(m.m00 * x + m.m01 * y + m.m02 * z + m.m03, m.m10 * x + m.m11 * y + m.m12 * z + m.m13, m.m30 * x + m.m31 * y + m.m32 * z + m.m33);
+                var p = toWorld.MultiplyPoint3x4(new Vector3((c & 1) == 0 ? min.x : max.x, (c & 2) == 0 ? min.y : max.y, (c & 4) == 0 ? min.z : max.z));
+                Clip[c] = new Vector3(m.m00 * p.x + m.m01 * p.y + m.m02 * p.z + m.m03, m.m10 * p.x + m.m11 * p.y + m.m12 * p.z + m.m13, m.m30 * p.x + m.m31 * p.y + m.m32 * p.z + m.m33);
             }
 
             // Corners in front of the camera, and where the box's edges cross just in front of
@@ -900,22 +981,49 @@ internal static class DepthCulling
             }
         }
 
+        // Where the main view sees the lens: its depth there is the lens, not the world.
+        _hasLens = xMin <= xMax;
+        _lensXMin = xMin - 1f / _width;
+        _lensXMax = xMax + 1f / _width;
+        _lensYMin = yMin - 1f / _height;
+        _lensYMax = yMax + 1f / _height;
+
         // The view's edges ScopeMargin degrees further out, in viewport units (0-1 is the view).
-        var halfV = opticCamera.fieldOfView * 0.5f * Mathf.Deg2Rad;
-        var halfH = Mathf.Atan(Mathf.Tan(halfV) * opticCamera.aspect);
+        var halfV = Mathf.Atan(1f / projection.m11);
+        var halfH = Mathf.Atan(1f / projection.m00);
+        ScopeFov = 2f * halfV * Mathf.Rad2Deg;
         var margin = ScopeMargin * Mathf.Deg2Rad;
         var reachX = 0.5f * Mathf.Tan(Mathf.Min(halfH + margin, 1.4f)) / Mathf.Tan(halfH);
         var reachY = 0.5f * Mathf.Tan(Mathf.Min(halfV + margin, 1.4f)) / Mathf.Tan(halfV);
+        _scopeReachX = reachX;
+        _scopeReachY = reachY;
+        _roundScopeView = fresh ? _scopeRenderView : GL.GetGPUProjectionMatrix(projection, true) * opticCamera.worldToCameraMatrix;
+        // Where the scope's centre will be after the lead, in its current view: the reach only
+        // grows that way (what's on the trailing side is leaving the scope).
+        _scopeShiftX = _scopeShiftY = 0f;
+        if (ahead != Quaternion.identity)
+        {
+            var v = _roundScopeView;
+            var p = origin + ahead * (camToWorld.MultiplyVector(Vector3.back) * 100f);
+            var w = v.m30 * p.x + v.m31 * p.y + v.m32 * p.z + v.m33;
+            if (w > 0.01f)
+            {
+                _scopeShiftX = Mathf.Clamp((v.m00 * p.x + v.m01 * p.y + v.m02 * p.z + v.m03) / w * 0.5f, -MaxShift, MaxShift);
+                _scopeShiftY = Mathf.Clamp((v.m10 * p.x + v.m11 * p.y + v.m12 * p.z + v.m13) / w * 0.5f, -MaxShift, MaxShift);
+            }
+            else _scopeShiftX = _scopeShiftY = MaxShift;
+        }
+        // Plus the scope's own view as it is now (a low zoom sees past the lens's edge). Not the
+        // margin or the turn: outside the lens the main depth is the world, seen from almost the
+        // same spot, so what it shows covered stays covered when the scope swings over it. Only
+        // behind the lens is it blind, and ScopeCovers keeps what may swing in from there drawn.
         for (var c = 0; c < 8; c++)
         {
-            var p = opticCamera.ViewportToWorldPoint(new Vector3(0.5f + ((c & 1) == 0 ? -reachX : reachX), 0.5f + ((c & 2) == 0 ? -reachY : reachY),
-                (c & 4) == 0 ? MinDistance : 1000f));
-            for (var turned = 0; turned < 2; turned++)
-            {
-                if (turned == 1) p = origin + ahead * (p - origin);
-                var clip = new Vector3(m.m00 * p.x + m.m01 * p.y + m.m02 * p.z + m.m03, m.m10 * p.x + m.m11 * p.y + m.m12 * p.z + m.m13, m.m30 * p.x + m.m31 * p.y + m.m32 * p.z + m.m33);
-                if (clip.z > Front) Extend(clip, ref xMin, ref yMin, ref xMax, ref yMax);
-            }
+            var d = (c & 4) == 0 ? MinDistance : 1000f;
+            // Camera space looks down -z.
+            var p = camToWorld.MultiplyPoint3x4(new Vector3(((c & 1) == 0 ? -d : d) / projection.m00, ((c & 2) == 0 ? -d : d) / projection.m11, -d));
+            var clip = new Vector3(m.m00 * p.x + m.m01 * p.y + m.m02 * p.z + m.m03, m.m10 * p.x + m.m11 * p.y + m.m12 * p.z + m.m13, m.m30 * p.x + m.m31 * p.y + m.m32 * p.z + m.m33);
+            if (clip.z > Front) Extend(clip, ref xMin, ref yMin, ref xMax, ref yMax);
         }
 
         if (xMin > xMax) return false;
@@ -1006,9 +1114,10 @@ internal static class DepthCulling
             Pyramid.Build(_depth, _width, _height);
             if (_roundScopeDepth) ScopePyramid.Build(_scopeDepth, _scopeWidth, _scopeHeight);
             _scopeTestedRound = 0;
-            SetPlanes(ref m);
+            SetPlanes(Planes, ref m);
             set.Want.Clear();
             set.Try.Clear();
+            set.Stale.Clear();
             var now = _roundTime;
             int tested = 0, outCells = 0, coveredCells = 0;
             var round = _roundId;
@@ -1021,22 +1130,11 @@ internal static class DepthCulling
                 set.CellState[c] = CellOut;
                 if (OutOfView(cellMin, cellMax))
                 {
-                    // Unity doesn't draw any of it; what's hidden stays hidden until it's back in
-                    // view, unless the eye moved enough since it was found covered: it can't be
-                    // checked out of view, so it's let go (free: Unity isn't drawing it) and
-                    // checked again once back in view, rather than seen late from a new spot.
+                    // Unity doesn't draw any of it.
                     outCells++;
                     for (var i = from; i < to; i++)
                     {
-                        if (set.Streak[i] == 0) continue;
-                        if ((eye - set.CheckedFrom[i]).sqrMagnitude >= set.Slack[i])
-                        {
-                            set.Streak[i] = 0;
-                            set.NextCheck[i] = 0f;
-                            continue;
-                        }
-
-                        if (set.Streak[i] >= HideAfter) Wanted(set, i, round);
+                        if (set.Streak[i] != 0 || set.Off[i] != null) KeepOutOfView(set, i, eye, round);
                     }
 
                     continue;
@@ -1088,15 +1186,31 @@ internal static class DepthCulling
                 {
                     tested++;
                     var why = cellNear && Near(set.Min[i], set.Max[i], eye) ? WhyNear : BoxWhy(set.Min[i], set.Max[i], ref m);
+                    // Behind the lens next to the scope's picture nobody sees it, but it got there
+                    // from somewhere one of the views did (the open view, or the scope's picture):
+                    // its last verdict stands. The same while the scope's depth is late (a round
+                    // without it every so often). Only what was last seen showing is kept drawn.
+                    if ((why == WhyScopeAhead || why == WhyScopeNoDepth) && set.Streak[i] != 0) why = WhyCovered;
                     if (why == WhyCovered)
                     {
                         MarkCovered(set, i, eye, now, _usedScope ? 0f : Slack(Pyramid.NearestCover), round, true);
                         continue;
                     }
 
+                    // Hidden and now out of view, in a cell partly in view: kept like the ones in
+                    // cells out of view.
+                    if (why == WhyOutOfView && set.Off[i] != null)
+                    {
+                        KeepOutOfView(set, i, eye, round);
+                        if (set.Streak[i] != 0) set.NextCheck[i] = now + VisibleRecheck * (0.75f + (i & 15) / 30f);
+                        continue;
+                    }
+
                     set.Why[i] = why;
                     set.Streak[i] = 0;
                     set.NextCheck[i] = now + VisibleRecheck * (0.75f + (i & 15) / 30f);
+                    // Covered again later, it's asked at once (Apply), not as a retry.
+                    set.RetryAt[i] = 0f;
                 }
             }
 
@@ -1111,7 +1225,7 @@ internal static class DepthCulling
             ScopeTested = _scopeTestedRound;
             Status = $"{_width}x{_height} depth (arrives after {_arriveFrames:0.0} frames, {_arriveMs:0.0} ms; results applied {_appliedAge:0.0} frames old, one every {_resultEvery:0.0} frames), "
                      + $"{Tested} tested; cells: {CellsOut} of {Cells} out of view, {CellsCovered} covered whole"
-                     + (_roundScoped ? _roundScopeDepth ? $"; scope: {_scopeWidth}x{_scopeHeight} depth, {ScopeTested} checked against it" : "; scope: no depth of its own, its view stays drawn" : "");
+                     + (_roundScoped ? _roundScopeDepth ? $"; scope: {_scopeWidth}x{_scopeHeight} depth, {ScopeTested} checked against it, view {ScopeFov:0.0}°, lead {ScopeLeadDegrees:0.0}°" : "; scope: no depth of its own, its view stays drawn" : "");
         }
         catch (Exception ex)
         {
@@ -1121,12 +1235,15 @@ internal static class DepthCulling
         Volatile.Write(ref _state, Ready);
     }
 
-    private const byte WhyCovered = 1, WhyNear = 2, WhyOutOfView = 3, WhyBehindCamera = 4, WhyShowsBehind = 5;
+    private const byte WhyCovered = 1, WhyNear = 2, WhyOutOfView = 3, WhyBehindCamera = 4, WhyShowsBehind = 5,
+        WhyScopeShows = 6, WhyScopeAhead = 7, WhyScopeNoDepth = 8;
 
     private static readonly string[] WhyText =
     {
         "not checked yet", "covered", "nearer than 10 m", "out of view",
-        "partly behind the camera", "something farther (or sky, or the scope's view) shows somewhere in its box",
+        "partly behind the camera", "something farther (or sky) shows somewhere in its box",
+        "something farther shows in the scope's own depth", "next to the scope's view where nobody sees it, last seen showing",
+        "in the scope's view, which has no depth of its own",
     };
 
     // For the renderer census (profiling only): what the hiding makes of a drawn renderer.
@@ -1156,6 +1273,27 @@ internal static class DepthCulling
     {
         set.Want.Add(i);
         set.WantedIn[i] = round;
+    }
+
+    // Out of view, so it can't be checked: a covered one stays wanted hidden until the eye
+    // has moved enough that its cover could have shifted, then it's checked again once back in
+    // view. One still hidden then stays hidden too (showing it would cost a switch per part
+    // for something Unity isn't drawing, and hiding it again two more checks) and is listed
+    // stale: the main thread shows it the frame it comes back into view (ShowEntering).
+    private static void KeepOutOfView(Set set, int i, Vector3 eye, int round)
+    {
+        if (set.Streak[i] != 0 && (eye - set.CheckedFrom[i]).sqrMagnitude >= set.Slack[i])
+        {
+            set.Streak[i] = 0;
+            set.NextCheck[i] = 0f;
+        }
+
+        if (set.Streak[i] >= HideAfter) Wanted(set, i, round);
+        else if (set.Off[i] != null)
+        {
+            Wanted(set, i, round);
+            set.Stale.Add(i);
+        }
     }
 
     private static void MarkCovered(Set set, int i, Vector3 eye, float now, float slack, int round, bool inView)
@@ -1189,25 +1327,29 @@ internal static class DepthCulling
     }
 
     // The left, right, bottom and top planes of the round's view, worked out once per round:
-    // the box test runs for tens of thousands of objects.
+    // the box test runs for tens of thousands of objects. The worker's; the main thread has
+    // its own (ViewPlanes).
     private static readonly Vector4[] Planes = new Vector4[4];
 
-    private static void SetPlanes(ref Matrix4x4 m)
+    private static void SetPlanes(Vector4[] planes, ref Matrix4x4 m)
     {
-        Planes[0] = new Vector4(m.m30 + m.m00, m.m31 + m.m01, m.m32 + m.m02, m.m33 + m.m03);
-        Planes[1] = new Vector4(m.m30 - m.m00, m.m31 - m.m01, m.m32 - m.m02, m.m33 - m.m03);
-        Planes[2] = new Vector4(m.m30 + m.m10, m.m31 + m.m11, m.m32 + m.m12, m.m33 + m.m13);
-        Planes[3] = new Vector4(m.m30 - m.m10, m.m31 - m.m11, m.m32 - m.m12, m.m33 - m.m13);
+        planes[0] = new Vector4(m.m30 + m.m00, m.m31 + m.m01, m.m32 + m.m02, m.m33 + m.m03);
+        planes[1] = new Vector4(m.m30 - m.m00, m.m31 - m.m01, m.m32 - m.m02, m.m33 - m.m03);
+        planes[2] = new Vector4(m.m30 + m.m10, m.m31 + m.m11, m.m32 + m.m12, m.m33 + m.m13);
+        planes[3] = new Vector4(m.m30 - m.m10, m.m31 - m.m11, m.m32 - m.m12, m.m33 - m.m13);
     }
 
-    // The box against the left, right, bottom and top planes of the view (SetPlanes).
-    private static bool OutOfView(Vector3 min, Vector3 max)
+    private static bool OutOfView(Vector3 min, Vector3 max) => OutOfView(Planes, min, max);
+
+    // The box against the left, right, bottom and top planes of a view (SetPlanes). Together
+    // they also leave out what's wholly behind the eye.
+    private static bool OutOfView(Vector4[] planes, Vector3 min, Vector3 max)
     {
         float cx = (min.x + max.x) * 0.5f, cy = (min.y + max.y) * 0.5f, cz = (min.z + max.z) * 0.5f;
         float ex = (max.x - min.x) * 0.5f, ey = (max.y - min.y) * 0.5f, ez = (max.z - min.z) * 0.5f;
         for (var p = 0; p < 4; p++)
         {
-            var q = Planes[p];
+            var q = planes[p];
             if (q.x * cx + q.y * cy + q.z * cz + q.w + Math.Abs(q.x) * ex + Math.Abs(q.y) * ey + Math.Abs(q.z) * ez < 0f) return true;
         }
 
@@ -1227,19 +1369,42 @@ internal static class DepthCulling
         if (result != DepthCover.Covered) return WhyShowsBehind;
         if (!_roundScoped || xMax < _scopeXMin || xMin > _scopeXMax || yMax < _scopeYMin || yMin > _scopeYMax) return WhyCovered;
         _usedScope = true;
-        return ScopeCovers(min, max) ? WhyCovered : WhyShowsBehind;
+        var scope = ScopeCovers(min, max);
+        // Not seen by the scope yet, but outside the lens on the main screen: there the main
+        // depth is the world from almost the same spot, and it found the box covered.
+        if (scope == WhyScopeAhead && (!_hasLens || xMax < _lensXMin || xMin > _lensXMax || yMax < _lensYMin || yMin > _lensYMax)) return WhyCovered;
+        return scope;
     }
 
     // In the scope's own depth: wholly inside its picture (part outside may swing in) and
     // covered there.
-    private static bool ScopeCovers(Vector3 min, Vector3 max)
+    private static byte ScopeCovers(Vector3 min, Vector3 max)
     {
-        if (!_roundScopeDepth) return false;
+        // Wholly outside what the scope sees now or soon: behind the lens on the main screen it's
+        // only the scope itself, so the main depth's answer stands. The lens covers far more
+        // than a zoomed scope's view, and all of that used to stay drawn.
+        var view = _roundScopeView;
+        if (Project(min, max, ref view, out var vxMin, out var vyMin, out var vxMax, out var vyMax, out _)
+            && (vxMax < 0.5f - _scopeReachX + Math.Min(0f, _scopeShiftX) || vxMin > 0.5f + _scopeReachX + Math.Max(0f, _scopeShiftX)
+                || vyMax < 0.5f - _scopeReachY + Math.Min(0f, _scopeShiftY) || vyMin > 0.5f + _scopeReachY + Math.Max(0f, _scopeShiftY))) return WhyCovered;
+        if (!_roundScopeDepth) return WhyScopeNoDepth;
         _scopeTestedRound++;
         var m = _scopeViewProjection;
-        return Project(min, max, ref m, out var xMin, out var yMin, out var xMax, out var yMax, out var nearest)
-               && xMin >= 0f && yMin >= 0f && xMax <= 1f && yMax <= 1f
-               && ScopePyramid.Test(xMin, yMin, xMax, yMax, nearest) == DepthCover.Covered;
+        // Wholly outside the scope's picture but near it (the margin, ahead of a turn): kept
+        // drawn, it may come into the scope before the next check. Otherwise only the part
+        // inside the picture is tested, like the main view does at its edges, except while
+        // turning by more than a tenth of the scope's view per lead time: then it must not stick
+        // out on the side the scope is turning towards, so what's about to sweep in is already
+        // drawn (zoomed in, a smaller turn counts).
+        if (!Project(min, max, ref m, out var xMin, out var yMin, out var xMax, out var yMax, out var nearest)) return WhyScopeAhead;
+        if (_scopeShiftX > TurningShare && xMax > 1f || _scopeShiftX < -TurningShare && xMin < 0f
+            || _scopeShiftY > TurningShare && yMax > 1f || _scopeShiftY < -TurningShare && yMin < 0f) return WhyScopeAhead;
+        return ScopePyramid.Test(xMin, yMin, xMax, yMax, nearest) switch
+        {
+            DepthCover.Covered => WhyCovered,
+            DepthCover.OffScreen => WhyScopeAhead,
+            _ => WhyScopeShows,
+        };
     }
 
     // The box on screen (0-1) and the depth of its nearest corner (larger is nearer); false
@@ -1277,26 +1442,61 @@ internal static class DepthCulling
             return;
         }
 
-        // New hides per check are capped so turning towards thousands of covered objects
-        // doesn't stall a frame; the rest are still covered next check. Showing is never capped.
+        // Showing first, never capped: what the round no longer wants. Ones already shown on
+        // entering the view (ShowEntering) are dropped from the list.
         var round = _roundId;
+        var kept = 0;
+        for (var n = 0; n < HiddenUnits.Count; n++)
+        {
+            var i = HiddenUnits[n];
+            if (set.Off[i] == null) continue;
+            if (set.WantedIn[i] == round) HiddenUnits[kept++] = i;
+            else Show(set, i);
+        }
+
+        HiddenUnits.RemoveRange(kept, HiddenUnits.Count - kept);
+
+        StaleUnits.Clear();
+        foreach (var i in set.Stale)
+        {
+            if (set.Off[i] != null) StaleUnits.Add(i);
+        }
+
+        StaleCount = StaleUnits.Count;
+
+        // Then hiding. An object asked for the first time since it last showed (or whose baked
+        // group the game just switched back on) is asked at once: most of those are being
+        // drawn. Re-asking ones the game wasn't drawing gets RetryBudget. New hides are capped
+        // so turning towards thousands of covered objects doesn't stall a frame; the rest are
+        // still covered next check.
         var want = set.Try;
-        int checks = DrawnChecksPerCheck, hides = HidesPerCheck, waiting = 0;
+        int hides = HidesPerCheck, waiting = 0;
         var now = Time.time;
+        var retryUntil = Stopwatch.GetTimestamp() + RetryBudget;
+        var retriesOut = false;
         var from = want.Count > 0 ? _applyFrom % want.Count : 0;
         _applyFrom = from;
         for (var n = 0; n < want.Count; n++)
         {
             var i = want[(from + n) % want.Count];
-            if (set.Off[i] != null || now < set.RetryAt[i]) continue;
-            if (checks <= 0 || hides <= 0)
+            var retryAt = set.RetryAt[i];
+            if (set.Off[i] != null || now < retryAt) continue;
+            // Its baked group is switched off: the game draws none of it. Asked again when the
+            // group comes back on (BakedSwitchPatch), or after BakedOffRetry in case that's missed.
+            var bake = set.BakeGroup[i];
+            if (bake != null && !bake.isGroupEnabled)
+            {
+                set.RetryAt[i] = now + BakedOffRetry;
+                continue;
+            }
+
+            if (hides <= 0 || retryAt > 0f && (retriesOut || (retriesOut = Stopwatch.GetTimestamp() >= retryUntil)))
             {
                 // Out of budget: the next check starts here.
                 if (waiting++ == 0) _applyFrom = from + n;
                 continue;
             }
 
-            checks--;
             // Hiding what the game isn't drawing saves nothing and costs a switch per renderer;
             // those are asked again a little later, spread so they don't all come due at once.
             if (Hide(set, i)) hides--;
@@ -1304,70 +1504,67 @@ internal static class DepthCulling
         }
 
         Waiting = waiting;
-
-        var kept = 0;
-        for (var n = 0; n < HiddenUnits.Count; n++)
-        {
-            var i = HiddenUnits[n];
-            if (set.WantedIn[i] == round) HiddenUnits[kept++] = i;
-            else Show(set, i);
-        }
-
-        HiddenUnits.RemoveRange(kept, HiddenUnits.Count - kept);
     }
+
+    // A part Hide left alone (destroyed, shadow-only, or switched off by someone else).
+    private const ShadowCastingMode NotSwitched = (ShadowCastingMode)(-1);
+
+    private static bool Drawn(Renderer renderer) => renderer != null && renderer.isVisible;
 
     private static bool Hide(Set set, int i)
     {
-        // Drawn at all? Asked first and alone (one call per part, stopping at the first yes):
-        // most of these are retries of objects the game isn't drawing.
-        var drawn = false;
-        foreach (var renderer in set.Renderers[i])
+        // Drawn at all? One call per part, stopping at the first yes, starting with the part
+        // that was drawn last time.
+        var renderers = set.Renderers[i];
+        int last = set.DrawnPart[i], drawn = -1;
+        if (last < renderers.Length && Drawn(renderers[last])) drawn = last;
+        else
         {
-            if (renderer != null && renderer.isVisible)
+            for (var n = 0; n < renderers.Length; n++)
             {
-                drawn = true;
+                if (n == last || !Drawn(renderers[n])) continue;
+                drawn = n;
                 break;
             }
         }
 
-        if (!drawn) return false;
-        var count = 0;
-        foreach (var renderer in set.Renderers[i])
-        {
-            if (renderer == null || renderer.forceRenderingOff || renderer.shadowCastingMode == ShadowCastingMode.ShadowsOnly) continue;
-            count++;
-        }
+        if (drawn < 0) return false;
+        if (drawn < 256) set.DrawnPart[i] = (byte)drawn;
 
-        if (count == 0) return false;
-        var off = new Renderer[count];
-        var was = new ShadowCastingMode[count];
-        count = 0;
-        foreach (var renderer in set.Renderers[i])
+        // One pass, into the unit's own record. A part someone else switched off is only made
+        // shadow-only (it draws nothing either way) when it casts shadows, so Show never
+        // switches back on what it didn't switch off.
+        var was = set.Was[i] ??= new ShadowCastingMode[renderers.Length];
+        var any = false;
+        for (var n = 0; n < renderers.Length; n++)
         {
-            if (renderer == null || renderer.forceRenderingOff) continue;
+            was[n] = NotSwitched;
+            var renderer = renderers[n];
+            if (renderer == null) continue;
             var mode = renderer.shadowCastingMode;
             if (mode == ShadowCastingMode.ShadowsOnly) continue;
-            if (mode == ShadowCastingMode.Off)
-            {
-                renderer.forceRenderingOff = true;
-                was[count] = ShadowCastingMode.ShadowsOnly;
-            }
-            else
+            if (mode != ShadowCastingMode.Off)
             {
                 renderer.shadowCastingMode = ShadowCastingMode.ShadowsOnly;
-                was[count] = mode;
+                was[n] = mode;
             }
+            else if (!renderer.forceRenderingOff)
+            {
+                renderer.forceRenderingOff = true;
+                was[n] = ShadowCastingMode.ShadowsOnly;
+            }
+            else continue;
 
-            off[count++] = renderer;
+            any = true;
         }
 
-        set.Off[i] = off;
-        set.Was[i] = was;
-        set.Saving[i] = drawn;
+        if (!any) return false;
+        set.Off[i] = renderers;
+        set.Saving[i] = true;
         HiddenUnits.Add(i);
         Hidden++;
         _frameHides++;
-        if (drawn) Saving++;
+        Saving++;
         return true;
     }
 
@@ -1379,6 +1576,7 @@ internal static class DepthCulling
         if (off == null || was == null) return;
         for (var n = 0; n < off.Length; n++)
         {
+            if (was[n] == NotSwitched) continue;
             var renderer = off[n];
             if (renderer == null) continue;
             if (was[n] == ShadowCastingMode.ShadowsOnly) renderer.forceRenderingOff = false;
@@ -1386,7 +1584,6 @@ internal static class DepthCulling
         }
 
         set.Off[i] = null;
-        set.Was[i] = null;
         Hidden--;
         _frameShows++;
         if (set.Saving[i]) Saving--;
@@ -1396,6 +1593,72 @@ internal static class DepthCulling
     {
         foreach (var i in HiddenUnits) Show(set, i);
         HiddenUnits.Clear();
+        StaleUnits.Clear();
+        StaleCount = 0;
+    }
+
+    // Hidden objects out of view whose last check no longer holds (Apply copies the worker's
+    // list): shown the frame they come back into the camera's view, before Unity culls it,
+    // instead of when they're shown or hidden again by a check.
+    private static readonly List<int> StaleUnits = new();
+    internal static int StaleCount;
+    private static readonly Vector4[] ViewPlanes = new Vector4[4];
+
+    private static void ShowEntering(Set set, Camera camera)
+    {
+        var m = camera.cullingMatrix;
+        SetPlanes(ViewPlanes, ref m);
+        var kept = 0;
+        for (var n = 0; n < StaleUnits.Count; n++)
+        {
+            var i = StaleUnits[n];
+            if (set.Off[i] == null) continue;
+            if (OutOfView(ViewPlanes, set.Min[i], set.Max[i])) StaleUnits[kept++] = i;
+            else Show(set, i);
+        }
+
+        StaleUnits.RemoveRange(kept, StaleUnits.Count - kept);
+        StaleCount = kept;
+    }
+
+    // The game's baked visibility (PerfectCulling) switching groups back on, a few per frame
+    // as the camera moves between its cells: their objects the last checks found not drawn
+    // are asked again in the next one instead of after NotDrawnRetry. UpdateSwitchQueues takes
+    // the groups from the end of the queue; the group's IsEnabled setter and Toggle are
+    // AggressiveInlining, so they can't be patched.
+    private class BakedSwitchPatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod() =>
+            AccessTools.Method(typeof(PerfectCullingCrossSceneGroup), nameof(PerfectCullingCrossSceneGroup.UpdateSwitchQueues));
+
+        [PatchPrefix]
+        private static void Prefix(PerfectCullingCrossSceneGroup __instance, FastArray<ushort> ____queueActivate)
+        {
+            var set = _set;
+            if (set == null || Time.frameCount - _activeFrame > 1 || ____queueActivate == null) return;
+            try
+            {
+                var groups = __instance.bakeGroups;
+                var count = ____queueActivate.Count;
+                var buffer = ____queueActivate.Buffer;
+                var take = Math.Min(count, PerfectCullingSettings.Instance.numActivationsPerVolume / 2);
+                for (var k = 1; k <= take; k++)
+                {
+                    var g = buffer[count - k];
+                    if (g >= groups.Length) continue;
+                    var renderers = groups[g]?.renderers;
+                    if (renderers == null) continue;
+                    foreach (var renderer in renderers)
+                    {
+                        if (renderer is not null && set.UnitOf.TryGetValue(renderer, out var i) && set.RetryAt[i] > 0f) set.RetryAt[i] = 0f;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _error ??= ex;
+            }
+        }
     }
 
     // Setting off, A/B or an error: show everything, and the next rounds start counting afresh.
