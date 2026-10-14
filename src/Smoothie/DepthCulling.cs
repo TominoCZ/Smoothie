@@ -204,12 +204,12 @@ internal static class DepthCulling
     // cover it was sized from (m). Overlay, to tell a fast eye from near cover.
     private static float _movingGrow, _movingCover;
     // Whatever the player holds (gun, knife, grenade, meds; nothing with empty hands): its parts'
-    // renderers, fetched again when the item or hands controller changes and every couple of
-    // seconds (attachments changed in a raid), put on the round's screen part by part for the
+    // renderers, fetched again when the item, the hands controller or the item's hierarchy changes
+    // (attachments changed in a raid), put on the round's screen part by part for the
     // pyramid's gear mask (DepthPyramid.AddGear). A part not listed yet only gets the full margin.
     private static GameObject? _gearRoot;
     private static object? _gearHands;
-    private static float _gearAt;
+    private static int _gearHierarchy;
     private static Renderer[] _gearParts = Array.Empty<Renderer>();
     internal static int GearParts;
     private static int _movingRound;
@@ -218,9 +218,10 @@ internal static class DepthCulling
     // Lamps: the level's spot and point lights that don't move. One whose lit area (its range,
     // for a spot only the cone) is covered wherever it's on screen lights nothing you can see: it
     // gets an empty culling mask (no object lit, nothing drawn into its shadow map) until any of
-    // that area may show, and the frame a turn brings in a part that wasn't checked. The game never writes a level light's culling mask (only the weapon-modding preview,
-    // on its own lights). Boxes and positions are taken each round on the main thread; Streak and
-    // Want are the worker's; the rest the main thread's.
+    // that area may show, and the frame a turn brings in a part that wasn't checked. The game
+    // never writes a level light's culling mask (only the weapon-modding preview, on its own
+    // lights). Boxes and positions are taken at the scan and again one lamp per round (main
+    // thread); Streak and Want are the worker's; the rest the main thread's.
     private static Light[] _lamps = Array.Empty<Light>();
     private static Vector3[] _lampMin = Array.Empty<Vector3>(), _lampMax = Array.Empty<Vector3>(), _lampAt = Array.Empty<Vector3>();
     private static bool[] _lampTest = Array.Empty<bool>(), _lampWant = Array.Empty<bool>(), _lampOff = Array.Empty<bool>();
@@ -432,6 +433,17 @@ internal static class DepthCulling
         _lampRect = new Vector4[n];
         _lampSkipRect = new Vector4[n];
         _lampsPastEdge = 0;
+        for (var l = 0; l < n; l++) TakeLampBox(l);
+    }
+
+    // A lamp's box and where it was taken: at the scan, then one lamp per round (a lamp that moved
+    // anyway is never skipped, ApplyLamps compares with _lampAt).
+    private static void TakeLampBox(int l)
+    {
+        var light = _lamps[l];
+        if (light == null) return;
+        LampBox(light, out _lampMin[l], out _lampMax[l]);
+        _lampAt[l] = light.transform.position;
     }
 
     // The space a lamp can light: its range around it; for a spot only the cone out to its range
@@ -791,11 +803,12 @@ internal static class DepthCulling
         var hands = Comfort.Common.Singleton<GameWorld>.Instance?.MainPlayer?.HandsController;
         var root = hands != null ? hands.ControllerGameObject : null;
         if (root == null) return;
-        if (!ReferenceEquals(root, _gearRoot) || !ReferenceEquals(hands, _gearHands) || Time.unscaledTime - _gearAt > 2f)
+        var hierarchy = root.transform.hierarchyCount;
+        if (!ReferenceEquals(root, _gearRoot) || !ReferenceEquals(hands, _gearHands) || hierarchy != _gearHierarchy)
         {
             _gearRoot = root;
             _gearHands = hands;
-            _gearAt = Time.unscaledTime;
+            _gearHierarchy = hierarchy;
             var parts = new List<Renderer>();
             foreach (var renderer in root.GetComponentsInChildren<Renderer>(true))
             {
@@ -1029,14 +1042,11 @@ internal static class DepthCulling
         _roundReachMinus = Vector3.Min(_eyeSpeedMinus * latency, Vector3.one * MaxDrift);
         _roundReach = Vector3.Max(_roundReachPlus, _roundReachMinus);
         _roundLamps = Plugin.On(Plugin.SkipCoveredLamps);
+        if (_lamps.Length > 0) TakeLampBox(_roundId % _lamps.Length);
         for (var l = 0; l < _lamps.Length; l++)
         {
             var light = _lamps[l];
-            var test = _roundLamps && light != null && light.isActiveAndEnabled;
-            _lampTest[l] = test;
-            if (!test) continue;
-            LampBox(light!, out _lampMin[l], out _lampMax[l]);
-            _lampAt[l] = light!.transform.position;
+            _lampTest[l] = _roundLamps && light != null && light.isActiveAndEnabled;
         }
         _tanX = 1f / Mathf.Abs(_projection.m00);
         _tanY = 1f / Mathf.Abs(_projection.m11);
