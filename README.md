@@ -38,16 +38,49 @@ video playing through your whole raid, and muzzle smoke lighting recalculated fo
   objects the game isn't drawing anyway aren't checked at all.
 - Area lights (the game's glowing panels, signs and windows) behind walls are skipped like lamps.
   Indoors on Streets that took one spot from ~150 to 170-200 fps.
-- Less of Unity's own per-frame work on big maps: level of detail is skipped for objects behind
-  you, and two of Unity's culling loops are rewritten in memory to do the same work faster. Only
-  for the current game build; on any other build these switch themselves off.
+- **Smoothie now patches Unity's engine code** (see below): two of Unity's culling loops are
+  rewritten in memory to do the same work faster, and level of detail is skipped for objects
+  behind you. Only for the current game build; on any other build these switch themselves off.
 - Far buildings' stand-in meshes are hidden too when covered.
 - The covered-object check runs in native code with SIMD (`SmoothieNative.dll`, next to
   `Smoothie.dll`), several times faster than before; that matters most on CPUs with fewer cores.
 
+## Engine code patch
+
+Since 1.0.5 Smoothie changes a little of Unity's own engine code while the game runs. Most mods
+only change the game's C# scripts; this goes one level deeper, into `UnityPlayer.dll`, the
+engine itself. In short:
+
+- **What:** two loops Unity runs every frame over every object on the map (on Streets over
+  200,000) are replaced in memory with versions that do the same work faster: the scan after
+  culling checks 16 objects at a time instead of one, and the level-of-detail loop skips the
+  groups Smoothie has set aside. Unity's results are the same; nothing you see changes.
+- **Nothing on disk changes.** The patch lives in the running game's memory only. Close the game
+  and it's gone; the game files are never touched.
+- **Only for the exact engine build it was made for.** Smoothie checks the build id of
+  `UnityPlayer.dll` and the exact original bytes at each spot before touching anything. After a
+  game update, or on any other build, the patch (and the other features that read Unity's
+  internals) switch themselves off and the log says so, until Smoothie is updated.
+- **Safe instructions only.** The new code uses only instructions every 64-bit CPU has (SSE2),
+  and it's written between frames, never while Unity could be running those loops.
+- **Easy to turn off.** Untick **Faster engine culling loops (code patch)** in the F12 menu and
+  Unity's original code goes back in immediately; **Turn off all fixes (A/B test)** does the
+  same.
+
+Some of Smoothie's other features read and write Unity's internal data directly too (for speed),
+under the same build check. Smoothie also ships a small native library, `SmoothieNative.dll`, for
+the covered-object check. Its source and everything about how the patch was found and how to
+redo it after a game update are in this repository (`src/Smoothie/EnginePatch.cs`,
+`tools/engine-patches/`, `src/SmoothieNative/`).
+
+Antivirus software rarely cares about this, but code that changes another module's code in
+memory is the kind of thing heuristics look at. If yours complains, the source is all here.
+
 ## Compatibility
 
 - **Client-side only.** Nothing goes on the server.
+- **Patches Unity's engine code in memory** on the current game build only; see
+  [Engine code patch](#engine-code-patch).
 - **Fika is optional.** Smoothie works offline, as a Fika host and as a Fika client, and doesn't
   touch any of Fika's code. On a Fika client, hidden bots keep their aiming.
 - **Works with Rupture.** Rupture keeps corpses reacting to hits, so Smoothie's corpse settle
