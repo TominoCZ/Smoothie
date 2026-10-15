@@ -13,7 +13,7 @@ using UnityEngine;
 
 namespace Smoothie;
 
-[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.5")]
+[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.6")]
 // Optional: when Fika is installed it has to load first, or its types aren't there yet when
 // Smoothie looks for them and its observed bots aren't recognised. Without Fika this does nothing.
 [BepInDependency("com.fika.core", BepInDependency.DependencyFlags.SoftDependency)]
@@ -133,7 +133,7 @@ public class Plugin : BaseUnityPlugin
         SkipOutOfView = Bind(other, "Skip LOD work for objects you cannot see", true,
             "Unity recomputes the level of detail of every object on the map for every frame, including everything behind you and everything the game itself isn't drawing; on big maps like Streets that's a large part of each frame (~0.7-1 ms measured). With this on, level objects out of view and beyond shadow range, and those the game has switched off, are skipped through Unity's own forced-level switch, a byte per object, so turning around costs next to nothing: everything is put back before the frame it could show in is drawn. Nothing you see changes. Only for this exact game build: on any other build of the game's engine it switches itself off.", 80);
         EngineLoops = Bind(other, "Faster engine culling loops (code patch)", true,
-            "Rewrites two loops in Unity's own code, in memory while the game runs (nothing on disk changes), to do the same work faster: the scan over every object on the map after each frame's culling (~220k on Streets) checks 16 at a time instead of one, and the level-of-detail loop skips the groups \"Skip LOD work for objects you cannot see\" has set aside, instead of working them out just to throw the result away. Nothing you see changes. Only for this exact game build: on any other build of the game's engine it switches itself off, and off puts Unity's code back.", 78);
+            "Rewrites three loops in Unity's own code, in memory while the game runs (nothing on disk changes), to do the same work faster: the scan over every object on the map after each frame's culling (~220k on Streets) checks 16 at a time instead of one, the level-of-detail loop skips the groups \"Skip LOD work for objects you cannot see\" has set aside, instead of working them out just to throw the result away, and the navigation-obstacle update stops working out every door obstacle's position for path-following agents the game doesn't have (bots find their way differently). Nothing you see changes. Only for this exact game build: on any other build of the game's engine it switches itself off, and off puts Unity's code back.", 78);
         EngineLoops.SettingChanged += (_, _) => StartFlip(EngineLoops, "faster engine loops");
         SortByMaterial = Bind(other, "Draw level objects grouped by material", true,
             "Draws everything solid grouped by material instead of nearest first, so the game switches materials less often (on Streets ~270 fewer switches a frame). That moves a little work from your CPU, which Tarkov is almost always waiting on, to your graphics card (things hidden behind nearer ones get shaded too). Nothing you see changes. If the overlay shows GPU wait going up with this on, your graphics card is the limit: switch it off.", 79);
@@ -480,6 +480,9 @@ public class Plugin : BaseUnityPlugin
             SyncPatch(EnginePatch.VisibilityScan, On(EngineLoops));
             // Only skips groups "Skip LOD work" forced: without it, nothing to gain.
             SyncPatch(EnginePatch.LodLoop, On(EngineLoops) && On(SkipOutOfView));
+            // Work only NavMeshAgents use; EFT has none (Unity's code runs while one is active).
+            SyncPatch(EnginePatch.NavCrowd, On(EngineLoops));
+            SyncPatch(EnginePatch.NavVelocity, On(EngineLoops));
             // Leaving a raid: drop everything that refers to its players, so none of it is
             // kept alive through the menu.
             var inRaid = Diagnostics.InRaid;
