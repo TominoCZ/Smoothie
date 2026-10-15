@@ -255,6 +255,7 @@ internal static class LodCulling
         }
 
         var moving = new Dictionary<Transform, bool>();
+        int grown = 0, alone = 0;
         var found = new List<(long Key, LODGroup Group, Vector3 Center, float Radius, Renderer[]? Baked)>();
         var all = UnityEngine.Object.FindObjectsByType<LODGroup>(FindObjectsSortMode.None);
         for (var n = 0; n < all.Length; n++)
@@ -272,21 +273,39 @@ internal static class LodCulling
             var scale = t.lossyScale;
             var center = t.TransformPoint(group.localReferencePoint);
             var radius = group.size * Math.Max(Math.Abs(scale.x), Math.Max(Math.Abs(scale.y), Math.Abs(scale.z))) * 0.87f;
-            if (!(radius < 5000f)) continue;
 
             Renderer[]? bakedParts = null;
             var parts = new List<Renderer>();
             var allBaked = true;
+            var grew = false;
             foreach (var lod in group.GetLODs())
             foreach (var renderer in lod.renderers)
             {
                 if (renderer == null) continue;
                 parts.Add(renderer);
                 if (!baked.Contains(renderer)) allBaked = false;
+                // The group's size only picks its level (Unity culls by the meshes' own bounds), so
+                // it can be smaller than its meshes, and a long road counted as out of view while
+                // part of it was on screen. The sphere is grown to cover every mesh.
+                var b = renderer.bounds;
+                if (b.extents == Vector3.zero) continue;
+                var reach = Vector3.Distance(center, b.center) + b.extents.magnitude;
+                if (reach > radius)
+                {
+                    radius = reach;
+                    grew = true;
+                }
             }
 
+            if (!(radius < 5000f)) continue;
+            if (grew) grown++;
             if (allBaked && parts.Count > 0) bakedParts = parts.ToArray();
-            long key = ((long)Mathf.FloorToInt(center.x / CellSize) & 0x1FFFFF) << 42 | ((long)Mathf.FloorToInt(center.y / CellSize) & 0x1FFFFF) << 21 | ((long)Mathf.FloorToInt(center.z / CellSize) & 0x1FFFFF);
+            // A group bigger than a cell gets a cell of its own: in a shared one its sphere would
+            // keep every small neighbour in view with it.
+            var big = radius > CellSize;
+            if (big) alone++;
+            long key = big ? long.MinValue + n
+                : ((long)Mathf.FloorToInt(center.x / CellSize) & 0x1FFFFF) << 42 | ((long)Mathf.FloorToInt(center.y / CellSize) & 0x1FFFFF) << 21 | ((long)Mathf.FloorToInt(center.z / CellSize) & 0x1FFFFF);
             found.Add((key, group, center, radius, bakedParts));
         }
 
@@ -340,7 +359,7 @@ internal static class LodCulling
         }
 
         Groups = count;
-        Plugin.Log.LogInfo($"LOD culling ({SceneSkip.Note}): {count} static LOD groups in {cells} cells, {ToCheck.Count} of them all the game's baked visibility");
+        Plugin.Log.LogInfo($"LOD culling ({SceneSkip.Note}): {count} static LOD groups in {cells} cells, {ToCheck.Count} of them all the game's baked visibility, {grown} grown to cover their meshes, {alone} in a cell of their own");
     }
 
     // For the A/B log: forced groups by reason, and how many slots really hold the forced level.
