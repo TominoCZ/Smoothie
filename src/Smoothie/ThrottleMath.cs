@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Security;
 
 namespace Smoothie;
 
@@ -228,8 +230,72 @@ public static class DepthCover
 // Run on the worker for every box of every check, so written for the game's Mono JIT, which
 // keeps array bounds checks and rarely inlines: the coarse levels sit in one array per kind,
 // pinned once per test and walked with pointers, and min/max are plain comparisons.
+//
+// With UseNative (SmoothieNative, src/SmoothieNative/pyramid.c: the same build and test compiled
+// with SSE2) Build and Test go there instead, over the same arrays, pinned for good; the code
+// below stays as the fallback and as the reference the self-check compares it against.
 public sealed unsafe class DepthPyramid
 {
+    private const string Native = "SmoothieNative";
+
+    [DllImport(Native, CallingConvention = CallingConvention.Cdecl), SuppressUnmanagedCodeSecurity]
+    private static extern int sm_version();
+
+    [DllImport(Native, CallingConvention = CallingConvention.Cdecl), SuppressUnmanagedCodeSecurity]
+    private static extern void sm_build(float* fine, float* fineWorld, bool* fineGear, int levels, int* offset, int* wid, int* hei,
+        float* far, float* nearWorld, bool* gearAny);
+
+    [DllImport(Native, CallingConvention = CallingConvention.Cdecl), SuppressUnmanagedCodeSecurity]
+    private static extern int sm_test(NativeLevels* pyramid, float xMin, float yMin, float xMax, float yMax, float boxNearest,
+        out float nearestCover, out int gearCover);
+
+    // pyramid.c's Pyramid: pointers into this pyramid's pinned arrays, written after each Build.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeLevels
+    {
+        public float* Depth, Far, NearWorld;
+        public bool* GearMask, GearAny;
+        public int* Offset, Wid;
+        public int Levels, Width, Height;
+    }
+
+    // Set once the library answered (TryNative); the same for every pyramid.
+    public static bool UseNative { get; set; }
+
+    // The library must already be loadable by its name (in the game: loaded from the plugin's
+    // folder first, see DepthCulling). False, and the C# code stays in use, if it isn't.
+    public static bool TryNative()
+    {
+        try
+        {
+            UseNative = sm_version() == 1;
+        }
+        catch (Exception)
+        {
+            UseNative = false;
+        }
+
+        return UseNative;
+    }
+
+    // Arrays the native side reads, pinned while they're in use; the levels' struct.
+    private readonly Dictionary<Array, GCHandle> _pinned = new();
+    private NativeLevels* _native;
+
+    private T* Pin<T>(T[] array) where T : unmanaged
+    {
+        if (!_pinned.TryGetValue(array, out var handle)) _pinned[array] = handle = GCHandle.Alloc(array, GCHandleType.Pinned);
+        return (T*)handle.AddrOfPinnedObject();
+    }
+
+    // A replaced array: let it go.
+    private void Unpin(Array array)
+    {
+        if (!_pinned.TryGetValue(array, out var handle)) return;
+        handle.Free();
+        _pinned.Remove(array);
+    }
+
     // Texels a covered box must grow by so its cover's edge can't slide off it while the eye
     // moves `reach` metres: parallax r * (1/cover - 1/far), with 1/distance of a depth value d
     // being (d + p22) / p23 (larger d is nearer). Taken at the box's farthest point, it also
@@ -263,6 +329,8 @@ public sealed unsafe class DepthPyramid
         var n = width * height;
         if (_gearMask.Length != n)
         {
+            Unpin(_gearMask);
+            Unpin(_nearWorld0);
             _gearMask = new bool[n];
             _nearWorld0 = new float[n];
         }
@@ -291,6 +359,7 @@ public sealed unsafe class DepthPyramid
     private bool[] _gearAny = Array.Empty<bool>();
     private readonly int[] _offset = new int[32], _wid = new int[32], _hei = new int[32];
     private float[] _depth = Array.Empty<float>();
+    private float[]? _lastDepth;
     private int _levels, _width, _height;
 
     public void Build(float[] depth, int width, int height)
@@ -311,11 +380,38 @@ public sealed unsafe class DepthPyramid
             levels++;
         }
 
-        if (_far.Length < total)
+        // 4 to spare: the native test reads a row 4 texels at a time.
+        if (_far.Length < total + 4)
         {
-            _far = new float[total];
-            _nearWorld = new float[total];
-            _gearAny = new bool[total];
+            Unpin(_far);
+            Unpin(_nearWorld);
+            Unpin(_gearAny);
+            _far = new float[total + 4];
+            _nearWorld = new float[total + 4];
+            _gearAny = new bool[total + 4];
+        }
+
+        if (UseNative)
+        {
+            if (!ReferenceEquals(_lastDepth, depth))
+            {
+                if (_lastDepth != null) Unpin(_lastDepth);
+                _lastDepth = depth;
+            }
+
+            var offset = Pin(_offset);
+            var wid = Pin(_wid);
+            sm_build(Pin(depth), Pin(_nearWorld0), Pin(_gearMask), levels, offset, wid, Pin(_hei), Pin(_far), Pin(_nearWorld), Pin(_gearAny));
+            if (_native == null) _native = (NativeLevels*)Marshal.AllocHGlobal(sizeof(NativeLevels));
+            *_native = new NativeLevels
+            {
+                Depth = Pin(depth), Far = Pin(_far), NearWorld = Pin(_nearWorld), GearMask = Pin(_gearMask), GearAny = Pin(_gearAny),
+                Offset = offset, Wid = wid, Levels = levels, Width = width, Height = height,
+            };
+            _levels = levels;
+            _width = width;
+            _height = height;
+            return;
         }
 
         fixed (float* fine = depth, fineWorld = _nearWorld0, far = _far, nearWorld = _nearWorld)
@@ -359,23 +455,40 @@ public sealed unsafe class DepthPyramid
     public int Width => _width;
     public int Height => _height;
 
-    // The current test (one at a time): the box's fine texel range and nearest depth, and the
-    // pinned arrays.
-    private int _x0, _x1, _r0, _r1;
-    private float _boxNearest;
-    private float* _pDepth, _pFar, _pNearWorld;
-    private bool* _pGearMask, _pGearAny;
-    private int* _pOffset, _pWid;
+    // One test's state, on the caller's stack so several threads can test at once: the box's
+    // fine texel range and nearest depth, the pinned arrays, and what covers it.
+    private struct Probe
+    {
+        public int X0, X1, R0, R1;
+        public float BoxNearest, NearestCover;
+        public bool GearCover;
+        public float* Depth, Far, NearWorld;
+        public bool* GearMask, GearAny;
+        public int* Offset, Wid;
+    }
 
-    // After a Covered result: the depth of the nearest cover under the box (larger is nearer),
-    // and whether some of the cover was gear.
+    // After a Covered result of the single-threaded Test: the depth of the nearest cover under
+    // the box (larger is nearer), and whether some of the cover was gear.
     private float _nearestCover;
     private bool _gearCover;
     public float NearestCover => _nearestCover;
     public bool GearCover => _gearCover;
 
-    public int Test(float xMin, float yMin, float xMax, float yMax, float boxNearest)
+    public int Test(float xMin, float yMin, float xMax, float yMax, float boxNearest) =>
+        Test(xMin, yMin, xMax, yMax, boxNearest, out _nearestCover, out _gearCover);
+
+    // Thread-safe once built: the cover comes back through the out parameters.
+    public int Test(float xMin, float yMin, float xMax, float yMax, float boxNearest, out float nearestCover, out bool gearCover)
     {
+        if (_native != null && UseNative)
+        {
+            var result = sm_test(_native, xMin, yMin, xMax, yMax, boxNearest, out nearestCover, out var gear);
+            gearCover = gear != 0;
+            return result;
+        }
+
+        nearestCover = 0f;
+        gearCover = false;
         int width = _width, height = _height;
         if (xMax <= 0f || yMax <= 0f || xMin >= 1f || yMin >= 1f) return DepthCover.OffScreen;
         var x0 = (int)Math.Floor(xMin * width);
@@ -389,60 +502,56 @@ public sealed unsafe class DepthPyramid
         if (y1 < y0) y1 = y0;
         if (y1 > height - 1) y1 = height - 1;
         // Rows as stored: upside down.
-        _x0 = x0;
-        _x1 = x1;
-        _r0 = height - 1 - y1;
-        _r1 = height - 1 - y0;
-        _boxNearest = boxNearest;
-        _nearestCover = 0f;
-        _gearCover = false;
+        var p = new Probe { X0 = x0, X1 = x1, R0 = height - 1 - y1, R1 = height - 1 - y0, BoxNearest = boxNearest };
 
         // Start where the box spans at most 4x4 texels, and look closer only inside texels that
         // can't decide: the work follows the edges of the cover, not the area of the box.
         var level = 0;
-        while (level < _levels - 1 && ((_x1 >> level) - (_x0 >> level) > 3 || (_r1 >> level) - (_r0 >> level) > 3)) level++;
+        while (level < _levels - 1 && ((p.X1 >> level) - (p.X0 >> level) > 3 || (p.R1 >> level) - (p.R0 >> level) > 3)) level++;
         fixed (float* depth = _depth, far = _far, nearWorld = _nearWorld)
         fixed (bool* gearMask = _gearMask, gearAny = _gearAny)
         fixed (int* offset = _offset, wid = _wid)
         {
-            _pDepth = depth;
-            _pFar = far;
-            _pNearWorld = nearWorld;
-            _pGearMask = gearMask;
-            _pGearAny = gearAny;
-            _pOffset = offset;
-            _pWid = wid;
-            int rEnd = _r1 >> level, xEnd = _x1 >> level;
-            for (var r = _r0 >> level; r <= rEnd; r++)
-            for (var x = _x0 >> level; x <= xEnd; x++)
+            p.Depth = depth;
+            p.Far = far;
+            p.NearWorld = nearWorld;
+            p.GearMask = gearMask;
+            p.GearAny = gearAny;
+            p.Offset = offset;
+            p.Wid = wid;
+            int rEnd = p.R1 >> level, xEnd = p.X1 >> level;
+            for (var r = p.R0 >> level; r <= rEnd; r++)
+            for (var x = p.X0 >> level; x <= xEnd; x++)
             {
-                if (ShowsBehind(level, x, r)) return DepthCover.ShowsBehind;
+                if (ShowsBehind(ref p, level, x, r)) return DepthCover.ShowsBehind;
             }
         }
 
+        nearestCover = p.NearestCover;
+        gearCover = p.GearCover;
         return DepthCover.Covered;
     }
 
     // True when something at or behind the box shows in this texel's part of the box.
-    private bool ShowsBehind(int level, int x, int r)
+    private bool ShowsBehind(ref Probe p, int level, int x, int r)
     {
         if (level == 0)
         {
             var i = r * _width + x;
-            var d = _pDepth[i];
-            if (d <= _boxNearest) return true;
-            if (_pGearMask[i]) _gearCover = true;
-            else if (d > _nearestCover) _nearestCover = d;
+            var d = p.Depth[i];
+            if (d <= p.BoxNearest) return true;
+            if (p.GearMask[i]) p.GearCover = true;
+            else if (d > p.NearestCover) p.NearestCover = d;
             return false;
         }
 
-        var t = _pOffset[level] + r * _pWid[level] + x;
+        var t = p.Offset[level] + r * p.Wid[level] + x;
         // Everything below is nearer than the box: covered.
-        if (_pFar[t] > _boxNearest)
+        if (p.Far[t] > p.BoxNearest)
         {
-            var near = _pNearWorld[t];
-            if (near > _nearestCover) _nearestCover = near;
-            if (_pGearAny[t]) _gearCover = true;
+            var near = p.NearWorld[t];
+            if (near > p.NearestCover) p.NearestCover = near;
+            if (p.GearAny[t]) p.GearCover = true;
             return false;
         }
 
@@ -451,18 +560,18 @@ public sealed unsafe class DepthPyramid
         int bx1 = ((x + 1) << level) - 1, by1 = ((r + 1) << level) - 1;
         if (bx1 > _width - 1) bx1 = _width - 1;
         if (by1 > _height - 1) by1 = _height - 1;
-        if (bx0 >= _x0 && bx1 <= _x1 && by0 >= _r0 && by1 <= _r1) return true;
+        if (bx0 >= p.X0 && bx1 <= p.X1 && by0 >= p.R0 && by1 <= p.R1) return true;
 
         var shift = level - 1;
         int rFrom = r * 2, rTo = r * 2 + 1, xFrom = x * 2, xTo = x * 2 + 1;
-        if (_r0 >> shift > rFrom) rFrom = _r0 >> shift;
-        if (_r1 >> shift < rTo) rTo = _r1 >> shift;
-        if (_x0 >> shift > xFrom) xFrom = _x0 >> shift;
-        if (_x1 >> shift < xTo) xTo = _x1 >> shift;
+        if (p.R0 >> shift > rFrom) rFrom = p.R0 >> shift;
+        if (p.R1 >> shift < rTo) rTo = p.R1 >> shift;
+        if (p.X0 >> shift > xFrom) xFrom = p.X0 >> shift;
+        if (p.X1 >> shift < xTo) xTo = p.X1 >> shift;
         for (var cr = rFrom; cr <= rTo; cr++)
         for (var cx = xFrom; cx <= xTo; cx++)
         {
-            if (ShowsBehind(shift, cx, cr)) return true;
+            if (ShowsBehind(ref p, shift, cx, cr)) return true;
         }
 
         return false;

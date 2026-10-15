@@ -1,0 +1,418 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Reflection;
+using System.Threading;
+using EFT.CameraControl;
+using HarmonyLib;
+using Koenigz.PerfectCulling;
+using Koenigz.PerfectCulling.EFT;
+using SPT.Reflection.Patching;
+using UnityEngine;
+
+namespace Smoothie;
+
+// Takes LOD groups nothing can be seen of out of Unity's per-frame LOD work (Plugin.SkipOutOfView).
+// Unity's LOD pass recomputes every LOD group on the map (~134k on Streets) for every camera each
+// frame, wherever it is and whether anything of it is drawn; forced to a level it doesn't have
+// (SceneSkip), a group draws nothing and that pass returns from it at once. A byte each way, so
+// nothing about it costs much (switching objects off and on with enabled cost ~1 µs each and
+// hitched on every turn). Measured on Streets standing still: ~95k groups, ~0.7-1 ms a frame.
+// Two reasons a group has nothing to show:
+// - Out of view and beyond shadow range: every frame right before the main camera culls, cells
+//   of groups are tested against that frame's own view, and a cell coming into view is put back
+//   before Unity culls it, so nothing shows up late. Within shadow range everything stays:
+//   what's behind you can cast shadows into view.
+// - All its meshes switched off by the game's baked visibility: put back in the game's switch
+//   queue right before it switches any of them back on (SwitchPatch), so never a frame without.
+// Only static level groups (nothing that moves or can be used, no players or loot).
+internal static class LodCulling
+{
+    private const float CellSize = 32f;
+    private const float KeepBeyondShadows = 50f;
+    // Put back once within this of the view (m); taken out once past it by this plus a share of
+    // its distance, so a cell at the edge doesn't flip every frame.
+    private const float ShowMargin = 2f, HideMargin = 6f, HideShare = 0.1f;
+    private const int TakePerFrame = 3000, ChecksPerFrame = 2000;
+    private const byte OutOfView = 1, GameOff = 2;
+
+    // Per group, sorted by cell: the group, its bounding sphere, why it's forced (0: it isn't),
+    // and the slot and native object it was forced through (0: not forced).
+    private static LODGroup[] _groups = Array.Empty<LODGroup>();
+    private static byte[] _reason = Array.Empty<byte>();
+    private static uint[] _slot = Array.Empty<uint>();
+    private static IntPtr[] _native = Array.Empty<IntPtr>();
+    // Per group whose meshes are all the baked visibility's: its meshes (else null).
+    private static Renderer[]?[] _bakedParts = Array.Empty<Renderer[]?>();
+    private static readonly Dictionary<Renderer, int> GroupOf = new();
+    // Cells: groups CellStart[c] to CellStart[c + 1] - 1, a sphere around all of them, out now.
+    private static int[] _cellStart = Array.Empty<int>();
+    private static Vector3[] _cellCenter = Array.Empty<Vector3>();
+    private static float[] _cellRadius = Array.Empty<float>();
+    private static bool[] _cellOut = Array.Empty<bool>();
+    // Groups whose meshes the game may just have switched all off: checked on the main thread.
+    private static readonly List<int> ToCheck = new();
+    private static int _checkCursor;
+
+    private static IEnumerator<bool>? _build;
+    private static bool _built;
+    private static float _buildAt = -1f;
+    private static int _mainThread;
+    private static Camera? _camera;
+    private static Vector4 _side0, _side1, _side2, _side3;
+
+    internal static int Groups, Forced;
+    internal static double Ms;
+
+    internal static void Enable()
+    {
+        _mainThread = Thread.CurrentThread.ManagedThreadId;
+        Camera.onPreCull += PreCull;
+        new SwitchPatch().Enable();
+    }
+
+    private static bool On => Plugin.On(Plugin.SkipOutOfView) && SceneSkip.Check();
+
+    // Plugin.Update in a raid: the build, a slice per frame, 10 s in.
+    internal static void Tick()
+    {
+        if (!On)
+        {
+            if (Forced > 0) ShowAll();
+            return;
+        }
+
+        if (_built) return;
+        if (_buildAt < 0f) _buildAt = Time.time + 10f;
+        if (Time.time < _buildAt) return;
+        _build ??= Build();
+        if (!_build.MoveNext())
+        {
+            _build = null;
+            _built = true;
+        }
+    }
+
+    // The main camera, right before culling: cells in and out of view, then the groups the game
+    // may have switched all off.
+    private static void PreCull(Camera camera)
+    {
+        if (!_built || !Diagnostics.InRaid) return;
+        if (!ReferenceEquals(camera, _camera))
+        {
+            if (CameraManager.Instance?.Camera is not { } main || !ReferenceEquals(camera, main)) return;
+            _camera = camera;
+        }
+
+        if (!On) return;
+        var start = Stopwatch.GetTimestamp();
+        try
+        {
+            TestCells(camera);
+            CheckGameOff();
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.LogError($"LOD culling: {ex}");
+            Plugin.SkipOutOfView.Value = false;
+        }
+
+        Ms = Ms * 0.95 + (Stopwatch.GetTimestamp() - start) * Diagnostics.TickMs * 0.05;
+    }
+
+    private static void TestCells(Camera camera)
+    {
+        var m = camera.cullingMatrix;
+        _side0 = Normalized(new Vector4(m.m30 + m.m00, m.m31 + m.m01, m.m32 + m.m02, m.m33 + m.m03));
+        _side1 = Normalized(new Vector4(m.m30 - m.m00, m.m31 - m.m01, m.m32 - m.m02, m.m33 - m.m03));
+        _side2 = Normalized(new Vector4(m.m30 + m.m10, m.m31 + m.m11, m.m32 + m.m12, m.m33 + m.m13));
+        _side3 = Normalized(new Vector4(m.m30 - m.m10, m.m31 - m.m11, m.m32 - m.m12, m.m33 - m.m13));
+        var eye = camera.transform.position;
+        var keep = QualitySettings.shadowDistance + KeepBeyondShadows;
+        var budget = TakePerFrame;
+        for (var c = 0; c < _cellOut.Length; c++)
+        {
+            var center = _cellCenter[c];
+            var radius = _cellRadius[c];
+            float dx = center.x - eye.x, dy = center.y - eye.y, dz = center.z - eye.z;
+            var distance = (float)Math.Sqrt(dx * dx + dy * dy + dz * dz);
+            var near = distance - radius;
+            if (_cellOut[c])
+            {
+                if (near > keep && !InView(center, radius + ShowMargin)) continue;
+                _cellOut[c] = false;
+                for (var g = _cellStart[c]; g < _cellStart[c + 1]; g++) Clear(g, OutOfView);
+            }
+            else if (budget > 0 && near > keep + HideMargin && !InView(center, radius + HideMargin + HideShare * distance))
+            {
+                _cellOut[c] = true;
+                budget -= _cellStart[c + 1] - _cellStart[c];
+                for (var g = _cellStart[c]; g < _cellStart[c + 1]; g++) Set(g, OutOfView);
+            }
+        }
+    }
+
+    // Groups the game may have switched all off (queued by SwitchPatch, and every baked group
+    // once after the build), a budget per frame.
+    private static void CheckGameOff()
+    {
+        var end = Math.Min(ToCheck.Count, _checkCursor + ChecksPerFrame);
+        for (; _checkCursor < end; _checkCursor++)
+        {
+            var g = ToCheck[_checkCursor];
+            if (_bakedParts[g] is not { } parts || (_reason[g] & GameOff) != 0) continue;
+            var anyOn = false;
+            foreach (var renderer in parts)
+                if (renderer != null && renderer.enabled) anyOn = true;
+            if (!anyOn) Set(g, GameOff);
+        }
+
+        if (_checkCursor < ToCheck.Count) return;
+        ToCheck.Clear();
+        _checkCursor = 0;
+    }
+
+    private static void Set(int g, byte reason)
+    {
+        var was = _reason[g];
+        _reason[g] = (byte)(was | reason);
+        if (was != 0) return;
+        _slot[g] = SceneSkip.ForceNothing(_groups[g], out _native[g]);
+        if (_slot[g] != 0) Forced++;
+    }
+
+    private static void Clear(int g, byte reason)
+    {
+        var was = _reason[g];
+        if ((was & reason) == 0) return;
+        _reason[g] = (byte)(was & ~reason);
+        if (_reason[g] != 0 || _slot[g] == 0) return;
+        SceneSkip.Unforce(_groups[g], _slot[g], _native[g]);
+        _slot[g] = 0;
+        Forced--;
+    }
+
+    // Everything back (setting off, A/B, an error, leaving the raid).
+    internal static void ShowAll()
+    {
+        for (var g = 0; g < _reason.Length; g++)
+        {
+            if (_slot[g] != 0) SceneSkip.Unforce(_groups[g], _slot[g], _native[g]);
+            _reason[g] = 0;
+            _slot[g] = 0;
+        }
+
+        Array.Clear(_cellOut, 0, _cellOut.Length);
+        Forced = 0;
+        // Back on: everything is taken out again, game-off groups too.
+        ToCheck.Clear();
+        _checkCursor = 0;
+        for (var g = 0; g < _bakedParts.Length; g++)
+            if (_bakedParts[g] != null) ToCheck.Add(g);
+    }
+
+    internal static void Clear()
+    {
+        ShowAll();
+        _groups = Array.Empty<LODGroup>();
+        _reason = Array.Empty<byte>();
+        _slot = Array.Empty<uint>();
+        _native = Array.Empty<IntPtr>();
+        _bakedParts = Array.Empty<Renderer[]?>();
+        GroupOf.Clear();
+        _cellStart = Array.Empty<int>();
+        _cellCenter = Array.Empty<Vector3>();
+        _cellRadius = Array.Empty<float>();
+        _cellOut = Array.Empty<bool>();
+        ToCheck.Clear();
+        _checkCursor = 0;
+        _build = null;
+        _built = false;
+        _buildAt = -1f;
+        _camera = null;
+        Groups = 0;
+    }
+
+    // Every static LOD group: sphere, cell, and whether all its meshes are the baked visibility's.
+    // A slice per frame (~2 ms).
+    private static IEnumerator<bool> Build()
+    {
+        var slice = (long)(2.0 / Diagnostics.TickMs);
+        var start = Stopwatch.GetTimestamp();
+        var baked = new HashSet<Renderer>();
+        foreach (var crossScene in UnityEngine.Object.FindObjectsByType<PerfectCullingCrossSceneGroup>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            if (crossScene.bakeGroups == null) continue;
+            foreach (var group in crossScene.bakeGroups)
+                if (group?.renderers != null) baked.UnionWith(group.renderers);
+        }
+
+        var skipLayers = 0;
+        foreach (var layer in new[] { "Loot", "Interactive", "PlayerRenderers", "Player", "Deadbody" })
+        {
+            var index = LayerMask.NameToLayer(layer);
+            if (index >= 0) skipLayers |= 1 << index;
+        }
+
+        var moving = new Dictionary<Transform, bool>();
+        var found = new List<(long Key, LODGroup Group, Vector3 Center, float Radius, Renderer[]? Baked)>();
+        var all = UnityEngine.Object.FindObjectsByType<LODGroup>(FindObjectsSortMode.None);
+        for (var n = 0; n < all.Length; n++)
+        {
+            if ((n & 63) == 0 && Stopwatch.GetTimestamp() - start > slice)
+            {
+                yield return true;
+                start = Stopwatch.GetTimestamp();
+            }
+
+            var group = all[n];
+            if (group == null || !group.enabled || group.lodCount >= 8 || (skipLayers & (1 << group.gameObject.layer)) != 0) continue;
+            var t = group.transform;
+            if (DepthCulling.Moves(t, moving)) continue;
+            var scale = t.lossyScale;
+            var center = t.TransformPoint(group.localReferencePoint);
+            var radius = group.size * Math.Max(Math.Abs(scale.x), Math.Max(Math.Abs(scale.y), Math.Abs(scale.z))) * 0.87f;
+            if (!(radius < 5000f)) continue;
+
+            Renderer[]? bakedParts = null;
+            var parts = new List<Renderer>();
+            var allBaked = true;
+            foreach (var lod in group.GetLODs())
+            foreach (var renderer in lod.renderers)
+            {
+                if (renderer == null) continue;
+                parts.Add(renderer);
+                if (!baked.Contains(renderer)) allBaked = false;
+            }
+
+            if (allBaked && parts.Count > 0) bakedParts = parts.ToArray();
+            long key = ((long)Mathf.FloorToInt(center.x / CellSize) & 0x1FFFFF) << 42 | ((long)Mathf.FloorToInt(center.y / CellSize) & 0x1FFFFF) << 21 | ((long)Mathf.FloorToInt(center.z / CellSize) & 0x1FFFFF);
+            found.Add((key, group, center, radius, bakedParts));
+        }
+
+        found.Sort((a, b) => a.Key.CompareTo(b.Key));
+        var count = found.Count;
+        _groups = new LODGroup[count];
+        _reason = new byte[count];
+        _slot = new uint[count];
+        _native = new IntPtr[count];
+        _bakedParts = new Renderer[count][];
+        var starts = new List<int>();
+        var mins = new List<Vector3>();
+        var maxs = new List<Vector3>();
+        for (var g = 0; g < count; g++)
+        {
+            var (key, group, center, radius, parts) = found[g];
+            _groups[g] = group;
+            _bakedParts[g] = parts;
+            if (parts != null)
+            {
+                foreach (var renderer in parts) GroupOf[renderer] = g;
+                ToCheck.Add(g);
+            }
+
+            var min = center - Vector3.one * radius;
+            var max = center + Vector3.one * radius;
+            if (g == 0 || key != found[g - 1].Key)
+            {
+                starts.Add(g);
+                mins.Add(min);
+                maxs.Add(max);
+            }
+            else
+            {
+                var last = mins.Count - 1;
+                mins[last] = Vector3.Min(mins[last], min);
+                maxs[last] = Vector3.Max(maxs[last], max);
+            }
+        }
+
+        starts.Add(count);
+        _cellStart = starts.ToArray();
+        var cells = mins.Count;
+        _cellCenter = new Vector3[cells];
+        _cellRadius = new float[cells];
+        _cellOut = new bool[cells];
+        for (var c = 0; c < cells; c++)
+        {
+            _cellCenter[c] = (mins[c] + maxs[c]) * 0.5f;
+            _cellRadius[c] = (maxs[c] - mins[c]).magnitude * 0.5f;
+        }
+
+        Groups = count;
+        Plugin.Log.LogInfo($"LOD culling ({SceneSkip.Note}): {count} static LOD groups in {cells} cells, {ToCheck.Count} of them all the game's baked visibility");
+    }
+
+    // For the A/B log: forced groups by reason, and how many slots really hold the forced level.
+    internal static string Summary()
+    {
+        int outOfView = 0, gameOff = 0, holding = 0;
+        for (var g = 0; g < _reason.Length; g++)
+        {
+            if (_slot[g] == 0) continue;
+            if ((_reason[g] & OutOfView) != 0) outOfView++;
+            if ((_reason[g] & GameOff) != 0) gameOff++;
+            if (SceneSkip.IsForced(_slot[g], _native[g])) holding++;
+        }
+
+        return $"{Forced} of {Groups} LOD groups forced ({outOfView} out of view, {gameOff} switched off by the game; {holding} slots holding it), {Ms:0.00} ms a frame";
+    }
+
+    // The sphere within the view's four sides (they meet at the eye, so behind it is outside).
+    private static bool InView(Vector3 c, float radius) =>
+        _side0.x * c.x + _side0.y * c.y + _side0.z * c.z + _side0.w >= -radius
+        && _side1.x * c.x + _side1.y * c.y + _side1.z * c.z + _side1.w >= -radius
+        && _side2.x * c.x + _side2.y * c.y + _side2.z * c.z + _side2.w >= -radius
+        && _side3.x * c.x + _side3.y * c.y + _side3.z * c.z + _side3.w >= -radius;
+
+    private static Vector4 Normalized(Vector4 q)
+    {
+        var length = (float)Math.Sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
+        return length > 0f ? q / length : q;
+    }
+
+    // The game's baked visibility switching groups this frame (UpdateSwitchQueues takes from the
+    // end of both queues, deactivations first): a group about to get a mesh back is put back
+    // first; one losing meshes is checked afterwards (main thread) for whether any is left.
+    private class SwitchPatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod() =>
+            AccessTools.Method(typeof(PerfectCullingCrossSceneGroup), nameof(PerfectCullingCrossSceneGroup.UpdateSwitchQueues));
+
+        [PatchPrefix]
+        private static void Prefix(PerfectCullingCrossSceneGroup __instance, FastArray<ushort> ____queueActivate, FastArray<ushort> ____queueDeactivate)
+        {
+            if (Forced == 0 && ToCheck.Count == 0 && GroupOf.Count == 0) return;
+            try
+            {
+                var take = PerfectCullingSettings.Instance.numActivationsPerVolume / 2;
+                var groups = __instance.bakeGroups;
+                var main = Thread.CurrentThread.ManagedThreadId == _mainThread;
+                Visit(groups, ____queueActivate, take, true, main);
+                if (main) Visit(groups, ____queueDeactivate, take, false, true);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"LOD culling, switch queue: {ex}");
+            }
+        }
+
+        private static void Visit(PerfectCullingBakeGroup[] groups, FastArray<ushort>? queue, int take, bool activate, bool main)
+        {
+            if (queue == null) return;
+            var count = queue.Count;
+            var buffer = queue.Buffer;
+            for (var k = 1; k <= Math.Min(count, take); k++)
+            {
+                var b = buffer[count - k];
+                if (b >= groups.Length || groups[b]?.renderers is not { } renderers) continue;
+                foreach (var renderer in renderers)
+                {
+                    if (renderer is null || !GroupOf.TryGetValue(renderer, out var g)) continue;
+                    if (activate) Clear(g, GameOff);
+                    else if (main) ToCheck.Add(g);
+                }
+            }
+        }
+    }
+}

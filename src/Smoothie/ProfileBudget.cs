@@ -69,7 +69,9 @@ internal static class ProfileBudget
     {
         if (Time.unscaledTime - _hooksCheckedAt < 10f) return _noModHooks;
         _hooksCheckedAt = Time.unscaledTime;
-        return _noModHooks = ScanModHooks();
+        _noModHooks = ScanModHooks();
+        if (_noModHooks) Plugin.SetDisabled(Plugin.ProfilesOffThread, null);
+        return _noModHooks;
     }
 
     private static bool ScanModHooks()
@@ -87,6 +89,7 @@ internal static class ProfileBudget
             if (owners == null || owners.Count == 0) continue;
             var what = $"{string.Join(", ", owners)} patches {type.Name}.{method.Name}";
             if (Reported.Add(what)) Plugin.Log.LogInfo($"bot profiles stay on the main thread: {what}");
+            Plugin.SetDisabled(Plugin.ProfilesOffThread, $"{owners[0]} patches bot gear");
             return false;
         }
 

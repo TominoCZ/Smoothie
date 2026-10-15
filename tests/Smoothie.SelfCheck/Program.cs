@@ -219,6 +219,77 @@ pyramid.ClearGear();
 pyramid.Build(image, pw, ph);
 Check(Math.Abs(pyramid.Test(0.05f, 0.05f, 0.95f, 0.95f, 0.1f) == DepthCover.Covered ? pyramid.NearestCover - 0.9f : 1f) < 1e-6f, "gear mask survived ClearGear");
 
+// The native pyramid (src/SmoothieNative, SSE2) answers exactly as the C# one: random sizes
+// (odd ones and the game's 185x102 included), walls with holes, sky, near things and gear.
+Check(DepthPyramid.TryNative(), "libSmoothieNative.so didn't load");
+if (DepthPyramid.UseNative)
+{
+    var managed = new DepthPyramid();
+    var native = new DepthPyramid();
+    int[][] sizes = { new[] { 185, 102 }, new[] { 37, 23 }, new[] { 1, 1 }, new[] { 2, 7 }, new[] { 64, 64 }, new[] { 9, 130 } };
+    var nativeMismatches = 0;
+    var tests = 0;
+    for (var round = 0; round < 300; round++)
+    {
+        var size = sizes[round % sizes.Length];
+        int w = size[0], h = size[1];
+        var img = new float[w * h];
+        var wall = 0.05f + (float)random.NextDouble() * 0.3f;
+        for (var i = 0; i < img.Length; i++)
+        {
+            var roll = random.NextDouble();
+            img[i] = roll < 0.03 ? 0f : roll < 0.06 ? 0.95f : wall + (float)random.NextDouble() * 0.05f;
+        }
+
+        if (round % 4 == 0) for (var i = 0; i < img.Length; i++) img[i] = wall;
+        managed.ClearGear();
+        native.ClearGear();
+        if (round % 2 == 1)
+        {
+            float gx = (float)random.NextDouble(), gy = (float)random.NextDouble();
+            managed.AddGear(gx, gy, gx + 0.3f, gy + 0.3f, 0.99f, 0.0f);
+            native.AddGear(gx, gy, gx + 0.3f, gy + 0.3f, 0.99f, 0.0f);
+        }
+
+        DepthPyramid.UseNative = false;
+        managed.Build(img, w, h);
+        DepthPyramid.UseNative = true;
+        native.Build(img, w, h);
+        for (var box = 0; box < 300; box++)
+        {
+            float x = (float)random.NextDouble() * 1.2f - 0.1f, y = (float)random.NextDouble() * 1.2f - 0.1f;
+            float bw = (float)random.NextDouble() * 0.7f, bh = (float)random.NextDouble() * 0.7f;
+            var nearest = (float)random.NextDouble() * 0.4f;
+            // The managed pyramid was built without native levels, so it tests in C#.
+            var a = managed.Test(x, y, x + bw, y + bh, nearest, out var coverA, out var gearA);
+            var b = native.Test(x, y, x + bw, y + bh, nearest, out var coverB, out var gearB);
+            tests++;
+            if (a != b || a == DepthCover.Covered && (coverA != coverB || gearA != gearB)) nativeMismatches++;
+        }
+    }
+
+    Check(nativeMismatches == 0, $"native pyramid disagrees with the C# one {nativeMismatches} of {tests} times");
+    // ponytail: rough speed check only, printed, not asserted (machines differ).
+    var bench = new float[185 * 102];
+    for (var i = 0; i < bench.Length; i++) bench[i] = 0.2f + (float)random.NextDouble() * 0.01f;
+    foreach (var useNative in new[] { false, true })
+    {
+        DepthPyramid.UseNative = useNative;
+        var py = new DepthPyramid();
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var sink = 0;
+        for (var k = 0; k < 200; k++)
+        {
+            py.Build(bench, 185, 102);
+            for (var box = 0; box < 2000; box++) sink += py.Test(0.1f + box % 50 * 0.01f, 0.2f, 0.3f + box % 50 * 0.01f, 0.5f, 0.1f, out _, out _);
+        }
+
+        Console.WriteLine($"{(useNative ? "native" : "C#    ")}: {watch.Elapsed.TotalMilliseconds / 200:0.000} ms per build + 2000 tests ({sink})");
+    }
+
+    DepthPyramid.UseNative = false;
+}
+
 // Growth while moving: reversed-Z projection with near 0.05 m, far 10 km; depth of a distance z
 // is p23 / z - p22. Cover at 2 m, the box's far point at 20 m, eye 0.18 m: 0.18 * (1/2 - 1/20)
 // = 0.081 rad, about 8.9 texels of 0.0091 rad.

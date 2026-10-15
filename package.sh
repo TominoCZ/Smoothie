@@ -73,7 +73,7 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
 mkdir -p "$STAGE/$DEST"
-cp "$DLL" "$STAGE/$DEST/"
+cp "$DLL" "$(dirname "$DLL")/SmoothieNative.dll" "$STAGE/$DEST/"
 
 ZIP="$HERE/Smoothie_${VERSION}.zip"
 rm -f "$ZIP"

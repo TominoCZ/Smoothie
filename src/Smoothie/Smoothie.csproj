@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>1.0.4</Version>
+    <Version>1.0.5</Version>
     <AssemblyName>Smoothie</AssemblyName>
     <RootNamespace>Smoothie</RootNamespace>
   </PropertyGroup>
@@ -28,13 +28,24 @@
     <Reference Include="spt-reflection"><HintPath>$(SptPath)/BepInEx/plugins/spt/spt-reflection.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 
+  <!-- The native depth pyramid (src/SmoothieNative, needs mingw-w64), shipped next to the plugin. -->
+  <PropertyGroup>
+    <NativeDir>$(MSBuildThisFileDirectory)../SmoothieNative</NativeDir>
+  </PropertyGroup>
+  <Target Name="BuildNative" BeforeTargets="BeforeBuild" Inputs="$(NativeDir)/pyramid.c;$(NativeDir)/build.sh" Outputs="$(NativeDir)/bin/SmoothieNative.dll">
+    <Exec Command="bash &quot;$(NativeDir)/build.sh&quot;" />
+  </Target>
+  <ItemGroup>
+    <None Include="$(NativeDir)/bin/SmoothieNative.dll" Link="SmoothieNative.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
   <!-- dotnet build -p:SptDeploy=true  installs straight into the game. -->
   <Target Name="DeployToSpt" AfterTargets="Build" Condition="'$(SptDeploy)' == 'true'">
     <PropertyGroup>
       <SptPluginDir Condition="'$(SptPluginDir)' == ''">$(SptPath)/BepInEx/plugins/Smoothie</SptPluginDir>
     </PropertyGroup>
     <MakeDir Directories="$(SptPluginDir)" />
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(SptPluginDir)" />
+    <Copy SourceFiles="$(TargetPath);$(TargetDir)SmoothieNative.dll" DestinationFolder="$(SptPluginDir)" />
     <Message Importance="high" Text="Smoothie -> $(SptPluginDir)" />
   </Target>
 

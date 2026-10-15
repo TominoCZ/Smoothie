@@ -106,6 +106,8 @@ internal static class Overlay
             () => DepthCulling.MovingKept > 0 ? $"margin up to {DepthCulling.MovingGrow:0.0} texels" : "", true, Plugin.HideCovered),
         new("Lamps skipped", () => Plugin.On(Plugin.HideCovered) && Plugin.On(Plugin.SkipCoveredLamps) ? DepthCulling.LampsOff : 0,
             () => $"of {DepthCulling.LampsInView} lit in view ({DepthCulling.LampsOn} on, {DepthCulling.LampCount} on the map)", true, Plugin.SkipCoveredLamps),
+        new("LOD groups skipped", () => Plugin.On(Plugin.SkipOutOfView) ? LodCulling.Forced : 0,
+            () => SceneSkip.Available ? $"of {LodCulling.Groups} static; {LodCulling.Ms:0.00} ms a frame" : SceneSkip.Note, true, Plugin.SkipOutOfView),
         new("Smoothie itself", () => (float)(_ownFrameTicks * TickMs) + (Diagnostics.InRaid ? (float)(AnimatorThrottle.StepMs + Occlusion.Ms) : 0f),
             () => $"incl. this overlay {_overlayAverageMs:0.00}, hiding {DepthCulling.Ms:0.00} (worst {DepthCulling.PeakMs:0.00}: {DepthCulling.PeakNote}) ms; {Occlusion.Rays} bot rays", false),
     };

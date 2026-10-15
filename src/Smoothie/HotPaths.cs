@@ -331,13 +331,12 @@ internal static class HotPaths
     // Looked up on first use, once every plugin has loaded.
     private static bool? _ruptureInstalled;
 
-    private static bool RuptureInstalled
+    internal static bool RuptureInstalled
     {
         get
         {
             if (_ruptureInstalled is { } installed) return installed;
             _ruptureInstalled = BepInEx.Bootstrap.Chainloader.PluginInfos.ContainsKey("com.rootdarkarchon.rupture");
-            if (_ruptureInstalled.Value) Plugin.Log.LogInfo("Rupture is installed: corpses are left to it (\"Corpses stop moving after\" is off).");
             return _ruptureInstalled.Value;
         }
     }

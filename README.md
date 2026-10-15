@@ -19,7 +19,8 @@ bullets all work like before.
 | Gun of a bot the game already hid | still drawn | hidden with the bot |
 | Corpses | ragdoll for 15–30 s | settle after 5 s (left to Rupture when it's installed) |
 | Buildings, walls and furniture behind nearer ones | drawn, shadows too | not drawn past 3 m when fully covered, shadows included (checked against your scope's view too) |
-| Lamps lighting only rooms you can't see | light and shadows drawn | skipped until any of their light may come into view |
+| Lamps and area lights lighting only rooms you can't see | light and shadows drawn | skipped until any of their light may come into view |
+| Level of detail for objects behind you | worked out every frame | skipped (big maps) |
 | Huge bot counts when you host | hundreds of spawn attempts every 15 s, freezes | only as many as fit, gear built a bit per frame |
 | Requests to the SPT server | a new connection every time | one connection kept open |
 
@@ -30,16 +31,19 @@ On top of that, a few things the game wastes every frame are fixed: a coroutine 
 every bot every frame, dead bots' brains still being updated, the main menu's background
 video playing through your whole raid, and muzzle smoke lighting recalculated for every gun.
 
-## What's new in 1.0.4
+## What's new in 1.0.5
 
-- Far fewer draw calls indoors. Most of what a building costs is shadows: covered objects no
-  longer draw their shadows, and lamps whose whole lit area is behind walls are skipped. On
-  Factory that is over a thousand draw calls a frame in some spots.
-- Less pop-in while moving: what's about to come out from behind cover is drawn a little before
-  it does, more the faster you move and the nearer the cover.
-- Hiding now starts at 3 m instead of 10 m, adjustable from 1 to 10 m.
-- Level objects are drawn grouped by material: fewer material switches for your CPU.
-- Works with Rupture: corpses are left to it, so they keep reacting to hits after they land.
+- Hiding covered objects costs far less on your main thread. Turning around no longer causes
+  spikes (from up to 4.5 ms of its own down to about 1 ms), the check runs on several CPU cores, and
+  objects the game isn't drawing anyway aren't checked at all.
+- Area lights (the game's glowing panels, signs and windows) behind walls are skipped like lamps.
+  Indoors on Streets that took one spot from ~150 to 170-200 fps.
+- Less of Unity's own per-frame work on big maps: level of detail is skipped for objects behind
+  you, and two of Unity's culling loops are rewritten in memory to do the same work faster. Only
+  for the current game build; on any other build these switch themselves off.
+- Far buildings' stand-in meshes are hidden too when covered.
+- The covered-object check runs in native code with SIMD (`SmoothieNative.dll`, next to
+  `Smoothie.dll`), several times faster than before; that matters most on CPUs with fewer cores.
 
 ## Compatibility
 
@@ -59,9 +63,10 @@ Extract the zip into your SPT folder, so you end up with:
 
 ```
 <SPT>/BepInEx/plugins/Smoothie/Smoothie.dll
+<SPT>/BepInEx/plugins/Smoothie/SmoothieNative.dll
 ```
 
-To check it loaded, look for `Loading [Smoothie 1.0.4]` in `BepInEx/LogOutput.log`. As a Fika
+To check it loaded, look for `Loading [Smoothie 1.0.5]` in `BepInEx/LogOutput.log`. As a Fika
 client you'll also see this once you're in a raid:
 
 ```
@@ -92,7 +97,9 @@ what I'd recommend. Tick **Show advanced settings** to see the sliders and the t
 | Hide objects covered by nearer ones (experimental) | on | level objects aren't drawn while something nearer completely covers them. Something coming into view can show up a few frames late, only while you move; the faster you move, the earlier it's drawn. Doors, loot, players and anything that moves are never hidden |
 | Hide covered objects only beyond (m) | 3 m | everything nearer stays drawn; 1–10 m |
 | Covered objects also stop casting shadows | on | covered objects aren't drawn into shadow maps either, nor the game's separate shadow-only meshes when covered. Off: their shadows stay, always right but costs those draws |
-| Skip lamps lighting only covered areas | on | a lamp whose whole lit area is behind nearer things lights nothing you can see, so it stops lighting and drawing its shadows until any of that area may come into view. The sun and moon are left alone |
+| Skip lamps lighting only covered areas | on | a lamp or area light whose whole lit area is behind nearer things lights nothing you can see, so it stops lighting and drawing its shadows until any of that area may come into view. The sun and moon are left alone |
+| Skip LOD work for objects you cannot see | on | Unity stops working out the level of detail of level objects out of view and beyond shadow range, and of those the game switched off. Nothing you see changes. Current game build only |
+| Faster engine culling loops (code patch) | on | rewrites two of Unity's per-frame culling loops in memory (nothing on disk) to do the same work faster. Nothing you see changes. Current game build only; off puts Unity's code back |
 | Draw level objects grouped by material | on | fewer material switches for the CPU, a little more work for the graphics card; if the overlay shows GPU wait going up, switch it off |
 | Prevent memory cleanup stutters in raids | off | opening your inventory turns memory cleanup back on for the rest of the raid, which stutters every minute or two; this lets it finish and then pauses it again. Only on PCs with enough RAM for the game to pause it in the first place (25 GB by default) |
 | Keep server connection open (faster menus) | on | one open connection to the SPT server instead of a new one per request |
@@ -109,8 +116,10 @@ Settings were renamed in 1.0.1, so if you're coming from 1.0.0 they reset to the
 
 ## Building
 
-You need the .NET 10 SDK and the path to your SPT folder (the one with `EscapeFromTarkov.exe`
-and `BepInEx/`).
+You need the .NET 10 SDK, gcc and mingw-w64 (for `SmoothieNative.dll`, the depth checks in C
+with SSE2, built by `src/SmoothieNative/build.sh`), and the path to your SPT folder (the one with
+`EscapeFromTarkov.exe` and `BepInEx/`). Without the native DLL next to `Smoothie.dll` the plugin
+falls back to its own C# depth checks.
 
 For the release zip, put the path in `.env`:
 

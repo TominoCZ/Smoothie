@@ -13,7 +13,7 @@ using UnityEngine;
 
 namespace Smoothie;
 
-[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.4")]
+[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.5")]
 // Optional: when Fika is installed it has to load first, or its types aren't there yet when
 // Smoothie looks for them and its observed bots aren't recognised. Without Fika this does nothing.
 [BepInDependency("com.fika.core", BepInDependency.DependencyFlags.SoftDependency)]
@@ -43,6 +43,8 @@ public class Plugin : BaseUnityPlugin
     internal static ConfigEntry<float> HideBeyond = null!;
     internal static ConfigEntry<bool> HideShadows = null!;
     internal static ConfigEntry<bool> SkipCoveredLamps = null!;
+    internal static ConfigEntry<bool> SkipOutOfView = null!;
+    internal static ConfigEntry<bool> EngineLoops = null!;
     internal static ConfigEntry<bool> SortByMaterial = null!;
     internal static ConfigEntry<bool> ShowDepth = null!;
 
@@ -125,9 +127,14 @@ public class Plugin : BaseUnityPlugin
             "With \"Hide objects covered by nearer ones\" on: everything nearer than this stays drawn, all around you (behind you the game doesn't draw anyway). Lower hides more close by, like the room next to yours; higher is safer if something close ever shows up late, where it's big on screen.", 83, false,
             new AcceptableValueRange<float>(1f, 10f));
         SkipCoveredLamps = Bind(other, "Skip lamps lighting only covered areas", true,
-            "With \"Hide objects covered by nearer ones\" on: a lamp whose whole lit area is hidden behind nearer things (the next room, the other side of a wall) lights nothing you can see, so it stops lighting and drawing its shadows until any of that area may come into view. Each lamp with shadows draws everything around it again for its shadow (on Factory up to ~100 draw calls each). Its light can come on a moment late when the area comes into view, like hidden objects. The sun and moon are left alone.", 81);
+            "With \"Hide objects covered by nearer ones\" on: a lamp or area light (the game's glowing panels, signs and windows) whose whole lit area is hidden behind nearer things (the next room, the other side of a wall) lights nothing you can see, so it stops lighting and drawing its shadows until any of that area may come into view. Each lamp with shadows draws everything around it again for its shadow (on Factory up to ~100 draw calls each). Its light can come on a moment late when the area comes into view, like hidden objects. The sun and moon are left alone.", 81);
         HideShadows = Bind(other, "Covered objects also stop casting shadows", true,
             "With \"Hide objects covered by nearer ones\" on: a covered object isn't drawn into shadow maps either, and the game's separate shadow-only meshes (simplified shadow casters for big structures) are checked and switched off when covered too. In buildings most of what's drawn is shadows: on Factory over a thousand draw calls a frame. Off: covered objects keep casting their shadows, which is always right but costs those draws.", 82);
+        SkipOutOfView = Bind(other, "Skip LOD work for objects you cannot see", true,
+            "Unity recomputes the level of detail of every object on the map for every frame, including everything behind you and everything the game itself isn't drawing; on big maps like Streets that's a large part of each frame (~0.7-1 ms measured). With this on, level objects out of view and beyond shadow range, and those the game has switched off, are skipped through Unity's own forced-level switch, a byte per object, so turning around costs next to nothing: everything is put back before the frame it could show in is drawn. Nothing you see changes. Only for this exact game build: on any other build of the game's engine it switches itself off.", 80);
+        EngineLoops = Bind(other, "Faster engine culling loops (code patch)", true,
+            "Rewrites two loops in Unity's own code, in memory while the game runs (nothing on disk changes), to do the same work faster: the scan over every object on the map after each frame's culling (~220k on Streets) checks 16 at a time instead of one, and the level-of-detail loop skips the groups \"Skip LOD work for objects you cannot see\" has set aside, instead of working them out just to throw the result away. Nothing you see changes. Only for this exact game build: on any other build of the game's engine it switches itself off, and off puts Unity's code back.", 78);
+        EngineLoops.SettingChanged += (_, _) => StartFlip(EngineLoops, "faster engine loops");
         SortByMaterial = Bind(other, "Draw level objects grouped by material", true,
             "Draws everything solid grouped by material instead of nearest first, so the game switches materials less often (on Streets ~270 fewer switches a frame). That moves a little work from your CPU, which Tarkov is almost always waiting on, to your graphics card (things hidden behind nearer ones get shaded too). Nothing you see changes. If the overlay shows GPU wait going up with this on, your graphics card is the limit: switch it off.", 79);
         KeepCleanupPaused = Bind(other, "Prevent memory cleanup stutters in raids", false,
@@ -147,6 +154,7 @@ public class Plugin : BaseUnityPlugin
         HideCovered.SettingChanged += (_, _) => StartFlip(HideCovered, "hiding covered objects");
         SortByMaterial.SettingChanged += (_, _) => StartFlip(SortByMaterial, "grouping by material");
         SkipCoveredLamps.SettingChanged += (_, _) => StartFlip(SkipCoveredLamps, "skipping covered lamps");
+        SkipOutOfView.SettingChanged += (_, _) => StartFlip(SkipOutOfView, "skipping LOD work");
         // Shown and checked again from scratch, so each state is measured on its own.
         HideShadows.SettingChanged += (_, _) =>
         {
@@ -194,6 +202,7 @@ public class Plugin : BaseUnityPlugin
         Safely("hidden-bot IK", Occlusion.Enable);
         Safely("bot profile budget", ProfileBudget.Enable);
         Safely("hiding covered objects", DepthCulling.Enable);
+        Safely("skipping LOD groups", LodCulling.Enable);
         // Disabled, see Occlusion.ObservedIkVisibilityPatch: Fika's code is left alone.
         // Safely("Fika hidden-bot IK", () =>
         // {
@@ -253,9 +262,26 @@ public class Plugin : BaseUnityPlugin
     // For the overlay's banner.
     internal static bool SpawnFixesPaused => !Fixing && _pausedBeforeRaid;
 
+    // A feature that switched itself off (another mod, another game build, an error) says so in
+    // the F12 menu: "(disabled: why)" after its name; null puts the plain name back. The menu
+    // picks it up the next time it's opened.
+    internal static void SetDisabled(ConfigEntryBase entry, string? why)
+    {
+        foreach (var tag in entry.Description.Tags)
+        {
+            if (tag is not ConfigurationManagerAttributes attributes) continue;
+            var name = why == null ? null : $"{entry.Definition.Key} (disabled: {why})";
+            if (attributes.DispName == name) return;
+            attributes.DispName = name;
+            if (why != null) Log.LogInfo($"\"{entry.Definition.Key}\" is disabled: {why}");
+            return;
+        }
+    }
+
     internal static void Fail(ConfigEntryBase feature, Exception ex)
     {
         if (!Broken.Add(feature)) return;
+        SetDisabled(feature, "error, see the log");
         Log.LogError($"\"{feature.Definition.Key}\" switched off for this session after an error: {ex}");
         Safely("undoing it", ApplyFixes);
     }
@@ -267,8 +293,30 @@ public class Plugin : BaseUnityPlugin
         if (!On(SimplifyDistant)) DistantDetail.RestoreAll();
         if (!On(HideCulledWeapons)) HandsCulling.RestoreAll();
         if (!On(HideCovered)) DepthCulling.ShowAll();
+        if (!On(SkipOutOfView)) LodCulling.ShowAll();
         HotPaths.ResyncMenuVideos();
         ApplySender();
+    }
+
+    private static void SyncPatch(EnginePatch patch, bool on)
+    {
+        var note = patch.Note;
+        patch.Set(on);
+        if (patch.Note == note) return;
+        Log.LogInfo($"engine patch, {patch.Note}");
+        if (on && !patch.Applied && SceneSkip.Available) SetDisabled(EngineLoops, "the game's engine code isn't as expected");
+    }
+
+    // Once, on the first frame (every plugin has loaded by then): features that can't run here.
+    private static bool _checkedSetup;
+
+    private static void CheckSetup()
+    {
+        _checkedSetup = true;
+        if (HotPaths.RuptureInstalled) SetDisabled(CorpseSettleTime, "Rupture is installed");
+        if (SceneSkip.Check()) return;
+        SetDisabled(EngineLoops, "not made for this game version");
+        SetDisabled(SkipOutOfView, "not made for this game version");
     }
 
     // A type that may not exist (Fika's, when it isn't installed): null, without the warning
@@ -371,6 +419,7 @@ public class Plugin : BaseUnityPlugin
         var draws = Diagnostics.DrawCalls >= 0 ? $"{_flipDraws / FlipFrames.Count:0} ({_flipSetPass / FlipFrames.Count:0} SetPass)" : "n/a (overlay off)";
         Log.LogInfo($"A/B {_flipName} {(On(_flipSetting) ? "ON " : "OFF")}: frame {average:0.00} ms (median {median:0.00}, 95% {worst:0.00}, {1000f / average:0} fps), draw calls {draws}" +
                     (_flipSetting == HideCovered && On(HideCovered) ? $", {DepthCulling.Saving} drawn objects hidden, check {DepthCulling.WorkerMs:0.0} ms on a worker" : "") +
+                    (_flipSetting == SkipOutOfView ? ", " + LodCulling.Summary() : "") +
                     (Overlay.PartsSummary() is { Length: > 0 } parts ? $" |{parts.Replace("  overlay, last second:", " overlay, last second (not this A/B window):")}" : ""));
     }
     private float _lastSweep;
@@ -425,6 +474,12 @@ public class Plugin : BaseUnityPlugin
         var start = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
+            if (!_checkedSetup) CheckSetup();
+            // Engine patches are written only here: the main thread's script phase, before this
+            // frame's culling and after the last one's, so Unity can't be inside a patched loop.
+            SyncPatch(EnginePatch.VisibilityScan, On(EngineLoops));
+            // Only skips groups "Skip LOD work" forced: without it, nothing to gain.
+            SyncPatch(EnginePatch.LodLoop, On(EngineLoops) && On(SkipOutOfView));
             // Leaving a raid: drop everything that refers to its players, so none of it is
             // kept alive through the menu.
             var inRaid = Diagnostics.InRaid;
@@ -433,6 +488,7 @@ public class Plugin : BaseUnityPlugin
                 HandsCulling.RestoreAll();
                 DistantDetail.RestoreAll();
                 DepthCulling.Clear();
+                LodCulling.Clear();
                 Occlusion.OnRaidStart();
                 Diagnostics.OnRaidEnd();
             }
@@ -446,8 +502,12 @@ public class Plugin : BaseUnityPlugin
                 Guard(HideCulledWeapons, HandsCulling.Sweep);
                 Guard(SimplifyDistant, DistantDetail.Sweep);
                 Guard(HotPathFixes, HotPaths.ResyncMenuVideos);
+#if DEBUG
+                JitNames.Poll();
+#endif
             }
 
+            if (inRaid) Guard(SkipOutOfView, LodCulling.Tick);
             if (inRaid && On(HideCovered))
             {
                 Guard(HideCovered, DepthCulling.Scan);
@@ -592,4 +652,6 @@ internal sealed class ConfigurationManagerAttributes
 {
     public int? Order;
     public bool? IsAdvanced;
+    // Shown instead of the key when set (Plugin.SetDisabled); the saved setting keeps its key.
+    public string? DispName;
 }
