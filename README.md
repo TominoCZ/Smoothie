@@ -31,6 +31,14 @@ On top of that, a few things the game wastes every frame are fixed: a coroutine 
 every bot every frame, dead bots' brains still being updated, the main menu's background
 video playing through your whole raid, and muzzle smoke lighting recalculated for every gun.
 
+## What's new in 1.0.7
+
+- Fixed level geometry (seen on a road segment on Streets) disappearing at some camera angles
+  while you were looking at it. "Skip LOD work for objects you cannot see" judged whether an
+  object group was in view by its level-of-detail size, which can be smaller than its actual
+  meshes; it now uses the meshes' real extent. Very large groups get their own check, so they
+  don't keep their small neighbours' work running.
+
 ## What's new in 1.0.6
 
 - One more engine loop patched: every frame Unity worked out the position, size and speed of
