@@ -31,6 +31,16 @@ On top of that, a few things the game wastes every frame are fixed: a coroutine 
 every bot every frame, dead bots' brains still being updated, the main menu's background
 video playing through your whole raid, and muzzle smoke lighting recalculated for every gun.
 
+## What's new in 1.0.6
+
+- One more engine loop patched: every frame Unity worked out the position, size and speed of
+  every door's navigation obstacle for path-following agents ("NavMesh agents") that Tarkov
+  doesn't use: bots find their path a different way, and none of the popular AI mods (SAIN,
+  Questing Bots, Looting Bots, ORBIT, BigBrain, Waypoints) add such agents. On Streets that was
+  about 5% of the main thread's time, now under 1%. Doors still block bot paths exactly as
+  before; that part is left alone. If a mod ever adds such an agent, Unity's own code runs
+  again. Part of **Faster engine culling loops (code patch)**.
+
 ## What's new in 1.0.5
 
 - Hiding covered objects costs far less on your main thread. Turning around no longer causes
@@ -54,7 +64,10 @@ engine itself. In short:
 - **What:** two loops Unity runs every frame over every object on the map (on Streets over
   200,000) are replaced in memory with versions that do the same work faster: the scan after
   culling checks 16 objects at a time instead of one, and the level-of-detail loop skips the
-  groups Smoothie has set aside. Unity's results are the same; nothing you see changes.
+  groups Smoothie has set aside. A third skips Unity's per-frame update of every door's
+  navigation obstacle for path-following agents, which the game doesn't use (bots find their way
+  differently); if any such agent exists, Unity's own code runs as before. Unity's results are the
+  same; nothing you see changes.
 - **Nothing on disk changes.** The patch lives in the running game's memory only. Close the game
   and it's gone; the game files are never touched.
 - **Only for the exact engine build it was made for.** Smoothie checks the build id of
@@ -132,7 +145,7 @@ what I'd recommend. Tick **Show advanced settings** to see the sliders and the t
 | Covered objects also stop casting shadows | on | covered objects aren't drawn into shadow maps either, nor the game's separate shadow-only meshes when covered. Off: their shadows stay, always right but costs those draws |
 | Skip lamps lighting only covered areas | on | a lamp or area light whose whole lit area is behind nearer things lights nothing you can see, so it stops lighting and drawing its shadows until any of that area may come into view. The sun and moon are left alone |
 | Skip LOD work for objects you cannot see | on | Unity stops working out the level of detail of level objects out of view and beyond shadow range, and of those the game switched off. Nothing you see changes. Current game build only |
-| Faster engine culling loops (code patch) | on | rewrites two of Unity's per-frame culling loops in memory (nothing on disk) to do the same work faster. Nothing you see changes. Current game build only; off puts Unity's code back |
+| Faster engine culling loops (code patch) | on | rewrites three of Unity's per-frame loops (two culling, one navigation) in memory (nothing on disk) to do the same work faster. Nothing you see changes. Current game build only; off puts Unity's code back |
 | Draw level objects grouped by material | on | fewer material switches for the CPU, a little more work for the graphics card; if the overlay shows GPU wait going up, switch it off |
 | Prevent memory cleanup stutters in raids | off | opening your inventory turns memory cleanup back on for the rest of the raid, which stutters every minute or two; this lets it finish and then pauses it again. Only on PCs with enough RAM for the game to pause it in the first place (25 GB by default) |
 | Keep server connection open (faster menus) | on | one open connection to the SPT server instead of a new one per request |
