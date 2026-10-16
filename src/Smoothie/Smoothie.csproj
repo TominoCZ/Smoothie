@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>1.0.7</Version>
+    <Version>1.0.8</Version>
     <AssemblyName>Smoothie</AssemblyName>
     <RootNamespace>Smoothie</RootNamespace>
   </PropertyGroup>
@@ -15,6 +15,7 @@
     <Reference Include="UnityEngine.AnimationModule"><HintPath>$(SptManaged)/UnityEngine.AnimationModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="AnimationSystem.Types"><HintPath>$(SptManaged)/AnimationSystem.Types.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.IMGUIModule"><HintPath>$(SptManaged)/UnityEngine.IMGUIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.InputLegacyModule"><HintPath>$(SptManaged)/UnityEngine.InputLegacyModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(SptManaged)/UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.AudioModule"><HintPath>$(SptManaged)/UnityEngine.AudioModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.ParticleSystemModule"><HintPath>$(SptManaged)/UnityEngine.ParticleSystemModule.dll</HintPath><Private>false</Private></Reference>
@@ -32,7 +33,7 @@
   <PropertyGroup>
     <NativeDir>$(MSBuildThisFileDirectory)../SmoothieNative</NativeDir>
   </PropertyGroup>
-  <Target Name="BuildNative" BeforeTargets="BeforeBuild" Inputs="$(NativeDir)/pyramid.c;$(NativeDir)/build.sh" Outputs="$(NativeDir)/bin/SmoothieNative.dll">
+  <Target Name="BuildNative" BeforeTargets="BeforeBuild" Inputs="$(NativeDir)/pyramid.c;$(NativeDir)/animpause.c;$(NativeDir)/build.sh" Outputs="$(NativeDir)/bin/SmoothieNative.dll">
     <Exec Command="bash &quot;$(NativeDir)/build.sh&quot;" />
   </Target>
   <ItemGroup>

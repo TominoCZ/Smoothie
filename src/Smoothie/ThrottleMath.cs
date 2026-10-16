@@ -59,8 +59,10 @@ public static class ThrottleMath
 // When Occlusion casts its sight lines for one bot, and what it concludes in between.
 public sealed class Sight
 {
-    // Rays at most this often per bot, stretched by the bot's jitter so bots drift apart.
-    public const float CheckInterval = 0.1f;
+    // Rays at most this often per bot, stretched by the bot's jitter so bots drift apart. A bot
+    // stepping out of cover runs at full rate within about this long (was 0.1 s: a visible
+    // moment of low-rate animation; a check is ~10 lines for a blocked bot, a few µs each).
+    public const float CheckInterval = 1f / 30f;
 
     // Once a line gets through, the bot counts as seen this long without casting again,
     // unless it leaves the view: back in view, it is checked again right away.
@@ -77,6 +79,9 @@ public sealed class Sight
     // When the bot was first blocked; -1 while it isn't.
     private float _blockedSince = -1f;
 
+    // When the bot left the view; -1 while in view.
+    private float _outSince = -1f;
+
     public Sight(Func<bool> anyLineClear, float jitter)
     {
         _anyLineClear = anyLineClear;
@@ -92,14 +97,22 @@ public sealed class Sight
         {
             blocked = true;
             _seenUntil = 0f;
+            if (_outSince < 0f) _outSince = now;
         }
-        else if (now < _seenUntil) blocked = false;
-        else if (now < _nextCheck) blocked = _blockedSince >= 0f;
         else
         {
-            _nextCheck = now + CheckInterval * _jitter;
-            blocked = !_anyLineClear();
-            if (!blocked) _seenUntil = now + SeenHold;
+            // Back in view after a while: checked on that frame, not at the next scheduled check
+            // (a bot flickering at the screen's edge with your sway keeps to the schedule).
+            if (_outSince >= 0f && now - _outSince >= CheckInterval) _nextCheck = 0f;
+            _outSince = -1f;
+            if (now < _seenUntil) blocked = false;
+            else if (now < _nextCheck) blocked = _blockedSince >= 0f;
+            else
+            {
+                _nextCheck = now + CheckInterval * _jitter;
+                blocked = !_anyLineClear();
+                if (!blocked) _seenUntil = now + SeenHold;
+            }
         }
 
         if (!blocked) _blockedSince = -1f;

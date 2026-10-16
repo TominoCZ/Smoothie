@@ -45,8 +45,10 @@ internal static unsafe class SceneSkip
     // UnityPlayer.dll in memory, once the build matched (EnginePatch).
     internal static byte* Module;
     // UnityEngine.Object.m_CachedPtr: the native object, zero once destroyed.
-    private static AccessTools.FieldRef<UnityEngine.Object, IntPtr>? _cachedPtr;
+    private static readonly AccessTools.FieldRef<UnityEngine.Object, IntPtr> _cachedPtr =
+        AccessTools.FieldRefAccess<UnityEngine.Object, IntPtr>("m_CachedPtr");
     internal static bool Available { get; private set; }
+    internal static IntPtr NativeOf(UnityEngine.Object o) => _cachedPtr(o);
     internal static string Note = "not checked";
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
@@ -66,10 +68,9 @@ internal static unsafe class SceneSkip
             }
 
             var module = GetModuleHandleW("UnityPlayer.dll");
-            _cachedPtr = AccessTools.FieldRefAccess<UnityEngine.Object, IntPtr>("m_CachedPtr");
             if (module == IntPtr.Zero)
             {
-                Note = "UnityPlayer.dll or m_CachedPtr not found: off";
+                Note = "UnityPlayer.dll not found: off";
                 return false;
             }
 
@@ -102,7 +103,7 @@ internal static unsafe class SceneSkip
     {
         native = IntPtr.Zero;
         if (!Available || group is null) return 0;
-        var n = (byte*)_cachedPtr!(group);
+        var n = (byte*)_cachedPtr(group);
         if (n == null) return 0;
         var index = *(uint*)(n + GroupSlot);
         var slot = Slot(index, n);
@@ -128,12 +129,36 @@ internal static unsafe class SceneSkip
         if (slot == null)
         {
             if (group is null) return;
-            var n = (byte*)_cachedPtr!(group);
+            var n = (byte*)_cachedPtr(group);
             if (n == null) return;
-            slot = Slot(*(uint*)(n + GroupSlot), n);
+            index = *(uint*)(n + GroupSlot);
+            slot = Slot(index, n);
         }
 
-        if (slot != null && slot[SlotForced] == NothingMask) slot[SlotForced] = 0;
+        if (slot == null || slot[SlotForced] != NothingMask) return;
+        slot[SlotForced] = 0;
+        ClearResults(index);
+    }
+
+    // Every camera's LOD results, kept from frame to frame on the manager (one entry per camera,
+    // its masks a byte per slot; RemoveLODGroup moves them along with the slots). The LOD loop
+    // patch passes over a group whose last mask is ours without reading its slot
+    // (EnginePatch.LodLoop), so un-forcing one clears that mask everywhere: the next pass works
+    // the group out again, before the frame it could show in culls.
+    private const int LodResults = 0x38, LodResultCount = 0x48, ResultMasks = 0x10, ResultMaskCount = 0x20;
+
+    private static void ClearResults(uint index)
+    {
+        var manager = *(byte**)_lodManagerPointer;
+        var entries = *(byte***)(manager + LodResults);
+        var count = *(ulong*)(manager + LodResultCount);
+        for (ulong e = 0; e < count; e++)
+        {
+            var entry = entries[e];
+            if (entry == null || index >= *(ulong*)(entry + ResultMaskCount)) continue;
+            var masks = *(byte**)(entry + ResultMasks);
+            if (masks[index] == NothingMask) masks[index] = 0;
+        }
     }
 
     // renderer.isVisible and forceRenderingOff without a call into Unity per renderer: the same
@@ -143,19 +168,19 @@ internal static unsafe class SceneSkip
     // destroyed renderer (m_CachedPtr zero) reads as not visible and not switched off.
     internal static bool IsVisible(Renderer renderer)
     {
-        var native = (byte*)_cachedPtr!(renderer);
+        var native = (byte*)_cachedPtr(renderer);
         return native != null && (*(int*)(native + RendererFlags) & RendererVisible) != 0 && *(int*)(native + RendererHandle) != -1;
     }
 
     internal static bool ForceRenderingOff(Renderer renderer)
     {
-        var native = (byte*)_cachedPtr!(renderer);
+        var native = (byte*)_cachedPtr(renderer);
         return native != null && native[RendererForceOff] != 0;
     }
 
     internal static void SetForceRenderingOff(Renderer renderer, bool off)
     {
-        var native = (byte*)_cachedPtr!(renderer);
+        var native = (byte*)_cachedPtr(renderer);
         if (native != null) native[RendererForceOff] = off ? (byte)1 : (byte)0;
     }
 

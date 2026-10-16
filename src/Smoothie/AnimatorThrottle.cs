@@ -61,6 +61,12 @@ internal static class AnimatorThrottle
     // Lowest animation rate for a bot in a fight that you can't see.
     private const float FightingRate = 30f;
 
+    // How long after last seeing or shooting at its enemy a bot still counts as fighting (s).
+    private const float FightMemory = 10f;
+
+    // Fewer frames than this between a bot's updates: not throttled at all.
+    private const float SwitchWorthFrames = 2.5f;
+
     // Sanity cap on a learned footstep range.
     private const float MaxAudibleRange = 200f;
 
@@ -84,7 +90,7 @@ internal static class AnimatorThrottle
     private static float _audibleRange;
 
     // Last full frame's numbers, for the stats overlay.
-    internal static int Throttled;
+    internal static int Throttled, ThrottledFighting;
 
     // Why the others weren't, last full frame: in view within IK range, in a fight, or
     // close/audible enough that their rate is about the frame rate anyway.
@@ -98,7 +104,9 @@ internal static class AnimatorThrottle
     private static int _lastStepStart = -10;
     internal static int Steps;
     internal static double StepMs;
-    private static int _throttled;
+    private static int _throttled, _throttledFighting;
+    // The last PickInterval's bot was in a fight (off screen it's throttled, at FightingRate or faster).
+    private static bool _pickedFighting;
     private static int _steps;
     private static long _stepTicks;
 
@@ -112,17 +120,27 @@ internal static class AnimatorThrottle
     // Frame each player was last handled. Normally once per frame anyway; this keeps it
     // once if a Fika update ever starts calling Player.LateUpdate from its own override
     // (both patches would then run).
-    private static readonly ConditionalWeakTable<Player, int[]> HandledFrame = new();
+    // Also whether it's a bot: that never changes for a player, and on a Fika client it takes
+    // a walk through its profile (IsBot).
+    private sealed class Handled
+    {
+        public int Frame = -1;
+        public sbyte Bot = -1;
+    }
+
+    private static readonly ConditionalWeakTable<Player, Handled> HandledFrame = new();
+    private static readonly ConditionalWeakTable<Player, Handled>.CreateValueCallback NewHandled = _ => new Handled();
 
     // For the snapshot: did the animation step see this player in the last frame or this one.
     internal static bool HandledRecently(Player player) =>
-        HandledFrame.TryGetValue(player, out var handled) && handled[0] >= Time.frameCount - 1;
+        HandledFrame.TryGetValue(player, out var handled) && handled.Frame >= Time.frameCount - 1;
 
     internal static void BeforeLateUpdateSafe(Player player)
     {
-        var handled = HandledFrame.GetValue(player, _ => new[] { -1 });
-        if (handled[0] == Time.frameCount) return;
-        handled[0] = Time.frameCount;
+        var handled = HandledFrame.GetValue(player, NewHandled);
+        if (handled.Frame == Time.frameCount) return;
+        handled.Frame = Time.frameCount;
+        var bot = IsBot(player, handled);
 
         try
         {
@@ -135,7 +153,7 @@ internal static class AnimatorThrottle
 
         try
         {
-            if (!player.IsYourPlayer && IsBot(player)) DistantDetail.Update(player);
+            if (!player.IsYourPlayer && bot) DistantDetail.Update(player);
         }
         catch (Exception ex)
         {
@@ -144,7 +162,7 @@ internal static class AnimatorThrottle
 
         try
         {
-            BeforeLateUpdate(player);
+            BeforeLateUpdate(player, bot);
         }
         catch (Exception ex)
         {
@@ -152,7 +170,7 @@ internal static class AnimatorThrottle
         }
     }
 
-    private static void BeforeLateUpdate(Player player)
+    private static void BeforeLateUpdate(Player player, bool bot)
     {
         if (player.IsYourPlayer) return;
 
@@ -183,11 +201,14 @@ internal static class AnimatorThrottle
         // Switched off this frame, so Unity didn't animate it: this frame's time is owed too.
         if (state != null && !stepped) state.Pending += dt;
 
-        var throttling = Plugin.On(Plugin.ThrottleAnimators) && _hasCamera && IsBot(player);
+        var throttling = Plugin.On(Plugin.ThrottleAnimators) && _hasCamera && bot;
         var reason = FullRate.Other;
         var interval = throttling ? PickInterval(player, out reason) : 0f;
 
-        if (interval <= dt * 1.5f)
+        // Updated about every other frame anyway: switching the animator off and back on costs
+        // more than the frame skipped saves (switching on walks the bot's whole animation graph;
+        // Streets, 15 bots: ~3.7% of the main thread for all re-enables), so it stays on.
+        if (interval <= dt * SwitchWorthFrames)
         {
             if (throttling)
             {
@@ -201,6 +222,7 @@ internal static class AnimatorThrottle
         }
 
         _throttled++;
+        if (_pickedFighting) _throttledFighting++;
 
         if (state == null)
         {
@@ -235,14 +257,14 @@ internal static class AnimatorThrottle
         {
             state.BodySpeed = state.Body!.speed;
             state.Body.speed = state.BodySpeed * scale;
-            state.Body.enabled = true;
+            Run(state.Body);
         }
 
         if (IsAlive(state.Arms))
         {
             state.ArmsSpeed = state.Arms!.speed;
             state.Arms.speed = state.ArmsSpeed * scale;
-            state.Arms.enabled = true;
+            Run(state.Arms);
         }
 
         state.StepScale = scale;
@@ -272,8 +294,8 @@ internal static class AnimatorThrottle
             return;
         }
 
-        if (IsAlive(state.Body)) state.Body!.enabled = false;
-        if (IsAlive(state.Arms)) state.Arms!.enabled = false;
+        if (IsAlive(state.Body)) Hold(state.Body!);
+        if (IsAlive(state.Arms)) Hold(state.Arms!);
     }
 
     // A bot switched off mid-step gets no LateUpdate, so nothing would end the step: its
@@ -365,6 +387,7 @@ internal static class AnimatorThrottle
     private static float PickInterval(Player player, out FullRate reason)
     {
         reason = FullRate.Other;
+        _pickedFighting = false;
         var position = player.Position;
         var distance = Vector3.Distance(position, _cameraPosition);
 
@@ -395,8 +418,13 @@ internal static class AnimatorThrottle
         // whole stretch an update covers (AnimationEventsContainer), so a slower animator
         // fires them late, never skips them: one you can see animates every frame, one you
         // can't at least FightingRate, which keeps them at most 33 ms late.
+        // In a fight while it's under fire or has seen or shot at its enemy lately: a bot keeps its
+        // enemy in memory long after (searching, with SAIN for minutes), and stayed at full rate.
         var memory = player.AIData?.BotOwner?.Memory;
-        var fighting = memory != null && (memory.HaveEnemy || memory.IsUnderFire);
+        var enemy = memory?.GoalEnemy;
+        var fighting = memory != null && (memory.IsUnderFire || enemy != null &&
+            (enemy.IsVisible || Time.time - Mathf.Max(enemy.PersonalLastSeenTime, enemy.PersonalLastShootTime) < FightMemory));
+        _pickedFighting = fighting;
         if (fighting && onScreen)
         {
             reason = FullRate.Fighting;
@@ -432,29 +460,48 @@ internal static class AnimatorThrottle
     // In the main camera's view, or the scope's. Only valid after NextFrame.
     internal static bool InView(Vector3 position, out bool inOptic)
     {
-        var bounds = new Bounds(position + Vector3.up, BotBox);
-        inOptic = _hasOptic && GeometryUtility.TestPlanesAABB(OpticPlanes, bounds);
-        return inOptic || GeometryUtility.TestPlanesAABB(MainPlanes, bounds);
+        var center = position + Vector3.up;
+        var extents = BotBox * 0.5f;
+        inOptic = _hasOptic && InPlanes(OpticPlanes, center, extents);
+        return inOptic || InPlanes(MainPlanes, center, extents);
     }
 
     internal static bool InView(Bounds bounds) =>
-        _hasOptic && GeometryUtility.TestPlanesAABB(OpticPlanes, bounds) || GeometryUtility.TestPlanesAABB(MainPlanes, bounds);
+        _hasOptic && InPlanes(OpticPlanes, bounds.center, bounds.extents) || InPlanes(MainPlanes, bounds.center, bounds.extents);
+
+    // GeometryUtility.TestPlanesAABB without the call into the engine (up to three a bot a
+    // frame): the box is outside when wholly behind any plane (normals point inwards).
+    private static bool InPlanes(Plane[] planes, Vector3 c, Vector3 e)
+    {
+        for (var p = 0; p < planes.Length; p++)
+        {
+            var n = planes[p].normal;
+            if (n.x * c.x + n.y * c.y + n.z * c.z + planes[p].distance + Math.Abs(n.x) * e.x + Math.Abs(n.y) * e.y + Math.Abs(n.z) * e.z < 0f) return false;
+        }
+
+        return true;
+    }
 
     internal static float ZoomAt(Vector3 position) => InView(position, out var inOptic) && inOptic ? _opticZoom : _mainZoom;
 
-    internal static bool IsBot(Player player)
+    internal static bool IsBot(Player player) => player.IsAI || IsBot(player, HandledFrame.GetValue(player, NewHandled));
+
+    private static bool IsBot(Player player, Handled handled)
     {
         // Local bots, when this game is the host or offline.
         if (player.IsAI) return true;
+        if (handled.Bot >= 0) return handled.Bot == 1;
 
         // Fika client: bots arrive as ObservedPlayer without a BotOwner. Same test Fika
         // uses (FikaGlobals.IsPlayerProfile): a human profile has a pet id, a registration
-        // date, or a main-profile nickname (player scavs).
+        // date, or a main-profile nickname (player scavs). Remembered once the profile is there.
         var profile = player.Profile;
-        return profile != null
-               && string.IsNullOrEmpty(profile.PetId?.ToString())
-               && profile.Info.RegistrationDate <= 0
-               && string.IsNullOrEmpty(profile.Info.MainProfileNickname);
+        if (profile == null) return false;
+        var bot = string.IsNullOrEmpty(profile.PetId?.ToString())
+                  && profile.Info.RegistrationDate <= 0
+                  && string.IsNullOrEmpty(profile.Info.MainProfileNickname);
+        handled.Bot = bot ? (sbyte)1 : (sbyte)0;
+        return bot;
     }
 
     private static void Take(ref IAnimator? owned, IAnimator? current)
@@ -472,7 +519,7 @@ internal static class AnimatorThrottle
         if (owned == null && !current!.enabled) return;
 
         current!.keepAnimatorControllerStateOnDisable = true;
-        if (current.enabled) current.enabled = false;
+        Hold(current);
         owned = current;
     }
 
@@ -495,8 +542,8 @@ internal static class AnimatorThrottle
 
         try
         {
-            if (IsAlive(state.Body)) state.Body!.Update(dt);
-            if (IsAlive(state.Arms)) state.Arms!.Update(dt);
+            if (IsAlive(state.Body)) UpdateHeld(state.Body!, dt);
+            if (IsAlive(state.Arms)) UpdateHeld(state.Arms!, dt);
 
             if (state.DeferArms) UpdateDeferredArms(player, dt);
         }
@@ -530,7 +577,37 @@ internal static class AnimatorThrottle
 
     private static void GiveBack(IAnimator? animator)
     {
-        if (IsAlive(animator)) animator!.enabled = true;
+        if (IsAlive(animator)) Run(animator!);
+    }
+
+    // Held back from Unity's update: paused inside Unity while its hooks are in (AnimatorPause:
+    // the animator stays on, so letting it run again doesn't walk its whole animation graph),
+    // otherwise switched off.
+    private static void Hold(IAnimator animator)
+    {
+        if (AnimatorPause.Hold(((UnityAnimatorWrapper)animator).Animator))
+        {
+            // Switched off before the hooks were in.
+            if (!animator.enabled) animator.enabled = true;
+        }
+        else if (animator.enabled)
+        {
+            animator.enabled = false;
+        }
+    }
+
+    private static void Run(IAnimator animator)
+    {
+        if (!AnimatorPause.Release(((UnityAnimatorWrapper)animator).Animator)) animator.enabled = true;
+    }
+
+    // Stepped by hand: a paused animator's update would be skipped by the hooks too.
+    private static void UpdateHeld(IAnimator animator, float dt)
+    {
+        var unity = ((UnityAnimatorWrapper)animator).Animator;
+        var paused = AnimatorPause.Release(unity);
+        animator.Update(dt);
+        if (paused) AnimatorPause.Hold(unity);
     }
 
     // Only plain Unity animators. The fast-animator and spirit paths are driven differently.
@@ -543,13 +620,14 @@ internal static class AnimatorThrottle
         _frame = Time.frameCount;
 
         Throttled = _throttled;
+        ThrottledFighting = _throttledFighting;
         FullInView = _fullInView;
         FullFighting = _fullFighting;
         FullOther = _fullOther;
         _fullInView = _fullFighting = _fullOther = 0;
         Steps = _steps;
         StepMs = _stepTicks * Diagnostics.TickMs;
-        _throttled = 0;
+        _throttled = _throttledFighting = 0;
         _steps = 0;
         _stepTicks = 0;
 
@@ -578,13 +656,27 @@ internal static class AnimatorThrottle
         _mainZoom = ThrottleMath.Zoom(referenceFov, camera.fieldOfView);
 
         // A magnified scope renders through its own camera onto the lens.
+        // Its view as it was at its last render (OpticPreCull): the game moves it into place only
+        // for that, so read now it can be anywhere.
         var optic = manager.OpticCameraManager;
-        var opticCamera = optic?.Camera;
-        _hasOptic = optic != null && optic.IsAnyOpticCameraRendering && opticCamera != null && opticCamera.isActiveAndEnabled;
-        if (_hasOptic && opticCamera != null)
+        _hasOptic = optic != null && optic.IsAnyOpticCameraRendering && _opticSeen >= Time.frameCount - 1;
+        if (_hasOptic)
         {
-            GeometryUtility.CalculateFrustumPlanes(opticCamera, OpticPlanes);
-            _opticZoom = ThrottleMath.Zoom(referenceFov, opticCamera.fieldOfView);
+            GeometryUtility.CalculateFrustumPlanes(_opticCull, OpticPlanes);
+            _opticZoom = ThrottleMath.Zoom(referenceFov, _opticFov);
         }
+    }
+
+    private static Matrix4x4 _opticCull;
+    private static float _opticFov;
+    private static int _opticSeen = -10;
+
+    // Every camera, right before it culls: keeps the scope camera's view.
+    internal static void OpticPreCull(Camera camera)
+    {
+        if (!ReferenceEquals(camera, CameraManager.Instance?.OpticCameraManager?.Camera)) return;
+        _opticCull = camera.cullingMatrix;
+        _opticFov = camera.fieldOfView;
+        _opticSeen = Time.frameCount;
     }
 }

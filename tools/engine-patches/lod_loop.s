@@ -8,25 +8,88 @@
 # Per group: a forced group (slot+0x60 non-zero) gets exactly what CalculateLODMask gives it
 # (mask = that byte, fade = 0) without the distance, square root and call; every other group
 # goes Unity's own way, instruction for instruction. Back to Unity's code after the loop.
+# The mask and fade outputs are the camera's own arrays, kept from frame to frame on the manager
+# (CalculateLODDataArray 0x4FCCD0: one entry per camera at [manager+0x38], count +0x48; masks
+# at entry+0x10, fades at entry+0x30), and RemoveLODGroup (0x4FD550) moves their entries along
+# with the slots. So a group whose mask from last time is 0x80 (forced to level 7, which only
+# Smoothie writes: no group here has 8 levels) was forced to nothing then and still holds mask
+# 0x80 / fade 0: it's passed over without reading its slot (104 bytes, the loop's whole cost
+# across ~135k groups). Smoothie clears that mask in every camera's array when it un-forces a
+# group (SceneSkip.Unforce), so the next pass works it out. Anything else changing a forced
+# byte is still caught: each pass reads the slots of one block of 8192 groups anyway, the next
+# block every pass ((index >> 13) & 15 == a counter the routine advances every pass, in a
+# writable cell: cell_slot), in order. What a pass costs is mostly going round the loop ~135k
+# times, so the masks are compared 16 at a time (SSE2, as the visibility scan): 16 of ours in a
+# row outside the re-read block are passed over in one step, and up to the first that isn't.
 # Patch site (EnginePatch.LodLoop): the 19 bytes at RVA 0x4FC7C0
 #   4C 8B 6E 08                  mov r13,[rsi+0x8]
 #   4A 8D 04 03                  lea rax,[rbx+r8]
 #   4C 03 EF                     add r13,rdi
 #   48 89 84 24 B0 00 00 00      mov [rsp+0xb0],rax
 # become jmp [rip+0] + this routine's address + 5 nops. Address slots, filled at runtime:
-# back_slot (0xD8) = RVA 0x4FC872 (after the loop), mask_slot (0xE0) = CalculateLODMask
-# (0x4FC400), sqrt_slot (0xE8) = the square-root helper Unity calls for a negative value (0x18343FC).
+# back_slot = RVA 0x4FC872 (after the loop), mask_slot = CalculateLODMask (0x4FC400), sqrt_slot =
+# the square-root helper Unity calls for a negative value (0x18343FC), cell_slot = a writable
+# 4-byte counter (EnginePatch allocates it).
 # Only the perspective loop is replaced; the orthographic one (0x4FC730) is left as it is.
 # Unity 2022.3.43f1, UnityPlayer_Win64_player_mono_x64.pdb id BD9605D7A8BC4F21AF766D4707334ADC1.
 # Assemble with assemble.sh; how this was found and how to redo it: EnginePatch.cs header.
 cave:
+    mov rax, [rip+cell_slot]
+    inc dword ptr [rax]
 loop:
     cmp rbx, r14
     jae done
-    mov r13, [rsi+8]
-    add r13, rdi
     mov r8, [rsp+0xa8]
     lea rax, [rbx+r8]
+    lea rdx, [rbx+16]
+    cmp rdx, r14
+    ja single
+    mov rcx, [rip+cell_slot]
+    mov ecx, [rcx]
+    mov edx, ebx
+    shr edx, 13
+    xor edx, ecx
+    test dl, 15
+    jz single
+    lea edx, [rbx+15]
+    shr edx, 13
+    xor edx, ecx
+    test dl, 15
+    jz single
+    movdqu xmm0, [rax]
+    mov edx, 0x80808080
+    movd xmm1, edx
+    pshufd xmm1, xmm1, 0
+    pcmpeqb xmm0, xmm1
+    pmovmskb edx, xmm0
+    not edx
+    and edx, 0xffff
+    jz skip16
+    bsf ecx, edx
+    test ecx, ecx
+    jz single
+    add rbx, rcx
+    lea rbp, [rbp+rcx*4]
+    imul rdx, rcx, 0x68
+    add rdi, rdx
+    jmp loop
+skip16:
+    add rbx, 16
+    add rbp, 64
+    add rdi, 16*0x68
+    jmp loop
+single:
+    cmp byte ptr [rax], 0x80
+    jne full
+    mov ecx, ebx
+    shr ecx, 13
+    mov rdx, [rip+cell_slot]
+    xor ecx, [rdx]
+    test cl, 15
+    jnz next
+full:
+    mov r13, [rsi+8]
+    add r13, rdi
     movzx ecx, byte ptr [r13+0x60]
     test cl, cl
     jz slow
@@ -79,4 +142,6 @@ back_slot:
 mask_slot:
     .quad 0
 sqrt_slot:
+    .quad 0
+cell_slot:
     .quad 0

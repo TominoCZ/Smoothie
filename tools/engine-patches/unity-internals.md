@@ -57,7 +57,17 @@ putting it back costs ~0.6-1.7 µs per object (a turn brought tens of thousands 
 | `LODGroup+0x70` | its slot index, 0 when not registered | `AddLODGroup` |
 
 `CalculateLODMask` (`0x4FC400`) returns at once for a forced group (mask = the forced byte, fade
-0). Level 7 exists in no group here, so forcing it draws nothing. Slots move when groups are
+0). Level 7 exists in no group here, so forcing it draws nothing.
+
+Each camera's LOD results are kept from frame to frame on the manager: `[manager+0x38]` an array
+of entry pointers, count `+0x48`; an entry is the camera's id at `+0`, last time at `+0x8`, the
+mask bytes (a `core::vector<uint8>`) at `+0x10` (size `+0x20`) and the fades (`vector<float>`)
+at `+0x30` (size `+0x40`), one per slot (`CalculateLODDataArray`, `0x4FCCD0`, finds or makes the
+camera's entry and the loop writes into it). `AddLODGroup` appends 0 to every entry;
+`RemoveLODGroup` (`0x4FD550`) moves the last slot into the removed one and does the same in
+every entry. The LOD loop patch reads a group's last mask before its slot: `0x80` means
+Smoothie's forced level, so the slot is skipped (`SceneSkip.Unforce` clears that byte in every
+entry; every 16th group is still read each pass). Checked natively by `lod_loop_check.sh`. Slots move when groups are
 removed, so a slot is always found again through `LODGroup+0x70` and checked by its back-pointer.
 
 ## The two patched loops (EnginePatch)
@@ -74,6 +84,15 @@ square root) and calls `CalculateLODMask`, even for forced groups, which ignore 
 replacement hands a forced group exactly what `CalculateLODMask` would (its forced byte, fade 0)
 and runs every other group through Unity's own instructions. The orthographic loop (`0x4FC730`)
 is left alone.
+
+**Light count**, at the start of CullScene's light culling (the function at `0x3FC750`, named
+after `~BRGCullResults` in the symbols), patch site RVA `0x3FC771`, back at `0x3FC78C`.
+`LightManager*` is the global at RVA `0x1CF9450`; the manager is the head of an intrusive linked
+list of every enabled `Light` (links at `Light+0x40`, no size field), and at `+0x10` a hash set
+of the same lights minus fully baked ones (lightmap mode 2), live count at `+0x1c`. Unity counts
+the list one light at a time on every culling pass, only to size the pass's light buffers, which
+only `FindActiveLights` fills, from the set. The replacement reads the set's count and walks only
+when it is 0. Checked natively by `light_count_check.sh`.
 
 Patch sites, original bytes and address slots are listed at the top of each `.s` file.
 

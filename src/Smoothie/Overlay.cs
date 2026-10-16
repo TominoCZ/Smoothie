@@ -41,7 +41,11 @@ internal static class Overlay
         public readonly float[] History = new float[Samples];
         public readonly Texture2D Graph = new(Samples, GraphHeight, TextureFormat.RGBA32, false) { filterMode = FilterMode.Point };
         public double Sum;
-        public string Shown = "", ExtraShown = "", Share = "", Tag = "";
+        public string Shown = "", Share = "", Tag = "";
+
+        // The note as drawn: cut with "…" to fit its column (FitNote), redone when the note changes.
+        public string ExtraPlain = "";
+        public string? ExtraFitted;
 
         public Row(string name, Func<float> value, Func<string> extra, bool count, params ConfigEntry<bool>[] features)
         {
@@ -58,7 +62,7 @@ internal static class Overlay
         new("Frame", () => _frameMs, () => $"{1000f / Math.Max(0.1f, Average(0)):0} fps", false),
         new("Worst frame", () => _frameMs, () => "spikes here are stutters", false) { Max = true },
         new("Bot animation", () => Stage(_animBegin) + Stage(_animEnd) + (Diagnostics.InRaid ? (float)AnimatorThrottle.StepMs : 0f),
-            () => $"{AnimatorThrottle.Throttled} reduced; full: {AnimatorThrottle.FullInView} seen, {AnimatorThrottle.FullFighting} fight, {AnimatorThrottle.FullOther} near", false, Plugin.ThrottleAnimators)
+            () => $"{AnimatorThrottle.Throttled} reduced ({AnimatorThrottle.ThrottledFighting} fighting unseen); full rate: {AnimatorThrottle.FullInView} seen, {AnimatorThrottle.FullFighting} fighting, {AnimatorThrottle.FullOther} near", false, Plugin.ThrottleAnimators)
             { Color = new Color(0.25f, 0.5f, 0.95f), Short = "Anim" },
         new("Bot IK", () => (float)(_ikFrameTicks * TickMs),
             () => $"{Occlusion.HiddenCount} hidden bots skip it", false)
@@ -109,7 +113,7 @@ internal static class Overlay
         new("LOD groups skipped", () => Plugin.On(Plugin.SkipOutOfView) ? LodCulling.Forced : 0,
             () => SceneSkip.Available ? $"of {LodCulling.Groups} static; {LodCulling.Ms:0.00} ms a frame" : SceneSkip.Note, true, Plugin.SkipOutOfView),
         new("Smoothie itself", () => (float)(_ownFrameTicks * TickMs) + (Diagnostics.InRaid ? (float)(AnimatorThrottle.StepMs + Occlusion.Ms) : 0f),
-            () => $"incl. this overlay {_overlayAverageMs:0.00}, hiding {DepthCulling.Ms:0.00} (worst {DepthCulling.PeakMs:0.00}: {DepthCulling.PeakNote}) ms; {Occlusion.Rays} bot rays", false),
+            () => $"overlay {_overlayAverageMs:0.00} ms, hiding {DepthCulling.Ms:0.00} ms (worst {DepthCulling.PeakMs:0.00}), {Occlusion.Rays} bot rays", false),
     };
 
     // Which samples a setting changed in; the newest sample is at _head - 1.
@@ -169,7 +173,12 @@ internal static class Overlay
     private static long _aiTicks;
     private static long _aiFrameTicks;
     private static long _physicsFrameTicks;
+#if DEBUG
+    private static float _physicsSpikeAt;
+#endif
     private static long _syncTicks, _syncFrameTicks;
+    // Last frame's physics sync (for the A/B windows); NaN while the overlay is off.
+    internal static float SyncMs => _on ? (float)(_syncFrameTicks * TickMs) : float.NaN;
     private static long _profileTicks, _profileFrameTicks, _profileStart;
     private static int _profileDepth;
     private static System.Threading.Thread? _mainThread;
@@ -332,6 +341,17 @@ internal static class Overlay
             foreach (var ticks in Diagnostics.StageFrameTicks) stages += ticks;
             _outsideSum += Diagnostics.EngineTiming ? Math.Max(0.0, frameMs - stages * TickMs) : 0.0;
             _simSum += (_physicsFrameTicks - _syncFrameTicks) * TickMs;
+#if DEBUG
+            // Debug: single frames where physics took over 1 ms (a corpse falling, a grenade),
+            // which a per-second average or a sampling profiler flattens.
+            var physicsMs = _physicsFrameTicks * TickMs;
+            if (physicsMs > 1.0 && Time.unscaledTime - _physicsSpikeAt > 0.25f && !Plugin.Benchmarking)
+            {
+                _physicsSpikeAt = Time.unscaledTime;
+                Plugin.Log.LogInfo($"{DateTime.Now:HH:mm:ss.fff} physics {physicsMs:0.00} ms in one frame: step {(_physicsFrameTicks - _syncFrameTicks) * TickMs:0.00}, " +
+                                   $"sync {_syncFrameTicks * TickMs:0.00}; running for: {(Diagnostics.PhysicsKeepers is { Length: > 0 } k ? k : "nothing (sync only)")}");
+            }
+#endif
             _aiFrameTicks = _aiTicks;
             _aiTicks = 0;
             _profileFrameTicks = _profileTicks;
@@ -405,7 +425,13 @@ internal static class Overlay
             }
 
             row.Tag = row.Features.Length == 0 ? "" : on == row.Features.Length ? "<color=#7c7>fix on</color>" : on == 0 ? "<color=#e77>fix off</color>" : $"<color=#ec7>fix {on}/{row.Features.Length}</color>";
-            row.ExtraShown = $"<color=#bbb>{row.Extra()}</color>";
+            var extra = row.Extra();
+            if (extra != row.ExtraPlain)
+            {
+                row.ExtraPlain = extra;
+                row.ExtraFitted = null;
+            }
+
             Redraw(row);
         }
 
@@ -421,6 +447,16 @@ internal static class Overlay
         _barTotalMs = Math.Max(0.001f, total);
         _frameLabel = $"{frame:0.0} ms   {1000f / Math.Max(0.1f, frame):0} fps";
         _worstLabel = $"<color=#bbb>worst frame {Peak(1):0.0} ms</color>";
+    }
+
+    // This frame's parts of the frame bar (Anim, Scripts, ...), for the paired A/B; empty while off.
+    internal static string[] PartNames => SegmentRows.Select(i => Rows[i].Short).ToArray();
+
+    internal static bool PartsThisFrame(float[] into)
+    {
+        if (!_on) return false;
+        for (var i = 0; i < SegmentRows.Length && i < into.Length; i++) into[i] = Rows[SegmentRows[i]].Last;
+        return true;
     }
 
     // For the snapshot in the log: the frame's parts as the overlay shows them, so snapshots
@@ -482,6 +518,29 @@ internal static class Overlay
 
     private static GUIStyle? _text, _right, _big;
 
+    // Any note longer than its column is cut to fit, ending in "…", so no line runs past the panel.
+    private static string FitNote(string text, float maxWidth)
+    {
+        if (_text == null || Width(text) <= maxWidth) return text;
+        int low = 0, high = text.Length;
+        while (low < high)
+        {
+            var mid = (low + high + 1) / 2;
+            if (Width(text.Substring(0, mid) + "…") <= maxWidth) low = mid;
+            else high = mid - 1;
+        }
+
+        return text.Substring(0, low).TrimEnd(' ', ',', ';', '(') + "…";
+    }
+
+    private static readonly GUIContent Measured = new();
+
+    private static float Width(string text)
+    {
+        Measured.text = text;
+        return _text!.CalcSize(Measured).x;
+    }
+
     // Draws the panel at (x, y) and returns its bottom edge.
     internal static float Draw(float x, float y)
     {
@@ -537,7 +596,9 @@ internal static class Overlay
             Line(row.Color, row.Name, row.Shown, row.Share);
             GUI.DrawTexture(new Rect(x + graph, top + 1, Samples * 2, GraphHeight), row.Graph);
             GUI.Label(new Rect(x + tag, top + 2, 60, 20), row.Tag, _text);
-            GUI.Label(new Rect(x + note, top + 2, width - note - 8, 20), row.ExtraShown, _text);
+            row.ExtraFitted ??= $"<color=#bbb>{FitNote(row.ExtraPlain, width - note - 8)}</color>";
+
+            GUI.Label(new Rect(x + note, top + 2, width - note - 8, 20), row.ExtraFitted, _text);
             top += rowHeight;
         }
 

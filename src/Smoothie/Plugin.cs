@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -13,7 +14,7 @@ using UnityEngine;
 
 namespace Smoothie;
 
-[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.7")]
+[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.8")]
 // Optional: when Fika is installed it has to load first, or its types aren't there yet when
 // Smoothie looks for them and its observed bots aren't recognised. Without Fika this does nothing.
 [BepInDependency("com.fika.core", BepInDependency.DependencyFlags.SoftDependency)]
@@ -23,6 +24,7 @@ public class Plugin : BaseUnityPlugin
 
     internal static ConfigEntry<bool> ThrottleAnimators = null!;
     internal static ConfigEntry<bool> UnityStepping = null!;
+    internal static ConfigEntry<bool> PauseInEngine = null!;
     internal static ConfigEntry<float> FullRateDistance = null!;
     internal static ConfigEntry<float> LowestRateDistance = null!;
     internal static ConfigEntry<float> LowestVisibleRate = null!;
@@ -44,7 +46,14 @@ public class Plugin : BaseUnityPlugin
     internal static ConfigEntry<bool> HideShadows = null!;
     internal static ConfigEntry<bool> SkipCoveredLamps = null!;
     internal static ConfigEntry<bool> SkipOutOfView = null!;
+    internal static ConfigEntry<bool> SkipTooFar = null!;
+    internal static ConfigEntry<bool> FinePhysicsRegions = null!;
+    internal static ConfigEntry<bool> SkipHitTriggers = null!;
+    internal static ConfigEntry<bool> CapPhysicsRate = null!;
     internal static ConfigEntry<bool> EngineLoops = null!;
+#if DEBUG
+    internal static ConfigEntry<bool> LightCountTest = null!;
+#endif
     internal static ConfigEntry<bool> SortByMaterial = null!;
     internal static ConfigEntry<bool> ShowDepth = null!;
 
@@ -84,6 +93,8 @@ public class Plugin : BaseUnityPlugin
 
         UnityStepping = Bind(bots, "Update far bots on all CPU cores", true,
             "How \"Fewer animation updates for far or unseen bots\" catches a bot up: on, Unity does it with all other animations, spread over your CPU cores; off, Smoothie does it itself on the main thread, which costs more per bot. Only for comparing.", 65, true);
+        PauseInEngine = Bind(bots, "Cheaper animation pauses for far bots (code patch, experimental)", true,
+            "Smoothie saves CPU by updating the animation of far and unseen bots only a few times a second, and pausing it in between. Unity can only pause an animation by switching it off, and switching it back on is surprisingly expensive: Unity sets the bot's whole animation up again every time (on Streets with 15 bots ~0.4 ms a frame). With this on, the animation is never switched off; Unity just skips it until its next update. Bots look and move exactly the same. Only for this exact game build: on any other build of the game's engine it switches itself off.", 64, true);
         SimplifyDistance = Bind(bots, "Hide gear details beyond (m)", 60f,
             "How far away a bot has to be before its tiny details are hidden. Scope zoom counts: through a 4x scope, a bot 240 m away counts as 60 m.", 60, true,
             new AcceptableValueRange<float>(20f, 500f));
@@ -132,9 +143,23 @@ public class Plugin : BaseUnityPlugin
             "With \"Hide objects covered by nearer ones\" on: a covered object isn't drawn into shadow maps either, and the game's separate shadow-only meshes (simplified shadow casters for big structures) are checked and switched off when covered too. In buildings most of what's drawn is shadows: on Factory over a thousand draw calls a frame. Off: covered objects keep casting their shadows, which is always right but costs those draws.", 82);
         SkipOutOfView = Bind(other, "Skip LOD work for objects you cannot see", true,
             "Unity recomputes the level of detail of every object on the map for every frame, including everything behind you and everything the game itself isn't drawing; on big maps like Streets that's a large part of each frame (~0.7-1 ms measured). With this on, level objects out of view and beyond shadow range, and those the game has switched off, are skipped through Unity's own forced-level switch, a byte per object, so turning around costs next to nothing: everything is put back before the frame it could show in is drawn. Nothing you see changes. Only for this exact game build: on any other build of the game's engine it switches itself off.", 80);
+        SkipTooFar = Bind(other, "Skip LOD work for objects too far to draw", true,
+            "With \"Skip LOD work for objects you cannot see\" on: an object past the distance where the game's level of detail stops drawing it (small props and details far down a street) is also left out of Unity's per-frame LOD work, which otherwise works out for every one of them, every frame, that it draws nothing. On Streets that's most of the objects in view (~70k). Each is put back well before it would draw again (25% margin on Unity's own distance), so nothing you see changes. While aiming through a scope (its camera sees much further) this pauses, and what's in the scope's view is put back before the scope draws.", 80);
+        FinePhysicsRegions = Bind(other, "Split the map finer for physics", true,
+            "Whenever something moves under physics (a falling body, a thrown grenade, dropped loot, an airdrop) the game steps physics for the whole map, and every step checks each moving thing, including the 30-odd hit zones of every bot, against everything else in its part of the map. The map's own setup splits it into only a few parts, so each check runs through tens of thousands of objects. With this on it's split into the most parts Unity allows (16 by 16), so each check only looks at what's nearby. Same physics, same results. Takes a moment while the map loads.", 77);
+        SkipHitTriggers = Bind(other, "Skip unused physics trigger checks", true,
+            "While physics runs (a falling body, a grenade, dropped loot) Unity checks every hit zone of every bot (about 30 each) against every trigger zone it's inside, like spawn points and quest areas: thousands of checks per frame with bots around, for events nothing in the game listens to. The game finds who is in its zones its own way, every frame, whether physics runs or not. With this on those checks are skipped. Zones, quests, mines, extracts and bullets work exactly as before.", 76);
+        CapPhysicsRate = Bind(other, "Run physics at most 60 times a second", true,
+            "Whenever something moves under physics (a grenade, a falling body, dropped loot, a door) the game updates physics for the whole map once for every frame you see, and each update costs about the same no matter what moved (on Streets with bots ~1.2 ms). At 120 fps that's twice as many updates as at 60 fps, for the same result. With this on physics updates at most 60 times a second, each one covering the time since the last, exactly as the game runs at 60 fps. Below 60 fps nothing changes.", 77);
         EngineLoops = Bind(other, "Faster engine culling loops (code patch)", true,
-            "Rewrites three loops in Unity's own code, in memory while the game runs (nothing on disk changes), to do the same work faster: the scan over every object on the map after each frame's culling (~220k on Streets) checks 16 at a time instead of one, the level-of-detail loop skips the groups \"Skip LOD work for objects you cannot see\" has set aside, instead of working them out just to throw the result away, and the navigation-obstacle update stops working out every door obstacle's position for path-following agents the game doesn't have (bots find their way differently). Nothing you see changes. Only for this exact game build: on any other build of the game's engine it switches itself off, and off puts Unity's code back.", 78);
+            "Rewrites four loops in Unity's own code, in memory while the game runs (nothing on disk changes), to do the same work faster: the scan over every object on the map after each frame's culling (~220k on Streets) checks 16 at a time instead of one, the level-of-detail loop skips the groups \"Skip LOD work for objects you cannot see\" has set aside, instead of working them out just to throw the result away, the navigation-obstacle update stops working out every door obstacle's position for path-following agents the game doesn't have (bots find their way differently), and the light setup, done several times a frame, reads the number of lights Unity already keeps instead of counting every light on the map one by one. Nothing you see changes. Only for this exact game build: on any other build of the game's engine it switches itself off, and off puts Unity's code back.", 78);
         EngineLoops.SettingChanged += (_, _) => StartFlip(EngineLoops, "faster engine loops");
+#if DEBUG
+        // Debug builds: the light count patch on its own, for a paired A/B (PageDown).
+        LightCountTest = Bind(OverlaySection, "Test: read the light count (code patch)", true,
+            "With \"Faster engine culling loops\" on: reads the number of lights Unity keeps instead of counting them one by one. Off counts them as Unity does. Debug builds only.", 60, true);
+        LightCountTest.SettingChanged += (_, _) => StartFlip(LightCountTest, "reading the light count");
+#endif
         SortByMaterial = Bind(other, "Draw level objects grouped by material", true,
             "Draws everything solid grouped by material instead of nearest first, so the game switches materials less often (on Streets ~270 fewer switches a frame). That moves a little work from your CPU, which Tarkov is almost always waiting on, to your graphics card (things hidden behind nearer ones get shaded too). Nothing you see changes. If the overlay shows GPU wait going up with this on, your graphics card is the limit: switch it off.", 79);
         KeepCleanupPaused = Bind(other, "Prevent memory cleanup stutters in raids", false,
@@ -155,6 +180,11 @@ public class Plugin : BaseUnityPlugin
         SortByMaterial.SettingChanged += (_, _) => StartFlip(SortByMaterial, "grouping by material");
         SkipCoveredLamps.SettingChanged += (_, _) => StartFlip(SkipCoveredLamps, "skipping covered lamps");
         SkipOutOfView.SettingChanged += (_, _) => StartFlip(SkipOutOfView, "skipping LOD work");
+        SkipTooFar.SettingChanged += (_, _) => StartFlip(SkipTooFar, "skipping LOD work for far objects");
+        FinePhysicsRegions.SettingChanged += (_, _) => StartFlip(FinePhysicsRegions, "finer physics regions");
+        SkipHitTriggers.SettingChanged += (_, _) => StartFlip(SkipHitTriggers, "skipping hit zone trigger checks");
+        CapPhysicsRate.SettingChanged += (_, _) => StartFlip(CapPhysicsRate, "physics at most 60 a second");
+        PauseInEngine.SettingChanged += (_, _) => StartFlip(PauseInEngine, "cheaper animation pauses");
         // Shown and checked again from scratch, so each state is measured on its own.
         HideShadows.SettingChanged += (_, _) =>
         {
@@ -192,6 +222,7 @@ public class Plugin : BaseUnityPlugin
         Safely("animation throttling", () =>
         {
             new PlayerLateUpdatePatch().Enable();
+            Camera.onPreCull += AnimatorThrottle.OpticPreCull;
             new ArmsUpdatePatch().Enable();
             new MovementUpdatePatch().Enable();
         });
@@ -230,12 +261,24 @@ public class Plugin : BaseUnityPlugin
     // than breaking the method. Not by changing the setting: BepInEx would save that, and a
     // fixed version would then start with the feature off.
     private static readonly HashSet<ConfigEntryBase> Broken = new();
+    // Features that failed before this session, and features off only until the raid ends.
+    private static readonly HashSet<ConfigEntryBase> FailedBefore = new();
+    private static readonly HashSet<ConfigEntryBase> RetryNextRaid = new();
+    // In-game notice of a feature going off; shown from Update (Fail can run on a worker).
+    private static string? _notice;
 
     // Every feature checks this. "Turn off all fixes" is a second gate on top of each
     // feature's own setting, so it switches the mod off without changing any of them;
     // the overlay and logs aren't fixes and keep working.
+    // Nothing changes the hideout: it stays exactly as the game has it. Only the overlay and logs
+    // (when asked for) and the server connection, which isn't part of it, keep going there.
+    // Called many times a frame (per bot, from worker threads too), so the hideout is looked up
+    // once a frame, at the start of Update.
     internal static bool On(ConfigEntry<bool> feature) =>
-        feature.Value && !Broken.Contains(feature) && (Fixing || IgnoresPause(feature));
+        feature.Value && !Broken.Contains(feature) && (Fixing || IgnoresPause(feature)) &&
+        (!_inHideout || feature.Definition.Section == OverlaySection || feature == KeepBackendConnection);
+
+    private static bool _inHideout;
 
     // For the menu video pause: the A/B switch leaves it on. It only stops a game bug (the
     // hidden menu background's videos playing on through raids, 2-3 CPU cores); with it off
@@ -278,12 +321,35 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
+    // A first error in a raid switches the feature off for the rest of that raid only: it starts
+    // again from scratch the next raid, so a rare timing bug can't cost the whole session (a 1.0.4
+    // report: covered-object hiding off for good after one). A second error keeps it off for the
+    // session. Either way the player is told in game, not only in the log.
     internal static void Fail(ConfigEntryBase feature, Exception ex)
     {
         if (!Broken.Add(feature)) return;
-        SetDisabled(feature, "error, see the log");
-        Log.LogError($"\"{feature.Definition.Key}\" switched off for this session after an error: {ex}");
+        var retry = FailedBefore.Add(feature) && Diagnostics.InRaid;
+        if (retry) RetryNextRaid.Add(feature);
+        SetDisabled(feature, retry ? "error, back next raid; see the log" : "error, see the log");
+        Log.LogError($"\"{feature.Definition.Key}\" switched off for this {(retry ? "raid" : "session")} after an error: {ex}");
+        _notice = $"Smoothie: \"{feature.Definition.Key}\" stopped after an error" +
+                  (retry ? " and starts again next raid." : " and stays off until you restart.") +
+                  " Please report it with BepInEx/LogOutput.log.";
         Safely("undoing it", ApplyFixes);
+    }
+
+    private static void ShowNotice()
+    {
+        var notice = Interlocked.Exchange(ref _notice, null);
+        if (notice == null) return;
+        try
+        {
+            EFT.Communications.NotificationManager.DisplayWarningNotification(notice, EFT.Communications.ENotificationDurationType.Long);
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning($"in-game notice failed ({ex.Message}): {notice}");
+        }
     }
 
     // Puts back what a fix changed in the world once it's off, whichever way it went off:
@@ -295,7 +361,15 @@ public class Plugin : BaseUnityPlugin
         if (!On(HideCovered)) DepthCulling.ShowAll();
         if (!On(SkipOutOfView)) LodCulling.ShowAll();
         HotPaths.ResyncMenuVideos();
+        Guard(FinePhysicsRegions, HotPaths.SyncPhysicsRegions);
         ApplySender();
+    }
+
+    private static void SyncAnimatorPause()
+    {
+        var note = AnimatorPause.Note;
+        AnimatorPause.Sync(On(PauseInEngine) && On(ThrottleAnimators) && Diagnostics.InRaid);
+        if (AnimatorPause.Note != note) Log.LogInfo($"engine patch, animator pause: {AnimatorPause.Note}");
     }
 
     private static void SyncPatch(EnginePatch patch, bool on)
@@ -379,37 +453,200 @@ public class Plugin : BaseUnityPlugin
 
     private bool _wasInRaid;
 
-    // After each flip of an A/B setting: 1 s to settle, then 3 s of frame times, draw calls and
+    // After each flip of an A/B setting: FlipSettle s to settle, then FlipWindow s of frame times, draw calls and
     // SetPass averaged into one log line (with logging on), so on and off can be compared
     // standing still.
     private static float _flipAt = -1f;
     private static readonly List<float> FlipFrames = new();
-    private static double _flipDraws, _flipSetPass;
-    private static ConfigEntry<bool> _flipSetting = null!;
+    private static double _flipDraws, _flipSetPass, _flipSync;
+    private static ConfigEntry<bool>? _flipSetting;
     private static string _flipName = "";
+    // "Turn off all fixes" reads the other way round: on means Smoothie is off.
+    private static bool FlipOn => _flipSetting == PauseFixes ? !PauseFixes.Value : On(_flipSetting!);
+
+    // A/B: frames are measured from FlipSettle s after a flip, for FlipWindow s (hiding needs a few
+    // rounds and LOD skipping ~15 frames to settle; shorter windows were mostly noise).
+    private const float FlipSettle = 3f, FlipWindow = 10f;
 
     private static void StartFlip(ConfigEntry<bool> setting, string name)
     {
         _flipSetting = setting;
         _flipName = name;
-        _flipAt = Time.unscaledTime + 1f;
+        _flipAt = Time.unscaledTime + FlipSettle;
         FlipFrames.Clear();
-        _flipDraws = _flipSetPass = 0;
+        _flipDraws = _flipSetPass = _flipSync = 0;
     }
+
+#if DEBUG
+    // Debug, PageDown: an automatic A/B of the setting changed last (none yet: all fixes), flipped
+    // after every window, SeriesWindows of them, then both states' averages in one line. Bots
+    // move and fights come and go, so a single flip each way is mostly noise; alternating windows
+    // average it out. An even count ends where it started.
+    private const int SeriesWindows = 8;
+    private static int _seriesLeft;
+    private static readonly List<float> SeriesOn = new(), SeriesOff = new(), SyncOn = new(), SyncOff = new();
+
+    // Debug, PageDown: a paired A/B of the setting changed last. Long windows compare moments far
+    // apart (bots move, fights start and stop, the view drifts), which buried every small change.
+    // Here the setting flips every PairSettle + PairWindow s, and each ON second is compared with
+    // the OFF second right next to it: the game barely changes within two seconds, so the drift
+    // cancels across Pairs pairs. Reported per part of the frame (overlay on), with a 95% margin.
+    // Only for settings that act on the next frame (not covered-object hiding or LOD skipping,
+    // which need several seconds to settle: PageUp runs the long series for those).
+    private const float PairSettle = 1f, PairWindow = 2f;
+    private const int Pairs = 30;
+    private static int _pairWindowsLeft;
+    // A benchmark is measuring: Debug logging that costs frame time holds off.
+    internal static bool Benchmarking => _pairWindowsLeft > 0 || _seriesLeft > 0;
+    private static float _pairWindowStart;
+    private static int _pairFrames;
+    private static double _pairFrameSum;
+    private static double[] _pairPartSums = Array.Empty<double>();
+    private static readonly float[] PairPartsNow = new float[16];
+    private static bool _pairHaveParts;
+    private static readonly List<(bool On, double Frame, double[] Parts)> PairWindows = new();
+
+    // PageDown and PageUp compare the setting changed last, or else all of Smoothie.
+    private static void PickFlip()
+    {
+        if (_flipSetting != null) return;
+        _flipSetting = PauseFixes;
+        _flipName = "Smoothie (all fixes)";
+    }
+
+    private static void StartPairs()
+    {
+        PickFlip();
+        PairWindows.Clear();
+        _pairWindowsLeft = Pairs * 2;
+        Log.LogInfo($"A/B pairs of {_flipName}: {Pairs} pairs of {PairWindow:0} s windows, flipping every {PairSettle + PairWindow:0} s; stay put, about {Pairs * 2 * (PairSettle + PairWindow):0} s");
+        NextPairWindow();
+    }
+
+    private static void NextPairWindow()
+    {
+        _flipSetting!.Value = !_flipSetting.Value;
+        _flipAt = -1f; // not the long A/B window
+        _pairWindowStart = Time.unscaledTime + PairSettle;
+        _pairFrames = 0;
+        _pairFrameSum = 0;
+        _pairPartSums = new double[Overlay.PartNames.Length];
+        _pairHaveParts = true;
+    }
+
+    private static void MeasurePairs()
+    {
+        if (_pairWindowsLeft == 0) return;
+        if (!Diagnostics.InRaid)
+        {
+            _pairWindowsLeft = 0;
+            Log.LogInfo("A/B pairs stopped: left the raid");
+            return;
+        }
+
+        if (Time.unscaledTime < _pairWindowStart) return;
+        _pairFrames++;
+        _pairFrameSum += Time.unscaledDeltaTime * 1000f;
+        if (Overlay.PartsThisFrame(PairPartsNow))
+            for (var i = 0; i < _pairPartSums.Length; i++) _pairPartSums[i] += PairPartsNow[i];
+        else _pairHaveParts = false;
+        if (Time.unscaledTime < _pairWindowStart + PairWindow) return;
+
+        var on = FlipOn;
+        PairWindows.Add((on, _pairFrameSum / _pairFrames, _pairHaveParts ? _pairPartSums.Select(v => v / _pairFrames).ToArray() : Array.Empty<double>()));
+        if (--_pairWindowsLeft > 0)
+        {
+            NextPairWindow();
+            return;
+        }
+
+        LogPairs();
+    }
+
+    // ON minus OFF per neighbouring pair: mean and 95% margin (1.96 standard errors).
+    private static void LogPairs()
+    {
+        static string Difference(List<double> d) =>
+            d.Count < 2 ? "n/a" : $"{d.Average():+0.000;-0.000} ± {1.96 * Math.Sqrt(d.Sum(x => (x - d.Average()) * (x - d.Average())) / (d.Count - 1) / d.Count):0.000} ms";
+
+        var frame = new List<double>();
+        var names = Overlay.PartNames;
+        var parts = names.Select(_ => new List<double>()).ToArray();
+        for (var i = 0; i + 1 < PairWindows.Count; i += 2)
+        {
+            var (a, b) = (PairWindows[i], PairWindows[i + 1]);
+            var (on, off) = a.On ? (a, b) : (b, a);
+            if (on.On == off.On) continue;
+            frame.Add(on.Frame - off.Frame);
+            if (on.Parts.Length == names.Length && off.Parts.Length == names.Length)
+                for (var p = 0; p < names.Length; p++) parts[p].Add(on.Parts[p] - off.Parts[p]);
+        }
+
+        var onAverage = PairWindows.Where(w => w.On).Average(w => w.Frame);
+        var offAverage = PairWindows.Where(w => !w.On).Average(w => w.Frame);
+        var partsLine = parts[0].Count > 1
+            ? string.Join(", ", names.Select((n, p) => $"{n} {Difference(parts[p])}"))
+            : "parts: turn the overlay on";
+        Log.LogInfo($"A/B pairs {_flipName}: {frame.Count} pairs, frame ON {onAverage:0.00} ms, OFF {offAverage:0.00} ms; ON minus OFF: frame {Difference(frame)} | {partsLine}");
+    }
+
+    private static void StartSeries()
+    {
+        PickFlip();
+        SeriesOn.Clear();
+        SeriesOff.Clear();
+        SyncOn.Clear();
+        SyncOff.Clear();
+        _seriesLeft = SeriesWindows;
+        Log.LogInfo($"A/B series of {_flipName}: {SeriesWindows} windows of {FlipSettle + FlipWindow:0} s, flipping after each; stay put");
+        FlipSeries(_flipSetting!, _flipName);
+    }
+
+    private static void FlipSeries(ConfigEntry<bool> setting, string name)
+    {
+        setting.Value = !setting.Value;
+        StartFlip(setting, name);
+    }
+
+    // After each window of a series: the next flip, or the summary.
+    private static void SeriesWindowDone(bool on, float average, float sync)
+    {
+        (on ? SeriesOn : SeriesOff).Add(average);
+        (on ? SyncOn : SyncOff).Add(sync);
+        if (--_seriesLeft > 0)
+        {
+            FlipSeries(_flipSetting!, _flipName);
+            return;
+        }
+
+        string Line(List<float> frames) => $"{frames.Average():0.00} ms ({string.Join(", ", frames.Select(f => f.ToString("0.00")))})";
+        var difference = SeriesOn.Average() - SeriesOff.Average();
+        var syncLine = float.IsNaN(SyncOn.Average()) ? " (physics sync: turn the overlay on)" : $"; physics sync ON {SyncOn.Average():0.00} ms, OFF {SyncOff.Average():0.00} ms";
+        Log.LogInfo($"A/B series {_flipName}: ON {Line(SeriesOn)}, OFF {Line(SeriesOff)}; ON is {difference:+0.00;-0.00} ms a frame ({100.0 * difference / SeriesOff.Average():+0.0;-0.0}%)" + syncLine);
+    }
+#endif
 
     private static void MeasureFlip()
     {
         if (_flipAt < 0f || Time.unscaledTime < _flipAt) return;
-        if (!Diagnostics.InRaid || !Diagnostics.Logging)
+        var series = false;
+#if DEBUG
+        series = _seriesLeft > 0;
+#endif
+        if (!Diagnostics.InRaid || !Diagnostics.Logging && !series)
         {
             _flipAt = -1f;
+#if DEBUG
+            _seriesLeft = 0;
+#endif
             return;
         }
 
         FlipFrames.Add(Time.unscaledDeltaTime * 1000f);
         _flipDraws += Math.Max(0, Diagnostics.DrawCalls);
         _flipSetPass += Math.Max(0, Diagnostics.SetPassCalls);
-        if (Time.unscaledTime < _flipAt + 3f) return;
+        _flipSync += Overlay.SyncMs;
+        if (Time.unscaledTime < _flipAt + FlipWindow) return;
 
         _flipAt = -1f;
         FlipFrames.Sort();
@@ -417,10 +654,16 @@ public class Plugin : BaseUnityPlugin
         var median = FlipFrames[FlipFrames.Count / 2];
         var worst = FlipFrames[(int)(FlipFrames.Count * 0.95f)];
         var draws = Diagnostics.DrawCalls >= 0 ? $"{_flipDraws / FlipFrames.Count:0} ({_flipSetPass / FlipFrames.Count:0} SetPass)" : "n/a (overlay off)";
-        Log.LogInfo($"A/B {_flipName} {(On(_flipSetting) ? "ON " : "OFF")}: frame {average:0.00} ms (median {median:0.00}, 95% {worst:0.00}, {1000f / average:0} fps), draw calls {draws}" +
+        var flipOn = FlipOn;
+        var sync = (float)(_flipSync / FlipFrames.Count);
+        Log.LogInfo($"A/B {_flipName} {(flipOn ? "ON " : "OFF")}: frame {average:0.00} ms (median {median:0.00}, 95% {worst:0.00}, {1000f / average:0} fps), draw calls {draws}" +
+                    (float.IsNaN(sync) ? "" : $", physics sync {sync:0.00} ms") +
                     (_flipSetting == HideCovered && On(HideCovered) ? $", {DepthCulling.Saving} drawn objects hidden, check {DepthCulling.WorkerMs:0.0} ms on a worker" : "") +
-                    (_flipSetting == SkipOutOfView ? ", " + LodCulling.Summary() : "") +
+                    (_flipSetting == SkipOutOfView || _flipSetting == SkipTooFar ? ", " + LodCulling.Summary() : "") +
                     (Overlay.PartsSummary() is { Length: > 0 } parts ? $" |{parts.Replace("  overlay, last second:", " overlay, last second (not this A/B window):")}" : ""));
+#if DEBUG
+        if (series) SeriesWindowDone(flipOn, (float)average, sync);
+#endif
     }
     private float _lastSweep;
 
@@ -474,15 +717,43 @@ public class Plugin : BaseUnityPlugin
         var start = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
+            _inHideout = Diagnostics.InHideout;
             if (!_checkedSetup) CheckSetup();
+            if (_notice != null) ShowNotice();
+#if DEBUG
+            // Debug builds: Delete flips "Turn off all fixes (A/B test)" and measures it, without
+            // the F12 menu, which costs frame time of its own. Needs "Log stutters" on to log.
+            if (Input.GetKeyDown(KeyCode.Delete))
+            {
+                PauseFixes.Value = !PauseFixes.Value;
+                StartFlip(PauseFixes, "Smoothie (all fixes)");
+            }
+
+            // End: a made-up error in covered-object hiding, to check the notice and the retry.
+            if (Input.GetKeyDown(KeyCode.End)) Fail(HideCovered, new InvalidOperationException("test error (End key, Debug build)"));
+            // Home: what the physics step is busy with (Diagnostics, logged a second later).
+            if (Input.GetKeyDown(KeyCode.Home)) Diagnostics.StartPhysicsCensus();
+            // Insert: keep the physics step running, for an A/B under a steady physics load.
+            if (Input.GetKeyDown(KeyCode.Insert) && Diagnostics.InRaid) HotPaths.TogglePhysicsKeeper();
+            // PageDown: a paired A/B of the setting changed last (StartPairs); PageUp: the long series
+            // for settings that need seconds to settle (StartSeries).
+            if (Input.GetKeyDown(KeyCode.PageDown) && Diagnostics.InRaid && _seriesLeft == 0 && _pairWindowsLeft == 0) StartPairs();
+            if (Input.GetKeyDown(KeyCode.PageUp) && Diagnostics.InRaid && _seriesLeft == 0 && _pairWindowsLeft == 0) StartSeries();
+#endif
             // Engine patches are written only here: the main thread's script phase, before this
             // frame's culling and after the last one's, so Unity can't be inside a patched loop.
             SyncPatch(EnginePatch.VisibilityScan, On(EngineLoops));
             // Only skips groups "Skip LOD work" forced: without it, nothing to gain.
             SyncPatch(EnginePatch.LodLoop, On(EngineLoops) && On(SkipOutOfView));
+            Guard(PauseInEngine, SyncAnimatorPause);
             // Work only NavMeshAgents use; EFT has none (Unity's code runs while one is active).
             SyncPatch(EnginePatch.NavCrowd, On(EngineLoops));
             SyncPatch(EnginePatch.NavVelocity, On(EngineLoops));
+#if DEBUG
+            SyncPatch(EnginePatch.LightCount, On(EngineLoops) && LightCountTest.Value);
+#else
+            SyncPatch(EnginePatch.LightCount, On(EngineLoops));
+#endif
             // Leaving a raid: drop everything that refers to its players, so none of it is
             // kept alive through the menu.
             var inRaid = Diagnostics.InRaid;
@@ -494,10 +765,21 @@ public class Plugin : BaseUnityPlugin
                 LodCulling.Clear();
                 Occlusion.OnRaidStart();
                 Diagnostics.OnRaidEnd();
+                // Its state is cleared above: what failed once this raid gets another go.
+                foreach (var feature in RetryNextRaid)
+                {
+                    Broken.Remove(feature);
+                    SetDisabled(feature, null);
+                    Log.LogInfo($"\"{feature.Definition.Key}\" back on for the next raid after its error");
+                }
+
+                RetryNextRaid.Clear();
             }
 
             _wasInRaid = inRaid;
             if (inRaid) Guard(SortByMaterial, HotPaths.SortByMaterial);
+            if (inRaid) Guard(FinePhysicsRegions, HotPaths.SyncPhysicsRegions);
+            Guard(SkipHitTriggers, HotPaths.SyncHitTriggers);
             if (!inRaid) _pausedBeforeRaid = PauseFixes.Value;
             if (inRaid && Time.unscaledTime - _lastSweep > 5f)
             {
@@ -518,6 +800,9 @@ public class Plugin : BaseUnityPlugin
             }
             Guard(KeepCleanupPaused, Diagnostics.KeepCleanupPaused);
             MeasureFlip();
+#if DEBUG
+            MeasurePairs();
+#endif
             Diagnostics.Tick();
         }
         catch (Exception ex)

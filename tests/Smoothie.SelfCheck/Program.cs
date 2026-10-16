@@ -47,9 +47,14 @@ void Run(float seconds, bool inView)
 Run(1f, inView: false);
 Check(casts == 0, $"out-of-view bot cast {casts} lines");
 Check(sight.Hidden(t, false), "bot out of view for 1 s is not hidden");
+// Coming into view is checked on that very frame.
+sight.Hidden(t, true);
+Check(casts == 1, "bot coming into view isn't checked at once");
+casts = 0;
+t += Sight.CheckInterval;
 
 Run(1f, inView: true);
-Check(casts is >= 9 and <= 11, $"blocked bot in view cast {casts} lines in 1 s, expected ~10");
+Check(Math.Abs(casts - 1f / Sight.CheckInterval) <= 1.5f, $"blocked bot in view cast {casts} lines in 1 s, expected ~{1f / Sight.CheckInterval:0}");
 Check(sight.Hidden(t, true), "blocked bot in view is not hidden");
 
 clear = true;
@@ -305,6 +310,44 @@ Check(DepthPyramid.MoveGrowTexels(0.18f, DepthAt(19.9f), DepthAt(20f), p23, 0.00
 var own = DepthPyramid.OwnShiftTexels(0.2f, DepthAt(20f), p22, p23, 0.0091f, 100f);
 Check(Math.Abs(own - 1.1f) < 0.05f, $"own shift behind the gun is {own} texels, not ~1.1");
 
+// The animator pause hooks (src/SmoothieNative/animpause.c), with recording stand-ins for Unity's
+// functions: listed animators' outputs are left out of the pose list, listed graphs skip only
+// their normal frames, and everything else reaches Unity unchanged.
+unsafe
+{
+    var outputs = new IntPtr[3];
+    var animators = new IntPtr[] { (IntPtr)0xA1, (IntPtr)0xA2, (IntPtr)0xA3 };
+    for (var i = 0; i < 3; i++)
+    {
+        outputs[i] = System.Runtime.InteropServices.Marshal.AllocHGlobal(0x100);
+        *(IntPtr*)((byte*)outputs[i] + 0xD0) = animators[i];
+    }
+
+    fixed (IntPtr* data = outputs)
+    {
+        var vector = stackalloc IntPtr[] { (IntPtr)data, (IntPtr)0x1234, (IntPtr)3, (IntPtr)3 };
+        AnimHooks.SmoothieAnimInit((IntPtr)(delegate* unmanaged<IntPtr*, byte, byte, byte, void>)&AnimHooks.Update,
+            (IntPtr)(delegate* unmanaged<IntPtr, int, double, float, ulong, uint, int, void>)&AnimHooks.Prepare);
+        var one = stackalloc IntPtr[] { (IntPtr)0xA2 };
+        var graph = stackalloc IntPtr[] { (IntPtr)0x62 };
+        AnimHooks.SmoothieAnimSet(one, graph, 1);
+        AnimHooks.SmoothieUpdateAvatars(vector, 1, 0, 1);
+        Check(AnimHooks.Seen.SequenceEqual(new[] { outputs[0], outputs[2] }), $"pose list kept {AnimHooks.Seen.Count} outputs, not the two unlisted ones");
+        Check(AnimHooks.Label == (IntPtr)0x1234 && AnimHooks.Flags == (1, 0, 1), "pose list lost its label or flags");
+        AnimHooks.Prepares.Clear();
+        AnimHooks.SmoothiePrepareFrame((IntPtr)0x62, 0, 1.5, 0.25f, 77, 3, 2);
+        AnimHooks.SmoothiePrepareFrame((IntPtr)0x62, 1, 1.5, 0.25f, 77, 3, 2);
+        AnimHooks.SmoothiePrepareFrame((IntPtr)0x61, 0, 2.5, 0.5f, 78, 4, 1);
+        Check(AnimHooks.Prepares.SequenceEqual(new[] { ((IntPtr)0x62, 1, 1.5, 0.25f, 77UL, 3U, 2), ((IntPtr)0x61, 0, 2.5, 0.5f, 78UL, 4U, 1) }),
+            $"graph frames passed: {string.Join(", ", AnimHooks.Prepares)}");
+        AnimHooks.SmoothieAnimSet(null, null, 0);
+        AnimHooks.SmoothieUpdateAvatars(vector, 0, 0, 0);
+        Check(AnimHooks.Vector == (IntPtr)vector, "with nothing listed the pose list isn't Unity's own");
+    }
+
+    foreach (var output in outputs) System.Runtime.InteropServices.Marshal.FreeHGlobal(output);
+}
+
 if (failures.Count > 0)
 {
     Console.Error.WriteLine($"FAIL ({failures.Count}):");
@@ -312,7 +355,34 @@ if (failures.Count > 0)
     return 1;
 }
 
-Console.WriteLine($"OK: throttle intervals, zoom, depth cover and the depth pyramid behave, {binds.Count} config names are valid.");
+Console.WriteLine($"OK: throttle intervals, zoom, depth cover, the depth pyramid and the animator pause hooks behave, {binds.Count} config names are valid.");
 return 0;
 
 static string SourcePath([System.Runtime.CompilerServices.CallerFilePath] string path = "") => path;
+
+static unsafe class AnimHooks
+{
+    internal static readonly List<IntPtr> Seen = new();
+    internal static readonly List<(IntPtr, int, double, float, ulong, uint, int)> Prepares = new();
+    internal static IntPtr Label, Vector;
+    internal static (int, int, int) Flags;
+
+    [System.Runtime.InteropServices.DllImport("SmoothieNative")] internal static extern void SmoothieAnimInit(IntPtr update, IntPtr prepare);
+    [System.Runtime.InteropServices.DllImport("SmoothieNative")] internal static extern void SmoothieAnimSet(IntPtr* animators, IntPtr* graphs, int count);
+    [System.Runtime.InteropServices.DllImport("SmoothieNative")] internal static extern void SmoothieUpdateAvatars(IntPtr* outputs, byte a, byte b, byte c);
+    [System.Runtime.InteropServices.DllImport("SmoothieNative")] internal static extern void SmoothiePrepareFrame(IntPtr graph, int type, double time, float delta, ulong frame, uint index, int context);
+
+    [System.Runtime.InteropServices.UnmanagedCallersOnly]
+    internal static void Update(IntPtr* outputs, byte a, byte b, byte c)
+    {
+        Vector = (IntPtr)outputs;
+        Label = outputs[1];
+        Flags = (a, b, c);
+        Seen.Clear();
+        for (var i = 0; i < (int)outputs[2]; i++) Seen.Add(((IntPtr*)outputs[0])[i]);
+    }
+
+    [System.Runtime.InteropServices.UnmanagedCallersOnly]
+    internal static void Prepare(IntPtr graph, int type, double time, float delta, ulong frame, uint index, int context) =>
+        Prepares.Add((graph, type, time, delta, frame, index, context));
+}

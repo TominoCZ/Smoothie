@@ -118,6 +118,7 @@ internal static class DepthCulling
         // and its box holds all of theirs.
         public int[] CellStart = null!;
         public Vector3[] CellMin = null!, CellMax = null!;
+        public int[] CellOf = null!;
         // What the last check made of each cell (debug view): CellOut, CellIdle, CellCovered, CellTested.
         public byte[] CellState = null!;
         public byte[] Streak = null!;
@@ -235,7 +236,7 @@ internal static class DepthCulling
     // thread); Streak and Want are the worker's; the rest the main thread's.
     private static Light[] _lamps = Array.Empty<Light>();
     private static Vector3[] _lampMin = Array.Empty<Vector3>(), _lampMax = Array.Empty<Vector3>(), _lampAt = Array.Empty<Vector3>();
-    private static bool[] _lampTest = Array.Empty<bool>(), _lampWant = Array.Empty<bool>(), _lampOff = Array.Empty<bool>();
+    private static bool[] _lampWant = Array.Empty<bool>(), _lampOff = Array.Empty<bool>();
     private static byte[] _lampStreak = Array.Empty<byte>();
     private static int[] _lampMaskWas = Array.Empty<int>();
     // Whether each lamp is on (active and enabled), asked LampsPerRound at a time: Streets has
@@ -248,6 +249,11 @@ internal static class DepthCulling
     // skipped one as its result was applied, with that round's view: a turn may bring in the part
     // past the screen's edge, which wasn't checked (KeepLampsInView).
     private static Vector4[] _lampRect = Array.Empty<Vector4>(), _lampSkipRect = Array.Empty<Vector4>();
+    // Per lamp its transform (static lamps: asked once), and the lamps switched off at the last
+    // result, so the per-frame view check walks those (~4.6k on Streets) instead of all (~11k).
+    private static Transform?[] _lampTransform = Array.Empty<Transform?>();
+    private static int[] _offList = Array.Empty<int>();
+    private static int _offCount;
     private static Matrix4x4 _lampView;
     private static int _lampsPastEdge;
     private static bool _roundLamps;
@@ -484,7 +490,7 @@ internal static class DepthCulling
         var lamps = new List<Light>();
         foreach (var light in UnityEngine.Object.FindObjectsByType<Light>(FindObjectsInactive.Include, FindObjectsSortMode.None))
         {
-            if ((light.type == LightType.Spot || light.type == LightType.Point)
+            if ((light.type == LightType.Spot || light.type == LightType.Point) && OfLevel(light)
                 && (skipLayers & (1 << light.gameObject.layer)) == 0 && !Moves(light.transform, moving)) lamps.Add(light);
         }
 
@@ -493,7 +499,7 @@ internal static class DepthCulling
         var boxes = new List<Bounds>();
         foreach (var area in UnityEngine.Object.FindObjectsByType<AreaLight>(FindObjectsInactive.Include, FindObjectsSortMode.None))
         {
-            if ((skipLayers & (1 << area.gameObject.layer)) != 0 || Moves(area.transform, moving)) continue;
+            if (!OfLevel(area) || (skipLayers & (1 << area.gameObject.layer)) != 0 || Moves(area.transform, moving)) continue;
             // Its source mesh's bounds are the volume it lights (AreaLight.GetFrustumBounds).
             var source = area.GetComponent<MeshRenderer>();
             if (source == null) continue;
@@ -506,15 +512,32 @@ internal static class DepthCulling
         SetAreas(areas.ToArray(), boxes);
     }
 
+    // Part of the map, not of a camera rig the game keeps across scenes: the item icon camera
+    // (IconCreatorBase: DontDestroyOnLoad at (0, -10, -1), lit by lights on it and its parents)
+    // and preview rigs light only their own camera's view, which the depth here knows nothing
+    // about. Skipped as "covered", their icons rendered black (and stayed cached).
+    private static bool OfLevel(Component light) =>
+        light.gameObject.scene.name != "DontDestroyOnLoad" && light.GetComponentInChildren<Camera>(true) == null;
+
+    // A round on the worker reads the lamp and area arrays: they're only swapped between rounds.
+    // (A report from Interchange: arrays replaced while a round still ran, an index past the new
+    // ones.) Its results were for the old arrays, so they're dropped.
+    private static void WaitForRound()
+    {
+        if (Volatile.Read(ref _state) != Testing) return;
+        SpinWait.SpinUntil(() => Volatile.Read(ref _state) != Testing, 250);
+        _epoch++;
+    }
+
     private static void SetLamps(Light[] lamps)
     {
+        WaitForRound();
         RestoreLamps();
         _lamps = lamps;
         var n = lamps.Length;
         _lampMin = new Vector3[n];
         _lampMax = new Vector3[n];
         _lampAt = new Vector3[n];
-        _lampTest = new bool[n];
         _lampWant = new bool[n];
         _lampOff = new bool[n];
         _lampStreak = new byte[n];
@@ -523,9 +546,13 @@ internal static class DepthCulling
         _lampCursor = 0;
         _lampRect = new Vector4[n];
         _lampSkipRect = new Vector4[n];
+        _lampTransform = new Transform?[n];
+        _offList = new int[n];
+        _offCount = 0;
         _lampsPastEdge = 0;
         for (var l = 0; l < n; l++)
         {
+            _lampTransform[l] = lamps[l] != null ? lamps[l].transform : null;
             TakeLampBox(l);
             _lampActive[l] = lamps[l] != null && lamps[l].isActiveAndEnabled;
         }
@@ -575,7 +602,8 @@ internal static class DepthCulling
     private static void ApplyLamps(bool fits)
     {
         var on = fits && _roundLamps && Plugin.On(Plugin.SkipCoveredLamps);
-        int off = 0, pastEdge = 0, candidates = 0;
+        int off = 0, candidates = 0;
+        _offCount = 0;
         var turn = _lampMoveTurn = (_lampMoveTurn + 1) % LampMoveTurns;
         _lampView = _roundViewProjection;
         if (_offLamp.Length < _lamps.Length)
@@ -587,7 +615,8 @@ internal static class DepthCulling
         for (var l = 0; l < _lamps.Length; l++)
         {
             // Most lamps: not skipped and not wanted, nothing to do (no call into the engine).
-            var wanted = on && _lampTest[l] && _lampWant[l];
+            // Wanted implies tested this round (TestLamps resets the streak of an untested one).
+            var wanted = on && _lampWant[l];
             if (!wanted && !_lampOff[l]) continue;
             if (wanted && !_lampOff[l])
             {
@@ -597,15 +626,24 @@ internal static class DepthCulling
                 continue;
             }
 
+            // Already off and still wanted, not its turn to be asked whether it moved: stays off,
+            // untouched (~4.6k lamps a result on Streets). Destroyed meanwhile: found on its turn.
+            if (wanted && l % LampMoveTurns != turn)
+            {
+                off++;
+                KeepRect(l);
+                continue;
+            }
+
             var light = _lamps[l];
-            if (light == null)
+            if (Gone(light))
             {
                 _lampOff[l] = false;
                 continue;
             }
 
             // Already off: still wanted, unless it moved (asked every LampMoveTurns-th result).
-            if (!wanted || l % LampMoveTurns == turn && (light.transform.position - _lampAt[l]).sqrMagnitude >= 1e-4f)
+            if (!wanted || (_lampTransform[l]!.position - _lampAt[l]).sqrMagnitude >= 1e-4f)
             {
                 if (light.cullingMask == 0) light.cullingMask = _lampMaskWas[l];
                 _lampOff[l] = false;
@@ -614,7 +652,7 @@ internal static class DepthCulling
             }
 
             off++;
-            KeepRect(l, ref pastEdge);
+            KeepRect(l);
         }
 
         if (candidates > LampOffsPerResult) Array.Sort(_offDistance, _offLamp, 0, candidates);
@@ -622,24 +660,29 @@ internal static class DepthCulling
         {
             var l = _offLamp[c];
             var light = _lamps[l];
-            if (light == null || (light.transform.position - _lampAt[l]).sqrMagnitude >= 1e-4f || light.cullingMask == 0) continue;
+            if (Gone(light) || (_lampTransform[l]!.position - _lampAt[l]).sqrMagnitude >= 1e-4f || light.cullingMask == 0) continue;
             _lampMaskWas[l] = light.cullingMask;
             light.cullingMask = 0;
             _lampOff[l] = true;
             _frameLampOffs++;
             off++;
-            KeepRect(l, ref pastEdge);
+            KeepRect(l);
         }
 
         LampsOff = off;
-        _lampsPastEdge = pastEdge;
+        _lampsPastEdge = _offCount;
     }
 
-    // A skipped lamp's checked area, for KeepLampsInView.
-    private static void KeepRect(int l, ref int pastEdge)
+    // Destroyed: what Unity's == ends up checking for a Light, without the managed comparison
+    // around it (~4.6k lamps a result).
+    private static bool Gone(Light light) => light is null || SceneSkip.NativeOf(light) == IntPtr.Zero;
+
+    // A skipped lamp's checked area, for KeepLampsInView: only those reaching past the screen's
+    // edge are listed (_offList), as only they can come into view by turning.
+    private static void KeepRect(int l)
     {
         _lampSkipRect[l] = _lampRect[l];
-        if (!OnScreen(_lampRect[l])) pastEdge++;
+        if (!OnScreen(_lampRect[l])) _offList[_offCount++] = l;
     }
 
     // EFT's area lights (AreaLight: a mesh plus a script) rebuild a command buffer for the main
@@ -655,13 +698,16 @@ internal static class DepthCulling
     private static Vector4[] _areaRect = Array.Empty<Vector4>();
     private static byte[] _areaStreak = Array.Empty<byte>();
     private static bool[] _areaWant = Array.Empty<bool>();
-    private static readonly HashSet<AreaLight> SkippedAreas = new();
+    // By reference: asked for every area light, camera and frame (~1.2k on Streets), and Unity's
+    // own Equals/GetHashCode made that ~0.7% of the main thread.
+    private static readonly HashSet<AreaLight> SkippedAreas = new(Diagnostics.ReferenceComparer.Instance);
     internal static int AreasOff;
     private static readonly AccessTools.FieldRef<AreaLight, Dictionary<Camera, CommandBuffer>> AreaBuffers =
         AccessTools.FieldRefAccess<AreaLight, Dictionary<Camera, CommandBuffer>>("m_Cameras");
 
     private static void SetAreas(AreaLight[] areas, List<Bounds> boxes)
     {
+        WaitForRound();
         RestoreAreas();
         var n = areas.Length;
         _areaMin = new Vector3[n];
@@ -742,6 +788,7 @@ internal static class DepthCulling
             !ReferenceEquals(cam, _camera) || SkippedAreas.Count == 0 || !SkippedAreas.Contains(__instance);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool OnScreen(Vector4 rect) => rect.x >= 0f && rect.y >= 0f && rect.z <= 1f && rect.w <= 1f;
 
     // Every frame before culling, while a skipped lamp's lit area reached past the screen's edge
@@ -777,9 +824,10 @@ internal static class DepthCulling
         // back every frame.
         float slackX = BoxGrowTexels / _width, slackY = BoxGrowTexels / _height;
         var pastEdge = 0;
-        for (var l = 0; l < _lamps.Length; l++)
+        for (var k = 0; k < _offCount; k++)
         {
-            if (!_lampOff[l] || OnScreen(_lampSkipRect[l])) continue;
+            var l = _offList[k];
+            if (!_lampOff[l]) continue;
             var r = _lampSkipRect[l];
             float x0 = Math.Max(r.x, xMin), y0 = Math.Max(r.y, yMin), x1 = Math.Min(r.z, xMax), y1 = Math.Min(r.w, yMax);
             if (everywhere || x0 < x1 && y0 < y1 && (x0 < -slackX || y0 < -slackY || x1 > 1f + slackX || y1 > 1f + slackY))
@@ -997,6 +1045,9 @@ internal static class DepthCulling
         set.CellMin = cellMin.ToArray();
         set.CellMax = cellMax.ToArray();
         set.CellState = new byte[set.CellMin.Length];
+        set.CellOf = new int[count];
+        for (var c = 0; c < set.CellMin.Length; c++)
+        for (var i = set.CellStart[c]; i < set.CellStart[c + 1]; i++) set.CellOf[i] = c;
 
         PendingRenderers.Clear();
         PendingBounds.Clear();
@@ -1374,7 +1425,6 @@ internal static class DepthCulling
             }
         }
 
-        for (var l = 0; l < lampCount; l++) _lampTest[l] = _roundLamps && _lampActive[l];
         _tanX = 1f / Mathf.Abs(_projection.m00);
         _tanY = 1f / Mathf.Abs(_projection.m11);
         _texelAngleX = 2f * _tanX / _width;
@@ -1948,10 +1998,12 @@ internal static class DepthCulling
     {
         for (var l = from; l < to; l++)
         {
-            var why = _lampTest[l] ? BoxWhy(lane, _lampMin[l], _lampMax[l], ref m) : WhyOutOfView;
+            // _lampActive is only written between rounds (Request, SetLamps).
+            var test = _roundLamps && _lampActive[l];
+            var why = test ? BoxWhy(lane, _lampMin[l], _lampMax[l], ref m) : WhyOutOfView;
             var covered = why == WhyCovered;
-            if (_lampTest[l]) lane.LampsOn++;
-            if (_lampTest[l] && why != WhyOutOfView) lane.LampsInView++;
+            if (test) lane.LampsOn++;
+            if (test && why != WhyOutOfView) lane.LampsInView++;
             if (covered && Project(_lampMin[l], _lampMax[l], ref m, out var lx0, out var ly0, out var lx1, out var ly1, out _, out _))
                 _lampRect[l] = new Vector4(lx0, ly0, lx1, ly1);
             _lampStreak[l] = covered ? (byte)Math.Min(_lampStreak[l] + 1, HideAfter) : (byte)0;
@@ -2209,48 +2261,45 @@ internal static class DepthCulling
         planes[3] = new Vector4(m.m30 - m.m10, m.m31 - m.m11, m.m32 - m.m12, m.m33 - m.m13);
     }
 
-    // The worker's planes (SetPlanes on Planes, every round) as fields with their normals'
-    // absolute values worked out once: tested for every box of every round.
-    private static Vector4 _plane0, _plane1, _plane2, _plane3;
-    private static Vector3 _abs0, _abs1, _abs2, _abs3;
-
-    private static void TakePlanes()
+    // A view's left, right, bottom and top planes (SetPlanes) with their normals' absolute
+    // values worked out once, for testing many boxes. Together they also leave out what's
+    // wholly behind the eye. One for the worker (every box of every round), one for the main
+    // thread (ShowEntering): the worker's is rewritten while it runs.
+    private struct Sides
     {
-        _plane0 = Planes[0];
-        _plane1 = Planes[1];
-        _plane2 = Planes[2];
-        _plane3 = Planes[3];
-        _abs0 = new Vector3(Math.Abs(_plane0.x), Math.Abs(_plane0.y), Math.Abs(_plane0.z));
-        _abs1 = new Vector3(Math.Abs(_plane1.x), Math.Abs(_plane1.y), Math.Abs(_plane1.z));
-        _abs2 = new Vector3(Math.Abs(_plane2.x), Math.Abs(_plane2.y), Math.Abs(_plane2.z));
-        _abs3 = new Vector3(Math.Abs(_plane3.x), Math.Abs(_plane3.y), Math.Abs(_plane3.z));
-    }
+        private Vector4 _p0, _p1, _p2, _p3;
+        private Vector3 _a0, _a1, _a2, _a3;
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool OutOfView(Vector3 min, Vector3 max)
-    {
-        float cx = (min.x + max.x) * 0.5f, cy = (min.y + max.y) * 0.5f, cz = (min.z + max.z) * 0.5f;
-        float ex = (max.x - min.x) * 0.5f, ey = (max.y - min.y) * 0.5f, ez = (max.z - min.z) * 0.5f;
-        return _plane0.x * cx + _plane0.y * cy + _plane0.z * cz + _plane0.w + _abs0.x * ex + _abs0.y * ey + _abs0.z * ez < 0f
-            || _plane1.x * cx + _plane1.y * cy + _plane1.z * cz + _plane1.w + _abs1.x * ex + _abs1.y * ey + _abs1.z * ez < 0f
-            || _plane2.x * cx + _plane2.y * cy + _plane2.z * cz + _plane2.w + _abs2.x * ex + _abs2.y * ey + _abs2.z * ez < 0f
-            || _plane3.x * cx + _plane3.y * cy + _plane3.z * cz + _plane3.w + _abs3.x * ex + _abs3.y * ey + _abs3.z * ez < 0f;
-    }
-
-    // The box against the left, right, bottom and top planes of a view (SetPlanes). Together
-    // they also leave out what's wholly behind the eye.
-    private static bool OutOfView(Vector4[] planes, Vector3 min, Vector3 max)
-    {
-        float cx = (min.x + max.x) * 0.5f, cy = (min.y + max.y) * 0.5f, cz = (min.z + max.z) * 0.5f;
-        float ex = (max.x - min.x) * 0.5f, ey = (max.y - min.y) * 0.5f, ez = (max.z - min.z) * 0.5f;
-        for (var p = 0; p < 4; p++)
+        public void Take(Vector4[] planes)
         {
-            var q = planes[p];
-            if (q.x * cx + q.y * cy + q.z * cz + q.w + Math.Abs(q.x) * ex + Math.Abs(q.y) * ey + Math.Abs(q.z) * ez < 0f) return true;
+            _p0 = planes[0];
+            _p1 = planes[1];
+            _p2 = planes[2];
+            _p3 = planes[3];
+            _a0 = new Vector3(Math.Abs(_p0.x), Math.Abs(_p0.y), Math.Abs(_p0.z));
+            _a1 = new Vector3(Math.Abs(_p1.x), Math.Abs(_p1.y), Math.Abs(_p1.z));
+            _a2 = new Vector3(Math.Abs(_p2.x), Math.Abs(_p2.y), Math.Abs(_p2.z));
+            _a3 = new Vector3(Math.Abs(_p3.x), Math.Abs(_p3.y), Math.Abs(_p3.z));
         }
 
-        return false;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool Out(Vector3 min, Vector3 max)
+        {
+            float cx = (min.x + max.x) * 0.5f, cy = (min.y + max.y) * 0.5f, cz = (min.z + max.z) * 0.5f;
+            float ex = (max.x - min.x) * 0.5f, ey = (max.y - min.y) * 0.5f, ez = (max.z - min.z) * 0.5f;
+            return _p0.x * cx + _p0.y * cy + _p0.z * cz + _p0.w + _a0.x * ex + _a0.y * ey + _a0.z * ez < 0f
+                || _p1.x * cx + _p1.y * cy + _p1.z * cz + _p1.w + _a1.x * ex + _a1.y * ey + _a1.z * ez < 0f
+                || _p2.x * cx + _p2.y * cy + _p2.z * cz + _p2.w + _a2.x * ex + _a2.y * ey + _a2.z * ez < 0f
+                || _p3.x * cx + _p3.y * cy + _p3.z * cz + _p3.w + _a3.x * ex + _a3.y * ey + _a3.z * ez < 0f;
+        }
     }
+
+    private static Sides _workerSides, _viewSides;
+
+    private static void TakePlanes() => _workerSides.Take(Planes);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool OutOfView(Vector3 min, Vector3 max) => _workerSides.Out(min, max);
 
     // A box against the depth: out of view, partly behind the camera, covered, or why not.
     // Covered on the main screen but in the scope's area: also covered in the scope's own
@@ -2493,12 +2542,13 @@ internal static class DepthCulling
         // switches back on what it didn't switch off.
         var was = set.Was[i] ??= new ShadowCastingMode[renderers.Length];
         var any = false;
+        var hidesShadows = HidesShadows;
         for (var n = 0; n < renderers.Length; n++)
         {
             was[n] = NotSwitched;
             var renderer = renderers[n];
             if (renderer == null) continue;
-            if (HidesShadows)
+            if (hidesShadows)
             {
                 if (ForceOff(renderer)) continue;
                 SetForceOff(renderer, true);
@@ -2570,16 +2620,28 @@ internal static class DepthCulling
     internal static int StaleCount;
     private static readonly Vector4[] ViewPlanes = new Vector4[4];
 
+    // The list comes in runs of one cell (the worker goes cell by cell, in unit order), and a
+    // cell's box holds its units' boxes: a cell out of view keeps its whole run without a test
+    // per unit.
     private static void ShowEntering(Set set, Camera camera)
     {
         var m = camera.cullingMatrix;
         SetPlanes(ViewPlanes, ref m);
-        var kept = 0;
+        _viewSides.Take(ViewPlanes);
+        int kept = 0, cell = -1;
+        var cellOut = false;
         for (var n = 0; n < StaleUnits.Count; n++)
         {
             var i = StaleUnits[n];
             if (set.Off[i] == null) continue;
-            if (OutOfView(ViewPlanes, set.Min[i], set.Max[i])) StaleUnits[kept++] = i;
+            var c = set.CellOf[i];
+            if (c != cell)
+            {
+                cell = c;
+                cellOut = _viewSides.Out(set.CellMin[c], set.CellMax[c]);
+            }
+
+            if (cellOut || _viewSides.Out(set.Min[i], set.Max[i])) StaleUnits[kept++] = i;
             else
             {
                 Show(set, i);

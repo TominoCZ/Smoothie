@@ -337,8 +337,11 @@ internal static class Diagnostics
     private static long _lastTickStamp;
     private static float _lastDeathSnapshot = -100f;
 
+    // The hideout is a GameWorld with a main player too, but not a raid.
     internal static bool InRaid =>
-        Singleton<GameWorld>.Instantiated && Singleton<GameWorld>.Instance.MainPlayer != null;
+        Singleton<GameWorld>.Instantiated && Singleton<GameWorld>.Instance is not HideoutGameWorld && Singleton<GameWorld>.Instance.MainPlayer != null;
+
+    internal static bool InHideout => Singleton<GameWorld>.Instantiated && Singleton<GameWorld>.Instance is HideoutGameWorld;
 
     // After a raid, once a memory cleanup has run: how many of its players are still in memory,
     // and is any of them reachable from Smoothie's own fields? Players are tracked weakly, so
@@ -458,7 +461,7 @@ internal static class Diagnostics
         return found;
     }
 
-    private sealed class ReferenceComparer : IEqualityComparer<object>
+    internal sealed class ReferenceComparer : IEqualityComparer<object>
     {
         internal static readonly ReferenceComparer Instance = new();
         bool IEqualityComparer<object>.Equals(object x, object y) => ReferenceEquals(x, y);
@@ -1319,25 +1322,146 @@ internal static class Diagnostics
 
     private static void LogPhysicsKeepers()
     {
-        var roots = new SortedDictionary<string, int>();
-        foreach (var body in PhysicsExtensions.UpdateController._rigidbodies)
-        {
-            if (body.rigidbody == null || !body.rigidbody.gameObject.activeInHierarchy) continue;
-            if (body.visibilityChecker != null && !body.visibilityChecker.IsVisible) continue;
-            var name = $"{body.rigidbody.transform.root.name}/{body.rigidbody.name}{(body.rigidbody.isKinematic ? " (kinematic)" : "")}";
-            roots[name] = roots.TryGetValue(name, out var n) ? n + 1 : 1;
-        }
-
-        var keepers = string.Join(", ", roots.Select(r => r.Value > 1 ? $"{r.Key} x{r.Value}" : r.Key));
+        var keepers = PhysicsKeepers;
         if (keepers == _physicsKeepers) return;
         _physicsKeepers = keepers;
         Plugin.Log.LogInfo($"{DateTime.Now:HH:mm:ss.fff} physics step {(keepers.Length > 0 ? $"kept running by: {keepers}" : "idle")}");
     }
 
+    internal static string PhysicsKeepers
+    {
+        get
+        {
+            var roots = new SortedDictionary<string, int>();
+            foreach (var body in PhysicsExtensions.UpdateController._rigidbodies)
+            {
+                if (body.rigidbody == null || !body.rigidbody.gameObject.activeInHierarchy) continue;
+                if (body.visibilityChecker != null && !body.visibilityChecker.IsVisible) continue;
+                var name = $"{body.rigidbody.transform.root.name}/{body.rigidbody.name}{(body.rigidbody.isKinematic ? " (kinematic)" : "")}";
+                roots[name] = roots.TryGetValue(name, out var n) ? n + 1 : 1;
+            }
+
+            return string.Join(", ", roots.Select(r => r.Value > 1 ? $"{r.Key} x{r.Value}" : r.Key));
+        }
+    }
+
+#if DEBUG
+    // Debug, Home: what PhysX is busy with while the scene step runs. Two snapshots of every
+    // enabled collider 1 s apart: colliders moved without a rigidbody (static actors, whose tree
+    // PhysX rebuilds), kinematic and dynamic ones moved, trigger shapes on moved things, and the
+    // awake bodies. Grouped by layer and object (digits as #), a one-off hitch.
+    private static Collider[]? _censusColliders;
+    private static Vector3[] _censusAt = Array.Empty<Vector3>();
+    private static float _censusDue = -1f;
+
+    internal static void StartPhysicsCensus()
+    {
+        _censusColliders = Object.FindObjectsByType<Collider>(FindObjectsSortMode.None);
+        _censusAt = new Vector3[_censusColliders.Length];
+        for (var i = 0; i < _censusColliders.Length; i++) _censusAt[i] = _censusColliders[i].transform.position;
+        _censusDue = Time.unscaledTime + 1f;
+        Plugin.Log.LogInfo($"physics census: {_censusColliders.Length} colliders, second look in 1 s (physics step {(_physicsKeepers.Length > 0 ? "running" : "idle")})");
+    }
+
+    private static string CensusName(Component c) =>
+        System.Text.RegularExpressions.Regex.Replace($"{LayerMask.LayerToName(c.gameObject.layer)}: {c.transform.root.name}/{c.name}", "[0-9]+", "#");
+
+    private static void CensusAdd(Dictionary<string, int> into, string key) => into[key] = into.TryGetValue(key, out var n) ? n + 1 : 1;
+
+    private static string CensusTop(Dictionary<string, int> groups) =>
+        string.Join("; ", groups.OrderByDescending(g => g.Value).Take(14).Select(g => $"{g.Value}x {g.Key}"));
+
+    private static long Tris(Mesh? mesh)
+    {
+        long n = 0;
+        if (mesh != null) for (var i = 0; i < mesh.subMeshCount; i++) n += mesh.GetIndexCount(i) / 3;
+        return n;
+    }
+
+    private static void FinishPhysicsCensus()
+    {
+        var colliders = _censusColliders!;
+        _censusColliders = null;
+        _censusDue = -1f;
+        var movedStatic = new Dictionary<string, int>();
+        var movedKinematic = new Dictionary<string, int>();
+        var movedDynamic = new Dictionary<string, int>();
+        var triggers = new Dictionary<string, int>();
+        var touched = new Dictionary<string, int>();
+        var near = new Collider[256];
+        int statics = 0, kinematics = 0, dynamics = 0, enabled = 0, pairs = 0, triggerPairs = 0;
+        for (var i = 0; i < colliders.Length; i++)
+        {
+            var c = colliders[i];
+            if (c == null || !c.enabled || !c.gameObject.activeInHierarchy) continue;
+            enabled++;
+            if ((c.transform.position - _censusAt[i]).sqrMagnitude < 1e-8f) continue;
+            var key = CensusName(c);
+            var body = c.attachedRigidbody;
+            if (body == null)
+            {
+                statics++;
+                CensusAdd(movedStatic, key);
+            }
+            else if (body.isKinematic)
+            {
+                kinematics++;
+                CensusAdd(movedKinematic, key);
+            }
+            else
+            {
+                dynamics++;
+                CensusAdd(movedDynamic, key);
+            }
+
+            // What PhysX pairs it with: everything its bounds overlap on a layer it collides with
+            // (broadphase pairs), and the triggers among them (tested every step it moves).
+            var b = c.bounds;
+            var hits = Physics.OverlapBoxNonAlloc(b.center, b.extents, near, Quaternion.identity, ~0, QueryTriggerInteraction.Collide);
+            for (var h = 0; h < hits; h++)
+            {
+                var o = near[h];
+                if (o == c || o.attachedRigidbody == body || Physics.GetIgnoreLayerCollision(c.gameObject.layer, o.gameObject.layer)) continue;
+                pairs++;
+                if (!o.isTrigger && !c.isTrigger) continue;
+                triggerPairs++;
+                CensusAdd(touched, $"{CensusName(o)} ({o.GetType().Name}{(o is MeshCollider m ? m.convex ? " convex" : $" {Tris(m.sharedMesh)} tris" : "")}{(o.attachedRigidbody == null ? "" : ", on a body")})");
+            }
+
+            if (!c.isTrigger) continue;
+            var scale = c.transform.lossyScale;
+            var shape = c is SphereCollider sphere
+                ? $"sphere r={sphere.radius * Mathf.Max(Mathf.Abs(scale.x), Mathf.Max(Mathf.Abs(scale.y), Mathf.Abs(scale.z))):0.0}"
+                : c.GetType().Name;
+            CensusAdd(triggers, $"{key} ({shape})");
+        }
+
+        var awake = new Dictionary<string, int>();
+        foreach (var body in Object.FindObjectsByType<Rigidbody>(FindObjectsSortMode.None))
+        {
+            if (body == null || body.IsSleeping()) continue;
+            CensusAdd(awake, CensusName(body) + (body.isKinematic ? " kinematic" : "") +
+                             (body.collisionDetectionMode != CollisionDetectionMode.Discrete ? $" {body.collisionDetectionMode}" : ""));
+        }
+
+        Plugin.Log.LogInfo($"physics census: {enabled} enabled colliders; moved in 1 s: {statics} without a rigidbody, {kinematics} kinematic, {dynamics} dynamic; physics step {(_physicsKeepers.Length > 0 ? "running: " + _physicsKeepers : "idle")}");
+        Plugin.Log.LogInfo($"physics census, moved without a rigidbody: {CensusTop(movedStatic)}");
+        Plugin.Log.LogInfo($"physics census, kinematic moved: {CensusTop(movedKinematic)}");
+        Plugin.Log.LogInfo($"physics census, dynamic moved: {CensusTop(movedDynamic)}");
+        Plugin.Log.LogInfo($"physics census, triggers on moved things: {CensusTop(triggers)}");
+        Plugin.Log.LogInfo($"physics census, overlaps of moved things on colliding layers: {pairs}, with a trigger: {triggerPairs}: {CensusTop(touched)}");
+        Plugin.Log.LogInfo($"physics census, awake bodies: {CensusTop(awake)}");
+    }
+#endif
+
+
     internal static void Tick()
     {
         // Measured between our own calls, the same span the script timings cover (Unity's
         // deltaTime is the previous frame's, one frame off from them).
+#if DEBUG
+        if (_censusDue > 0f && Time.unscaledTime >= _censusDue) FinishPhysicsCensus();
+#endif
         var stamp = Stopwatch.GetTimestamp();
         var ms = _lastTickStamp == 0 ? Time.unscaledDeltaTime * 1000f : (float)((stamp - _lastTickStamp) * 1000.0 / Stopwatch.Frequency);
         _lastTickStamp = stamp;

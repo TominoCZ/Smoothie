@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 
 namespace Smoothie;
@@ -87,14 +88,26 @@ internal sealed unsafe class EnginePatch
     // camera each frame (~134k groups on Streets, ~5% of the main thread): distance, square root and
     // a call to CalculateLODMask, whose first act for a forced group is to hand back the forced byte
     // with no fade. The routine does that itself for forced groups (LodCulling forces the ones
-    // nothing can be seen of) and sends every other group Unity's own way.
+    // nothing can be seen of) and sends every other group Unity's own way. A group still forced
+    // from last time isn't even read: its result in the camera's own array says so (most of the
+    // loop's remaining cost was reading ~135k slots of 104 bytes; tools/engine-patches/lod_loop.s).
     internal static readonly EnginePatch LodLoop = new(
         "LOD loop", 0x4FC7C0,
         new byte[] { 0x4C, 0x8B, 0x6E, 0x08, 0x4A, 0x8D, 0x04, 0x03, 0x4C, 0x03, 0xEF, 0x48, 0x89, 0x84, 0x24, 0xB0, 0x00, 0x00, 0x00 },
         new byte[]
         {
-            0x4C, 0x39, 0xF3, 0x0F, 0x83, 0xC7, 0x00, 0x00, 0x00, 0x4C, 0x8B, 0x6E, 0x08, 0x49, 0x01, 0xFD,
-            0x4C, 0x8B, 0x84, 0x24, 0xA8, 0x00, 0x00, 0x00, 0x4A, 0x8D, 0x04, 0x03, 0x41, 0x0F, 0xB6, 0x4D,
+            0x48, 0x8B, 0x05, 0x89, 0x01, 0x00, 0x00, 0xFF, 0x00, 0x4C, 0x39, 0xF3, 0x0F, 0x83, 0x5E, 0x01,
+            0x00, 0x00, 0x4C, 0x8B, 0x84, 0x24, 0xA8, 0x00, 0x00, 0x00, 0x4A, 0x8D, 0x04, 0x03, 0x48, 0x8D,
+            0x53, 0x10, 0x4C, 0x39, 0xF2, 0x77, 0x72, 0x48, 0x8B, 0x0D, 0x62, 0x01, 0x00, 0x00, 0x8B, 0x09,
+            0x89, 0xDA, 0xC1, 0xEA, 0x0D, 0x31, 0xCA, 0xF6, 0xC2, 0x0F, 0x74, 0x5D, 0x8D, 0x53, 0x0F, 0xC1,
+            0xEA, 0x0D, 0x31, 0xCA, 0xF6, 0xC2, 0x0F, 0x74, 0x50, 0xF3, 0x0F, 0x6F, 0x00, 0xBA, 0x80, 0x80,
+            0x80, 0x80, 0x66, 0x0F, 0x6E, 0xCA, 0x66, 0x0F, 0x70, 0xC9, 0x00, 0x66, 0x0F, 0x74, 0xC1, 0x66,
+            0x0F, 0xD7, 0xD0, 0xF7, 0xD2, 0x81, 0xE2, 0xFF, 0xFF, 0x00, 0x00, 0x74, 0x18, 0x0F, 0xBC, 0xCA,
+            0x85, 0xC9, 0x74, 0x25, 0x48, 0x01, 0xCB, 0x48, 0x8D, 0x6C, 0x8D, 0x00, 0x48, 0x6B, 0xD1, 0x68,
+            0x48, 0x01, 0xD7, 0xEB, 0x84, 0x48, 0x83, 0xC3, 0x10, 0x48, 0x83, 0xC5, 0x40, 0x48, 0x81, 0xC7,
+            0x80, 0x06, 0x00, 0x00, 0xE9, 0x70, 0xFF, 0xFF, 0xFF, 0x80, 0x38, 0x80, 0x75, 0x17, 0x89, 0xD9,
+            0xC1, 0xE9, 0x0D, 0x48, 0x8B, 0x15, 0xE6, 0x00, 0x00, 0x00, 0x33, 0x0A, 0xF6, 0xC1, 0x0F, 0x0F,
+            0x85, 0xAB, 0x00, 0x00, 0x00, 0x4C, 0x8B, 0x6E, 0x08, 0x49, 0x01, 0xFD, 0x41, 0x0F, 0xB6, 0x4D,
             0x60, 0x84, 0xC9, 0x74, 0x0E, 0x88, 0x08, 0xC7, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE9, 0x8D,
             0x00, 0x00, 0x00, 0x48, 0x89, 0x84, 0x24, 0xB0, 0x00, 0x00, 0x00, 0xF3, 0x41, 0x0F, 0x10, 0x45,
             0x04, 0xF3, 0x41, 0x0F, 0x5C, 0x44, 0x24, 0x08, 0xF3, 0x41, 0x0F, 0x10, 0x55, 0x00, 0xF3, 0x41,
@@ -105,12 +118,13 @@ internal sealed unsafe class EnginePatch
             0x54, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x84, 0x24, 0xB0, 0x00, 0x00, 0x00, 0x44, 0x8B, 0x46, 0x2C,
             0x45, 0x0F, 0xB6, 0xCF, 0x48, 0x89, 0x6C, 0x24, 0x30, 0x0F, 0x28, 0xC8, 0x48, 0x89, 0x44, 0x24,
             0x28, 0x4C, 0x89, 0xE9, 0xF3, 0x0F, 0x11, 0x7C, 0x24, 0x20, 0xFF, 0x15, 0x20, 0x00, 0x00, 0x00,
-            0x48, 0xFF, 0xC3, 0x48, 0x83, 0xC5, 0x04, 0x48, 0x83, 0xC7, 0x68, 0xE9, 0x30, 0xFF, 0xFF, 0xFF,
+            0x48, 0xFF, 0xC3, 0x48, 0x83, 0xC5, 0x04, 0x48, 0x83, 0xC7, 0x68, 0xE9, 0x99, 0xFE, 0xFF, 0xFF,
             0xFF, 0x25, 0x02, 0x00, 0x00, 0x00, 0x66, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         },
         // back after the loop, CalculateLODMask, the square-root helper Unity calls for a negative value
-        (0xD8, 0x4FC872), (0xE0, 0x4FC400), (0xE8, 0x18343FC));
+        (0x178, 0x4FC872), (0x180, 0x4FC400), (0x188, 0x18343FC)) { _cellSlot = 0x190 };
 
     // NavMeshManager::UpdateNavMeshObstacles recomputes every NavMeshObstacle's world box each frame
     // (walks up its transform's parents, moved or not) for the CrowdManager's obstacle list (~5%
@@ -148,11 +162,34 @@ internal sealed unsafe class EnginePatch
         // the physics module pointer, the velocity call, the code after it
         (0x50, 0x1CF97E8), (0x58, 0xA47840), (0x60, 0xA47862));
 
+    // Every culling pass (several a frame) starts by counting the scene's lights to size its light
+    // buffers, walking LightManager's linked list of every enabled light, one cache miss per light
+    // (~2% of the main thread on Streets). The manager's set of the same lights, which is what the
+    // pass then works through, keeps its own count: the routine reads that, and walks only when it
+    // reads 0. tools/engine-patches/light_count.s says why that count is enough.
+    internal static readonly EnginePatch LightCount = new(
+        "light count", 0x3FC771,
+        new byte[]
+        {
+            0x45, 0x8B, 0xF0, 0x48, 0x8B, 0x41, 0x08, 0x48, 0x3B, 0xC1, 0x74, 0x14, 0x0F, 0x1F, 0x00, 0x48,
+            0x8B, 0x40, 0x08, 0x49, 0xFF, 0xC6, 0x48, 0x3B, 0xC1, 0x75, 0xF4,
+        },
+        new byte[]
+        {
+            0x44, 0x8B, 0x71, 0x1C, 0x45, 0x85, 0xF6, 0x75, 0x11, 0x48, 0x89, 0xC8, 0x48, 0x8B, 0x40, 0x08,
+            0x48, 0x39, 0xC8, 0x74, 0x05, 0x49, 0xFF, 0xC6, 0xEB, 0xF2, 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        },
+        // back to Unity's test of the count
+        (0x20, 0x3FC78C));
+
     private readonly string _name;
     private readonly long _targetRva;
     private readonly byte[] _original, _routine;
     // Routine offsets that hold an absolute address, and the RVA in UnityPlayer.dll to put there.
     private readonly (int Offset, long Rva)[] _addresses;
+    // Routine offset that gets the address of a writable 8-byte cell of its own, or -1.
+    private int _cellSlot = -1;
     private byte* _memory;
     private bool _applied;
     internal bool Applied => _applied;
@@ -178,6 +215,17 @@ internal sealed unsafe class EnginePatch
 
     private const uint MemCommitReserve = 0x3000, ExecuteRead = 0x20, ExecuteReadWrite = 0x40;
 
+    // A page of executable memory holding `code`, or null.
+    internal static byte* Executable(byte[] code)
+    {
+        var memory = (byte*)VirtualAlloc(IntPtr.Zero, (UIntPtr)4096, MemCommitReserve, ExecuteReadWrite);
+        if (memory == null) return null;
+        Marshal.Copy(code, 0, (IntPtr)memory, code.Length);
+        VirtualProtect((IntPtr)memory, (UIntPtr)4096, ExecuteRead, out _);
+        FlushInstructionCache(GetCurrentProcess(), (IntPtr)memory, (UIntPtr)4096);
+        return memory;
+    }
+
     internal void Set(bool on)
     {
         if (on == _applied) return;
@@ -196,45 +244,217 @@ internal sealed unsafe class EnginePatch
             return;
         }
 
-        for (var i = 0; i < _original.Length; i++)
+        if (!Matches(target, _original))
         {
-            if (target[i] == _original[i]) continue;
             Note = $"{_name}: Unity's code isn't what this patch expects, left alone";
             return;
         }
 
         if (_memory == null)
         {
-            var memory = (byte*)VirtualAlloc(IntPtr.Zero, (UIntPtr)4096, MemCommitReserve, ExecuteReadWrite);
-            if (memory == null)
+            var routine = (byte[])_routine.Clone();
+            foreach (var (offset, rva) in _addresses) BitConverter.GetBytes((long)(SceneSkip.Module + rva)).CopyTo(routine, offset);
+            if (_cellSlot >= 0)
+            {
+                var cell = Marshal.AllocHGlobal(8);
+                Marshal.WriteInt64(cell, 0);
+                BitConverter.GetBytes((long)cell).CopyTo(routine, _cellSlot);
+            }
+            _memory = Executable(routine);
+            if (_memory == null)
             {
                 Note = $"{_name}: no executable memory, left alone";
                 return;
             }
-
-            Marshal.Copy(_routine, 0, (IntPtr)memory, _routine.Length);
-            foreach (var (offset, rva) in _addresses) *(long*)(memory + offset) = (long)(SceneSkip.Module + rva);
-            VirtualProtect((IntPtr)memory, (UIntPtr)4096, ExecuteRead, out _);
-            FlushInstructionCache(GetCurrentProcess(), (IntPtr)memory, (UIntPtr)4096);
-            _memory = memory;
         }
 
-        // jmp [rip+0]; dq routine; the rest of the replaced bytes nop (never run)
-        var jump = new byte[_original.Length];
-        for (var i = 14; i < jump.Length; i++) jump[i] = 0x90;
-        jump[0] = 0xFF;
-        jump[1] = 0x25;
-        BitConverter.GetBytes((long)_memory).CopyTo(jump, 6);
-        Write(target, jump);
+        Write(target, Jump((IntPtr)_memory, _original.Length));
         _applied = true;
         Note = $"{_name}: on";
     }
 
-    private static void Write(byte* target, byte[] bytes)
+    internal static void Write(byte* target, byte[] bytes)
     {
         VirtualProtect((IntPtr)target, (UIntPtr)bytes.Length, ExecuteReadWrite, out var old);
         Marshal.Copy(bytes, 0, (IntPtr)target, bytes.Length);
         VirtualProtect((IntPtr)target, (UIntPtr)bytes.Length, old, out _);
         FlushInstructionCache(GetCurrentProcess(), (IntPtr)target, (UIntPtr)bytes.Length);
+    }
+
+    internal static bool Matches(byte* code, byte[] expected)
+    {
+        for (var i = 0; i < expected.Length; i++)
+            if (code[i] != expected[i]) return false;
+        return true;
+    }
+
+    // jmp [rip+0] to `to`, padded with nops (never run) to `length` bytes.
+    internal static byte[] Jump(IntPtr to, int length)
+    {
+        var code = new byte[length];
+        for (var i = 14; i < length; i++) code[i] = 0x90;
+        code[0] = 0xFF;
+        code[1] = 0x25;
+        BitConverter.GetBytes((long)to).CopyTo(code, 6);
+        return code;
+    }
+}
+
+// Bots' animators the throttle holds back, paused inside Unity instead of switched off: switching
+// one back on makes Unity walk its whole animation graph (src/SmoothieNative/animpause.c says
+// why, and how the two hooks there keep Unity from updating a listed animator). Same build and
+// same rules as EnginePatch: exact original bytes, written only from Plugin.Update, off puts
+// them back (after letting every paused animator go). Each hook replaces a function's first
+// whole instructions with a jump to SmoothieNative.dll; those instructions, followed by a jump
+// back, become the trampoline the hook calls to run Unity's original.
+internal static unsafe class AnimatorPause
+{
+    private const long UpdateAvatarsRva = 0xB16510, PrepareFrameRva = 0x76C950;
+    // mov rax,rsp; mov [rax+20h],r9b; mov [rax+18h],r8b; mov [rax+8],rcx
+    private static readonly byte[] UpdateAvatarsStart = { 0x48, 0x8B, 0xC4, 0x44, 0x88, 0x48, 0x20, 0x44, 0x88, 0x40, 0x18, 0x48, 0x89, 0x48, 0x08 };
+    // mov rax,rsp; mov [rax+8],rcx; push rbp; push r14; lea rbp,[rax-68h]
+    private static readonly byte[] PrepareFrameStart = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x48, 0x08, 0x55, 0x41, 0x56, 0x48, 0x8D, 0x68, 0x98 };
+    // Animator: its graph handle (node, version; the graph is the node's +0x28 when the versions
+    // match), read the way Animator::AddToManager reads it.
+    private const int GraphNode = 0x618, GraphVersion = 0x620, NodeVersion = 0x20, NodeGraph = 0x28;
+
+    private static readonly HashSet<UnityEngine.Animator> Paused = new(Diagnostics.ReferenceComparer.Instance);
+    private static readonly List<UnityEngine.Animator> Gone = new();
+    private static bool _applied, _failed;
+    private static SetFn? _set;
+    internal static string Note = "off";
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void InitFn(IntPtr updateAvatars, IntPtr prepareFrame);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void SetFn(IntPtr* animators, IntPtr* graphs, int count);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr GetModuleHandleW(string name);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
+    private static extern IntPtr GetProcAddress(IntPtr module, string name);
+
+    // Every frame from Plugin.Update.
+    internal static void Sync(bool want)
+    {
+        if (want && !_applied && !_failed) Apply();
+        else if (!want && _applied) Remove();
+        // Animators get destroyed and graphs rebuilt: the list is redone every frame.
+        if (_applied && Paused.Count > 0) Publish();
+    }
+
+    // True when paused this way; false: not available, switch it off instead.
+    internal static bool Hold(UnityEngine.Animator animator)
+    {
+        if (!_applied) return false;
+        if (Paused.Add(animator)) Publish();
+        return true;
+    }
+
+    // True when it was paused this way (and now runs again).
+    internal static bool Release(UnityEngine.Animator animator)
+    {
+        if (!Paused.Remove(animator)) return false;
+        Publish();
+        return true;
+    }
+
+    private static void Publish()
+    {
+        var animators = stackalloc IntPtr[Math.Max(1, Paused.Count)];
+        var graphs = stackalloc IntPtr[Math.Max(1, Paused.Count)];
+        var n = 0;
+        foreach (var animator in Paused)
+        {
+            // Destroyed: dropped.
+            var native = (byte*)SceneSkip.NativeOf(animator);
+            if (native == null)
+            {
+                Gone.Add(animator);
+                continue;
+            }
+
+            animators[n] = (IntPtr)native;
+            graphs[n] = GraphOf(native);
+            n++;
+        }
+
+        foreach (var animator in Gone) Paused.Remove(animator);
+        Gone.Clear();
+        _set?.Invoke(animators, graphs, n);
+    }
+
+    private static IntPtr GraphOf(byte* animator)
+    {
+        var node = *(byte**)(animator + GraphNode);
+        if (node == null || *(uint*)(node + NodeVersion) != (*(uint*)(animator + GraphVersion) & ~1u)) return IntPtr.Zero;
+        return *(IntPtr*)(node + NodeGraph);
+    }
+
+    private static void Apply()
+    {
+        _failed = true;
+        if (!SceneSkip.Check())
+        {
+            Note = SceneSkip.Note;
+            return;
+        }
+
+        var native = GetModuleHandleW("SmoothieNative.dll");
+        var init = GetProcAddress(native, "SmoothieAnimInit");
+        var set = GetProcAddress(native, "SmoothieAnimSet");
+        var updateHook = GetProcAddress(native, "SmoothieUpdateAvatars");
+        var prepareHook = GetProcAddress(native, "SmoothiePrepareFrame");
+        if (native == IntPtr.Zero || init == IntPtr.Zero || set == IntPtr.Zero || updateHook == IntPtr.Zero || prepareHook == IntPtr.Zero)
+        {
+            Note = "SmoothieNative.dll missing or too old: off";
+            return;
+        }
+
+        var updateAvatars = SceneSkip.Module + UpdateAvatarsRva;
+        var prepareFrame = SceneSkip.Module + PrepareFrameRva;
+        if (!EnginePatch.Matches(updateAvatars, UpdateAvatarsStart) || !EnginePatch.Matches(prepareFrame, PrepareFrameStart))
+        {
+            Note = "Unity's animator code isn't what this expects: off";
+            return;
+        }
+
+        var updateTrampoline = EnginePatch.Executable(Trampoline(UpdateAvatarsStart, updateAvatars));
+        var prepareTrampoline = EnginePatch.Executable(Trampoline(PrepareFrameStart, prepareFrame));
+        if (updateTrampoline == null || prepareTrampoline == null)
+        {
+            Note = "no executable memory: off";
+            return;
+        }
+
+        Marshal.GetDelegateForFunctionPointer<InitFn>(init)((IntPtr)updateTrampoline, (IntPtr)prepareTrampoline);
+        _set = Marshal.GetDelegateForFunctionPointer<SetFn>(set);
+        _set(null, null, 0);
+        EnginePatch.Write(updateAvatars, EnginePatch.Jump(updateHook, UpdateAvatarsStart.Length));
+        EnginePatch.Write(prepareFrame, EnginePatch.Jump(prepareHook, PrepareFrameStart.Length));
+        _applied = true;
+        _failed = false;
+        Note = "on";
+    }
+
+    private static void Remove()
+    {
+        Paused.Clear();
+        _set?.Invoke(null, null, 0);
+        EnginePatch.Write(SceneSkip.Module + UpdateAvatarsRva, UpdateAvatarsStart);
+        EnginePatch.Write(SceneSkip.Module + PrepareFrameRva, PrepareFrameStart);
+        _applied = false;
+        Note = "off";
+    }
+
+    // Unity's first instructions, then a jump back to the one after them.
+    private static byte[] Trampoline(byte[] start, byte* function)
+    {
+        var code = new byte[start.Length + 14];
+        start.CopyTo(code, 0);
+        EnginePatch.Jump((IntPtr)(function + start.Length), 14).CopyTo(code, start.Length);
+        return code;
     }
 }
