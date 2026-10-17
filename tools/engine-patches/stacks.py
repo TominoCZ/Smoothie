@@ -15,7 +15,7 @@ Record (the main thread's id is the game's pid; no bots needed unless bots are t
   pid=$(pgrep -f 'EscapeFromTarkov.exe' | while read p; do [ "$(cat /proc/$p/comm)" = EscapeFromTarko ] && echo $p; done)
   perf record -e cycles -F 999 -t $pid --call-graph dwarf,65528 -o x.data -- sleep 10
   cp /proc/$pid/maps x.maps
-All threads (job workers, render thread) instead: -p $pid in place of -t $pid, --threads in the
+All threads (job workers, render thread) instead: -p $pid in place of -t $pid, --threads (or --tid N) in the
 report; -F 499 and dwarf,32768 keep the file to a few hundred MB.
 Report:
   stacks.py x.data x.maps --syms UnityPlayer.dll=<publics.txt> --syms mono-2.0-bdwgc.dll=<publics.txt>
@@ -510,12 +510,15 @@ def main():
     ap.add_argument('--min', type=float, default=0.5, help='tree/focus: hide below this %%')
     ap.add_argument('--check', action='store_true')
     ap.add_argument('--threads', action='store_true', help='recorded with -p: group stacks under their thread (job workers merged)')
+    ap.add_argument('--tid', type=int, help='recorded with -p: only this thread (the main thread\'s id is the game\'s pid)')
     a = ap.parse_args()
     mods = Modules(a.maps, dict(s.split('=', 1) for s in a.syms))
 
     stacks, hows, tids, ends, scans = [], [], [], collections.Counter(), 0
     thread_names = {}
     for ip, uip, regs, stack, tid in samples(a.data, thread_names):
+        if a.tid is not None and tid != a.tid:
+            continue
         tids.append(tid)
         frames, how, scanned = unwind(ip, uip, regs, stack, mods)
         stacks.append(frames)
