@@ -121,6 +121,10 @@ internal static class DepthCulling
         public int[] CellOf = null!;
         // What the last check made of each cell (debug view): CellOut, CellIdle, CellCovered, CellTested.
         public byte[] CellState = null!;
+        // Out of view at its last check with nothing in it covered or hidden: stays so until it's
+        // checked in view again (only that marks anything covered, and only that gets hidden), so
+        // it isn't walked meanwhile. The worker's.
+        public bool[] CellQuiet = null!;
         public byte[] Streak = null!;
         // Why each unit is or isn't hidden after the last round (the census reads it).
         public byte[] Why = null!;
@@ -176,6 +180,14 @@ internal static class DepthCulling
     private const int Idle = 0, Reading = 1, Testing = 2, Ready = 3;
     private static int _state;
     private static int _epoch, _roundEpoch, _roundId, _requestFrame;
+    // The readback in flight. Unity asks the render thread about it once a frame, at the start,
+    // and reads the answer only at the next start: a copy the GPU finished early in a frame landed
+    // two frames later. Asking again in Update and the main camera's pre-cull (Poll) gets the
+    // answer within the frame; Update() runs the callback itself once it's there.
+    private static AsyncGPUReadbackRequest _pending;
+    // A new depth is asked for at most this often (the slowest round rate before results landed
+    // sooner), so landing sooner never means more rounds.
+    private const int MinRoundFrames = 4;
     // How the depth copy travels (averages, overlay): frames and ms from asking for it to
     // having it, how old a result is in frames when it's applied, frames between results.
     private static float _arriveFrames, _arriveMs, _appliedAge, _resultEvery;
@@ -238,6 +250,11 @@ internal static class DepthCulling
     private static Vector3[] _lampMin = Array.Empty<Vector3>(), _lampMax = Array.Empty<Vector3>(), _lampAt = Array.Empty<Vector3>();
     private static bool[] _lampWant = Array.Empty<bool>(), _lampOff = Array.Empty<bool>();
     private static byte[] _lampStreak = Array.Empty<byte>();
+    // As objects' NextCheck, CheckedFrom and Slack (TestLamps). The worker's.
+    private static float[] _lampNextCheck = Array.Empty<float>(), _lampSlack = Array.Empty<float>();
+    private static Vector3[] _lampCheckedFrom = Array.Empty<Vector3>();
+    // Its whole lit area was on screen when last found covered (TestLamps). The worker's.
+    private static bool[] _lampWhole = Array.Empty<bool>();
     private static int[] _lampMaskWas = Array.Empty<int>();
     // Whether each lamp is on (active and enabled), asked LampsPerRound at a time: Streets has
     // ~3,800 lamps, and asking all of them every round cost the main thread ~0.4 ms. A lamp the
@@ -245,6 +262,32 @@ internal static class DepthCulling
     private static bool[] _lampActive = Array.Empty<bool>();
     private static int _lampCursor;
     private const int LampsPerRound = 256;
+    // Lamps in groups of LampGroup neighbours (sorted by LampCell at the scan), each with a box
+    // holding all of theirs: a group wholly out of view is judged at once. Most of Streets' lamps
+    // are out of view, and asking each cost a round about as much as all its objects' tests.
+    private const int LampGroup = 32;
+    private static Vector3[] _lampGroupMin = Array.Empty<Vector3>(), _lampGroupMax = Array.Empty<Vector3>();
+
+    private static long LampCell(Light light)
+    {
+        var p = light.transform.position;
+        return ((long)Mathf.FloorToInt(p.x / CellSize) << 32) + Mathf.FloorToInt(p.z / CellSize);
+    }
+
+    private static void TakeLampGroup(int g)
+    {
+        var from = g * LampGroup;
+        var to = Math.Min(_lamps.Length, from + LampGroup);
+        Vector3 min = _lampMin[from], max = _lampMax[from];
+        for (var l = from + 1; l < to; l++)
+        {
+            min = Vector3.Min(min, _lampMin[l]);
+            max = Vector3.Max(max, _lampMax[l]);
+        }
+
+        _lampGroupMin[g] = min;
+        _lampGroupMax[g] = max;
+    }
     // A lamp's lit area on the round's screen (0-1, may reach past it; the worker's), and for a
     // skipped one as its result was applied, with that round's view: a turn may bring in the part
     // past the screen's edge, which wasn't checked (KeepLampsInView).
@@ -290,6 +333,7 @@ internal static class DepthCulling
     internal static void Enable()
     {
         Camera.onPreCull += PreCull;
+        Camera.onPreRender += StartAfterCull;
         Camera.onPostRender += DrawCells;
         new PyramidBuiltPatch(nameof(GPUInstancerHiZOcclusionGenerator.OnEndCameraRendering)).Enable();
         new PyramidBuiltPatch(nameof(GPUInstancerHiZOcclusionGenerator.OnEndCameraRenderingBlit)).Enable();
@@ -494,7 +538,12 @@ internal static class DepthCulling
                 && (skipLayers & (1 << light.gameObject.layer)) == 0 && !Moves(light.transform, moving)) lamps.Add(light);
         }
 
-        SetLamps(lamps.ToArray());
+        // Neighbours next to each other, so a group of them can be judged out of view at once (TestLamps).
+        var lampArray = lamps.ToArray();
+        var cells = new long[lampArray.Length];
+        for (var l = 0; l < cells.Length; l++) cells[l] = LampCell(lampArray[l]);
+        Array.Sort(cells, lampArray);
+        SetLamps(lampArray);
         var areas = new List<AreaLight>();
         var boxes = new List<Bounds>();
         foreach (var area in UnityEngine.Object.FindObjectsByType<AreaLight>(FindObjectsInactive.Include, FindObjectsSortMode.None))
@@ -541,12 +590,18 @@ internal static class DepthCulling
         _lampWant = new bool[n];
         _lampOff = new bool[n];
         _lampStreak = new byte[n];
+        _lampNextCheck = new float[n];
+        _lampSlack = new float[n];
+        _lampCheckedFrom = new Vector3[n];
+        _lampWhole = new bool[n];
         _lampMaskWas = new int[n];
         _lampActive = new bool[n];
         _lampCursor = 0;
         _lampRect = new Vector4[n];
         _lampSkipRect = new Vector4[n];
         _lampTransform = new Transform?[n];
+        _lampGroupMin = new Vector3[(n + LampGroup - 1) / LampGroup];
+        _lampGroupMax = new Vector3[_lampGroupMin.Length];
         _offList = new int[n];
         _offCount = 0;
         _lampsPastEdge = 0;
@@ -556,6 +611,8 @@ internal static class DepthCulling
             TakeLampBox(l);
             _lampActive[l] = lamps[l] != null && lamps[l].isActiveAndEnabled;
         }
+
+        for (var g = 0; g < _lampGroupMin.Length; g++) TakeLampGroup(g);
     }
 
     // A lamp's box and where it was taken: at the scan, then one lamp per round (a lamp that moved
@@ -615,7 +672,7 @@ internal static class DepthCulling
         for (var l = 0; l < _lamps.Length; l++)
         {
             // Most lamps: not skipped and not wanted, nothing to do (no call into the engine).
-            // Wanted implies tested this round (TestLamps resets the streak of an untested one).
+            // Wanted implies in view this round (TestLamps resets the streak of one out of view).
             var wanted = on && _lampWant[l];
             if (!wanted && !_lampOff[l]) continue;
             if (wanted && !_lampOff[l])
@@ -875,7 +932,8 @@ internal static class DepthCulling
     private static bool HidesShadows => Plugin.On(Plugin.HideShadows);
 
     // Anything that can move or be used: physics bodies, animated parts, doors and other
-    // interactive objects, players. Remembered per transform, since objects share parents.
+    // interactive objects, players, trains (Reserve, Lighthouse: static props moved by script).
+    // Remembered per transform, since objects share parents.
     internal static bool Moves(Transform transform, Dictionary<Transform, bool> known)
     {
         if (transform == null) return false;
@@ -885,6 +943,7 @@ internal static class DepthCulling
             || transform.TryGetComponent<Animation>(out _)
             || transform.TryGetComponent<EFT.Interactive.InteractableObject>(out _)
             || transform.TryGetComponent<Player>(out _)
+            || transform.TryGetComponent<EFT.MovingPlatforms.MovingPlatform>(out _)
             || Moves(transform.parent, known);
         known[transform] = moves;
         return moves;
@@ -1045,6 +1104,7 @@ internal static class DepthCulling
         set.CellMin = cellMin.ToArray();
         set.CellMax = cellMax.ToArray();
         set.CellState = new byte[set.CellMin.Length];
+        set.CellQuiet = new bool[set.CellMin.Length];
         set.CellOf = new int[count];
         for (var c = 0; c < set.CellMin.Length; c++)
         for (var i = set.CellStart[c]; i < set.CellStart[c + 1]; i++) set.CellOf[i] = c;
@@ -1086,6 +1146,9 @@ internal static class DepthCulling
     {
         var set = _set;
         if (set == null || !ReferenceEquals(camera, _camera) || Time.frameCount - _activeFrame > 1) return;
+        _inPreCull = true;
+        Poll(); // Read times itself
+        _inPreCull = false;
         var start = Stopwatch.GetTimestamp();
         try
         {
@@ -1180,9 +1243,11 @@ internal static class DepthCulling
             _gearParts = parts.ToArray();
         }
 
+        // Only parts Unity drew last frame: only those are in the depth image (one that just came on
+        // counts as world cover for a round, which only keeps more drawn).
         foreach (var part in _gearParts)
         {
-            if (part == null || !part.enabled || !part.gameObject.activeInHierarchy) continue;
+            if (!Drawn(part)) continue;
             var bounds = part.bounds;
             if (!Project(bounds.min, bounds.max, ref m, out var xMin, out var yMin, out var xMax, out var yMax, out var near, out var far)) continue;
             Pyramid.AddGear(xMin, yMin, xMax, yMax, near, far);
@@ -1275,6 +1340,18 @@ internal static class DepthCulling
         {
             Status = _generator == null ? "no depth pyramid on this map" : _viewFrame < 0 ? "the camera's view was never captured" : "the depth pyramid isn't built";
         }
+        else
+        {
+            StartAfterCull(camera);
+            Poll();
+        }
+#if DEBUG
+        if (_testNote is { } note)
+        {
+            _testNote = null;
+            Plugin.Log.LogInfo($"{DateTime.Now:HH:mm:ss.fff} {note}");
+        }
+#endif
     }
 
     // The camera's depth pyramid generator: the grass system's, or on maps without grass
@@ -1385,11 +1462,29 @@ internal static class DepthCulling
         });
     }
 
+    private static void Poll()
+    {
+        if (_state == Reading) _pending.Update();
+    }
+
+    // A depth read at the main camera's pre-cull starts its check once the cull is over (its
+    // onPreRender; Tick if the camera never got there): started at once, the check's lanes would
+    // compete with Unity's culling jobs, which the main thread waits for.
+    private static bool _inPreCull;
+    private static Set? _afterCull;
+
+    private static void StartAfterCull(Camera camera)
+    {
+        if (_afterCull is not { } set || !ReferenceEquals(camera, _camera)) return;
+        _afterCull = null;
+        if (_state == Testing) Task.Run(() => Test(set));
+    }
+
     // Right after the grass system built this frame's depth pyramid.
     private static void Request(GPUInstancerHiZOcclusionGenerator generator, Camera camera)
     {
         if (_set == null || _state != Idle || !ReferenceEquals(camera, _camera) || _viewFrame != Time.frameCount
-            || Time.frameCount - _activeFrame > 1) return;
+            || Time.frameCount - _activeFrame > 1 || Time.frameCount - _requestFrame < MinRoundFrames) return;
         var texture = generator.hiZDepthTexture;
         if (texture == null) return;
         var start = Stopwatch.GetTimestamp();
@@ -1416,7 +1511,9 @@ internal static class DepthCulling
         var lampCount = _lamps.Length;
         if (lampCount > 0)
         {
-            TakeLampBox(_roundId % lampCount);
+            var retaken = _roundId % lampCount;
+            TakeLampBox(retaken);
+            TakeLampGroup(retaken / LampGroup);
             for (var k = Math.Min(LampsPerRound, lampCount); k > 0; k--)
             {
                 var light = _lamps[_lampCursor];
@@ -1434,7 +1531,7 @@ internal static class DepthCulling
         _requestFrame = Time.frameCount;
         _state = Reading;
         var id = ++_roundId;
-        AsyncGPUReadback.Request(texture, mip, TextureFormat.RFloat, request => Read(request, id));
+        _pending = AsyncGPUReadback.Request(texture, mip, TextureFormat.RFloat, request => Read(request, id));
         _frameTicks += Stopwatch.GetTimestamp() - start;
         PartTicks[PartRequest] += Stopwatch.GetTimestamp() - start;
     }
@@ -1777,6 +1874,7 @@ internal static class DepthCulling
         if (_recheckAll)
         {
             Array.Clear(set.NextCheck, 0, set.NextCheck.Length);
+            Array.Clear(_lampNextCheck, 0, _lampNextCheck.Length);
             _recheckAll = false;
         }
 
@@ -1785,12 +1883,20 @@ internal static class DepthCulling
             Array.Clear(set.Streak, 0, set.Streak.Length);
             Array.Clear(set.NextCheck, 0, set.NextCheck.Length);
             Array.Clear(_lampStreak, 0, _lampStreak.Length);
+            Array.Clear(_lampNextCheck, 0, _lampNextCheck.Length);
             Array.Clear(_areaStreak, 0, _areaStreak.Length);
             _resetStreaks = false;
         }
 
         _state = Testing;
-        Task.Run(() => Test(set));
+        if (_inPreCull)
+        {
+            _afterCull = set;
+#if DEBUG
+            _testAfterCull++;
+#endif
+        }
+        else Task.Run(() => Test(set));
         _frameTicks += Stopwatch.GetTimestamp() - start;
         PartTicks[PartRead] += Stopwatch.GetTimestamp() - start;
     }
@@ -1804,12 +1910,15 @@ internal static class DepthCulling
             var m = _roundViewProjection;
             Pyramid.Build(_depth, _width, _height);
             if (_roundScopeDepth) ScopePyramid.Build(_scopeDepth, _scopeWidth, _scopeHeight);
+            long phase = start, pyramidTicks = 0, lanesTicks = 0;
+            Stamp(ref pyramidTicks, ref phase);
             SetPlanes(Planes, ref m);
             TakePlanes();
             _testMatrix = m;
             foreach (var lane in Lanes) lane.Clear();
             _nextClaim = 0;
             Parallel.For(0, Lanes.Length, k => RunLane(set, Lanes[k]));
+            Stamp(ref lanesTicks, ref phase);
 
             // Merged in lane order: each lane's lists hold its own units, in the order it found them.
             set.Want.Clear();
@@ -1857,6 +1966,7 @@ internal static class DepthCulling
                      + (_roundReach.sqrMagnitude > 0.0001f ? $"; moving {_roundReach.x:0.00} m sideways, {_roundReach.y:0.00} up, {_roundReach.z:0.00} forward before the next result, {MovingKept} kept drawn for it, {GearParts} parts of what you hold not counted as sliding cover" + (MovingKept > 0 ? $" (grown up to {_movingGrow:0.0} texels, cover as near as {_movingCover:0.0} m)" : "") : "")
                      + (_roundLamps ? $"; lamps: {LampsOff} of {_lamps.Length} skipped (their lit area covered); area lights: {AreasOff} of {_areas.Length} skipped" : "")
                      + (_roundScoped ? _roundScopeDepth ? $"; scope: {_scopeWidth}x{_scopeHeight} depth, {ScopeTested} checked against it, view {ScopeFov:0.0}°, lead {ScopeLeadDegrees:0.0}°" : "; scope: no depth of its own, its view stays drawn" : "");
+            TimeParts(pyramidTicks, lanesTicks, Stopwatch.GetTimestamp() - phase);
         }
         catch (Exception ex)
         {
@@ -1878,12 +1988,16 @@ internal static class DepthCulling
         var lampClaims = (_lamps.Length + LampsPerClaim - 1) / LampsPerClaim;
         var claims = cellClaims + lampClaims + (_areas.Length + LampsPerClaim - 1) / LampsPerClaim;
         int claim;
+        long since = 0;
+        Mark(ref since);
         while ((claim = Interlocked.Increment(ref _nextClaim) - 1) < claims)
         {
             if (claim < cellClaims)
             {
                 var end = Math.Min(cells, (claim + 1) * CellsPerClaim);
                 for (var c = claim * CellsPerClaim; c < end; c++) TestCell(set, lane, c, eye, now, round, ref m);
+                Stamp(ref lane.CellTicks, ref since);
+                continue;
             }
             else if (claim < cellClaims + lampClaims)
             {
@@ -1895,12 +2009,16 @@ internal static class DepthCulling
                 var from = (claim - cellClaims - lampClaims) * LampsPerClaim;
                 TestAreas(lane, from, Math.Min(_areas.Length, from + LampsPerClaim), ref m);
             }
+
+            Stamp(ref lane.LampTicks, ref since);
         }
     }
 
-    private static void TestCell(Set set, Lane lane, int c, Vector3 eye, float now, int round, ref Matrix4x4 m)
+    private static unsafe void TestCell(Set set, Lane lane, int c, Vector3 eye, float now, int round, ref Matrix4x4 m)
     {
         int from = set.CellStart[c], to = set.CellStart[c + 1];
+        long since = 0;
+        Mark(ref since);
         var cellMin = set.CellMin[c];
         var cellMax = set.CellMax[c];
         set.CellState[c] = CellOut;
@@ -1908,29 +2026,63 @@ internal static class DepthCulling
         {
             // Unity doesn't draw any of it.
             lane.OutCells++;
+            if (set.CellQuiet[c]) return;
+            var quiet = true;
             for (var i = from; i < to; i++)
             {
-                if (set.Streak[i] != 0 || set.Off[i] != null) KeepOutOfView(set, lane, i, eye, round);
+                if (set.Streak[i] == 0 && set.Off[i] == null) continue;
+                KeepOutOfView(set, lane, i, eye, round);
+                quiet &= set.Streak[i] == 0 && set.Off[i] == null;
             }
 
+            set.CellQuiet[c] = quiet;
+            Count(ref lane.WalkedOut, to - from);
+            Stamp(ref lane.WalkTicks, ref since);
             return;
         }
 
         // Nothing in it due (all showed a moment ago, or covered with the eye still): skip.
+        set.CellQuiet[c] = false;
         var due = lane.Due;
         due.Clear();
+        // Due? Showed: checked again after a while. Covered: turning changes nothing, so only once
+        // the eye moved enough to shift its nearest cover by a texel (or after a while: doors, bots).
+        // Covered but not drawn by the game when Apply last asked (most covered objects): nothing
+        // to hide or show, so not checked until it's asked again; then it's checked in that round,
+        // so the answer it's hidden on is fresh. Every object of every cell in view, every round,
+        // so the arrays are pinned and read through pointers (the game's Mono JIT keeps each array
+        // access's bounds check).
+        var off = set.Off;
+        var gameTime = _roundGameTime;
+        fixed (float* retryAt = set.RetryAt, nextCheck = set.NextCheck, slack = set.Slack)
+        fixed (byte* streak = set.Streak)
+        fixed (Vector3* checkedFrom = set.CheckedFrom)
         for (var i = from; i < to; i++)
         {
-            if (Due(set, i, eye, now)) due.Add(i);
-            else if (set.Streak[i] >= HideAfter)
+            bool isDue;
+            if (off[i] == null && retryAt[i] > gameTime) isDue = false;
+            else if (now >= nextCheck[i]) isDue = true;
+            else if (streak[i] == 0) isDue = false;
+            else
+            {
+                var at = checkedFrom + i;
+                float dx = eye.x - at->x, dy = eye.y - at->y, dz = eye.z - at->z;
+                isDue = dx * dx + dy * dy + dz * dz >= slack[i];
+            }
+
+            if (isDue) due.Add(i);
+            else if (streak[i] >= HideAfter)
             {
                 Wanted(set, lane, i, round);
                 // A cell is often only partly in view: only what's in view itself is worth a
                 // try, and only one Apply will try (not hidden yet, not waiting to retry).
-                if (set.Off[i] == null && set.RetryAt[i] <= _roundGameTime && !OutOfView(set.Min[i], set.Max[i]) && !GameSkips(set, lane, i)) lane.Try.Add(i);
+                if (off[i] == null && retryAt[i] <= gameTime && !OutOfView(set.Min[i], set.Max[i]) && !GameSkips(set, lane, i)) lane.Try.Add(i);
             }
         }
 
+        Count(ref lane.Walked, to - from);
+        Count(ref lane.DueCount, due.Count);
+        Stamp(ref lane.WalkTicks, ref since);
         set.CellState[c] = CellIdle;
         if (due.Count == 0) return;
         // Most cells are far: then none of their objects is near either.
@@ -1993,21 +2145,58 @@ internal static class DepthCulling
     }
 
     // Lamps: covered HideAfter rounds in a row (as objects), shown on the first that isn't.
-    // Only the part on screen is checked; where the box lands is kept for the turn check.
+    // Only the part on screen is checked; where the box lands is kept for the turn check. Checked
+    // again on the objects' terms (Due): one found showing after VisibleRecheck; one found covered
+    // after that too, or as soon as the eye moved far enough for its nearest cover to shift by a
+    // texel (CoveredSlack, which also grows it while moving). A covered one only keeps its verdict
+    // if its whole lit area was on screen when checked: then a turn can't bring in a part that
+    // wasn't (as area lights); one reaching past the edge is checked every round, as before. Out
+    // of view or switched off: as before, and checked at once when back.
     private static void TestLamps(Lane lane, int from, int to, ref Matrix4x4 m)
     {
-        for (var l = from; l < to; l++)
+        var eye = _roundEye;
+        var now = _roundTime;
+        // Claims start on a group's first lamp (LampsPerClaim is a multiple of LampGroup).
+        for (var g = from; g < to; g += LampGroup)
+        for (int l = g, end = Math.Min(to, g + LampGroup), outOfView = -1; l < end; l++)
         {
             // _lampActive is only written between rounds (Request, SetLamps).
             var test = _roundLamps && _lampActive[l];
-            var why = test ? BoxWhy(lane, _lampMin[l], _lampMax[l], ref m) : WhyOutOfView;
-            var covered = why == WhyCovered;
+            // A group wholly out of view: so is each of its lamps (what BoxWhy would find), asked once.
+            if (test && outOfView < 0) outOfView = OutOfView(_lampGroupMin[g / LampGroup], _lampGroupMax[g / LampGroup]) ? 1 : 0;
             if (test) lane.LampsOn++;
-            if (test && why != WhyOutOfView) lane.LampsInView++;
+            var inView = test && outOfView == 0 && !OutOfView(_lampMin[l], _lampMax[l]);
+            var streak = _lampStreak[l];
+            if (inView && now < _lampNextCheck[l] && (streak == 0 || _lampWhole[l] && (eye - _lampCheckedFrom[l]).sqrMagnitude < _lampSlack[l]))
+            {
+                // Not due: its last verdict stands. A covered one keeps the box it was checked with,
+                // wholly on screen, so the turn check leaves it alone: all of it was checked.
+                lane.LampsInView++;
+                continue;
+            }
+
+            if (inView) Count(ref lane.LampTests, 1);
+            var why = inView ? BoxWhy(lane, _lampMin[l], _lampMax[l], ref m) : WhyOutOfView;
+            var covered = why == WhyCovered;
+            if (why != WhyOutOfView) lane.LampsInView++;
+            _lampWhole[l] = false;
             if (covered && Project(_lampMin[l], _lampMax[l], ref m, out var lx0, out var ly0, out var lx1, out var ly1, out _, out _))
+            {
                 _lampRect[l] = new Vector4(lx0, ly0, lx1, ly1);
-            _lampStreak[l] = covered ? (byte)Math.Min(_lampStreak[l] + 1, HideAfter) : (byte)0;
+                _lampWhole[l] = OnScreen(_lampRect[l]);
+            }
+
+            _lampStreak[l] = covered ? (byte)Math.Min(streak + 1, HideAfter) : (byte)0;
             _lampWant[l] = _lampStreak[l] >= HideAfter;
+            if (covered)
+            {
+                var slack = lane.UsedScope ? 0f : CoveredSlack(lane);
+                _lampCheckedFrom[l] = eye;
+                _lampSlack[l] = slack * slack;
+                // Not confirmed yet: checked again next round.
+                _lampNextCheck[l] = _lampStreak[l] < HideAfter ? now : now + VisibleRecheck * (0.75f + (l & 15) / 30f);
+            }
+            else _lampNextCheck[l] = why == WhyOutOfView ? 0f : now + VisibleRecheck * (0.75f + (l & 15) / 30f);
         }
     }
 
@@ -2034,22 +2223,6 @@ internal static class DepthCulling
         return why == WhyCovered ? "covered, counting down to hide" : why < WhyText.Length ? WhyText[why] : "unknown";
     }
 
-    // Showed: checked again after a while. Covered: turning changes nothing, so only once the
-    // eye moved enough to shift its nearest cover by a texel (or after a while: doors, bots).
-    // Covered but not drawn by the game when Apply last asked (most covered objects): nothing
-    // to hide or show, so not checked until it's asked again; then it's checked in that round,
-    // so the answer it's hidden on is fresh.
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static bool Due(Set set, int i, Vector3 eye, float now)
-    {
-        if (set.Off[i] == null && set.RetryAt[i] > _roundGameTime) return false;
-        if (now >= set.NextCheck[i]) return true;
-        if (set.Streak[i] == 0) return false;
-        var from = set.CheckedFrom[i];
-        float dx = eye.x - from.x, dy = eye.y - from.y, dz = eye.z - from.z;
-        return dx * dx + dy * dy + dz * dz >= set.Slack[i];
-    }
-
     // One worker thread's share of a round: its scratch, what it found, and its counts, merged
     // into the round's after all lanes finish. Every unit, cell and lamp is handled by exactly
     // one lane, so the per-unit arrays need no locking.
@@ -2066,6 +2239,11 @@ internal static class DepthCulling
         // The last box BoxWhy put on screen (0-1), its nearest depth, and what covered it, for CoveredSlack.
         public float X0, Y0, X1, Y1, Nearest, NearestCover;
         public bool GearCover;
+        // Where the round's time goes (Debug builds only, TimeParts): time on cells (of which
+        // walking them for due objects) and on lamps, objects walked in cells in and out of
+        // view, and how many were due.
+        public long CellTicks, WalkTicks, LampTicks;
+        public int Walked, WalkedOut, DueCount, LampTests;
 
         public void Clear()
         {
@@ -2073,6 +2251,8 @@ internal static class DepthCulling
             Try.Clear();
             Stale.Clear();
             Tested = OutCells = CoveredCells = ScopeTested = Moving = Deep = GameSkipped = LampsOn = LampsInView = 0;
+            CellTicks = WalkTicks = LampTicks = 0;
+            Walked = WalkedOut = DueCount = LampTests = 0;
             MovingGrow = 0f;
             MovingCover = float.MaxValue;
         }
@@ -2089,6 +2269,80 @@ internal static class DepthCulling
         for (var k = 0; k < count; k++) lanes[k] = new Lane();
         return lanes;
     }
+
+    // Round timing for Debug builds (calls vanish in Release): Mark starts a span, Stamp adds the
+    // time since into a total and starts the next.
+    [Conditional("DEBUG")]
+    private static void Mark(ref long since) => since = Stopwatch.GetTimestamp();
+
+    [Conditional("DEBUG")]
+    private static void Stamp(ref long into, ref long since)
+    {
+        var t = Stopwatch.GetTimestamp();
+        into += t - since;
+        since = t;
+    }
+
+    [Conditional("DEBUG")]
+    private static void Count(ref int into, int n) => into += n;
+
+    // Debug test log, every TestLogSeconds: where the worker's rounds spent their time (average and
+    // worst, ms; walking, testing and lamps summed over lanes), how many objects a round walked and
+    // tested, and how late results are. Built on the worker, logged by Tick.
+#if DEBUG
+    private const double TestLogSeconds = 30.0;
+    private static volatile string? _testNote;
+    private static long _testSince;
+    private static int _testRounds, _testAfterCull;
+    private static double _sumPyramid, _sumLanes, _sumWalk, _sumTests, _sumLamps, _sumMerge, _worstRound, _worstLanes;
+    private static long _sumWalked, _sumWalkedOut, _sumDue, _sumTested, _sumLampsOn, _sumLampsInView, _sumLampTests;
+#endif
+
+    [Conditional("DEBUG")]
+    private static void TimeParts(long pyramid, long lanes, long merge)
+    {
+#if DEBUG
+        long cell = 0, walk = 0, lamps = 0;
+        foreach (var lane in Lanes)
+        {
+            cell += lane.CellTicks;
+            walk += lane.WalkTicks;
+            lamps += lane.LampTicks;
+            _sumWalked += lane.Walked;
+            _sumWalkedOut += lane.WalkedOut;
+            _sumDue += lane.DueCount;
+            _sumLampTests += lane.LampTests;
+        }
+
+        var ms = Diagnostics.TickMs;
+        _sumPyramid += pyramid * ms;
+        _sumLanes += lanes * ms;
+        _sumWalk += walk * ms;
+        _sumTests += (cell - walk) * ms;
+        _sumLamps += lamps * ms;
+        _sumMerge += merge * ms;
+        _sumTested += Tested;
+        _sumLampsOn += LampsOn;
+        _sumLampsInView += LampsInView;
+        _worstRound = Math.Max(_worstRound, (pyramid + lanes + merge) * ms);
+        _worstLanes = Math.Max(_worstLanes, lanes * ms);
+        _testRounds++;
+        var now = Stopwatch.GetTimestamp();
+        if (_testSince == 0) _testSince = now;
+        if ((now - _testSince) * ms < TestLogSeconds * 1000.0) return;
+        double n = _testRounds;
+        _testNote = $"depth test, {_testRounds} rounds: round {(_sumPyramid + _sumLanes + _sumMerge) / n:0.00} ms avg, {_worstRound:0.00} worst | pyramid {_sumPyramid / n:0.00}, "
+                    + $"{Lanes.Length} threads {_sumLanes / n:0.00} wall ({_worstLanes:0.00} worst; summed over threads: walking cells {_sumWalk / n:0.00}, testing {_sumTests / n:0.00}, lamps {_sumLamps / n:0.00}), merge {_sumMerge / n:0.00} | "
+                    + $"per round: walked {_sumWalked / n:0} objects in view + {_sumWalkedOut / n:0} out of view, {_sumDue / n:0} due, {_sumTested / n:0} tested, "
+                    + $"lamps {_sumLampsOn / n:0} on of {_lamps.Length} ({_sumLampsInView / n:0} reaching into view, {_sumLampTests / n:0} tested), {_areas.Length} area lights | "
+                    + $"arrives after {_arriveFrames:0.0} frames, applied {_appliedAge:0.0} old, one every {_resultEvery:0.0}, {_testAfterCull} started after the cull";
+        _testSince = now;
+        _testRounds = _testAfterCull = 0;
+        _sumPyramid = _sumLanes = _sumWalk = _sumTests = _sumLamps = _sumMerge = _worstRound = _worstLanes = 0;
+        _sumWalked = _sumWalkedOut = _sumDue = _sumTested = _sumLampsOn = _sumLampsInView = _sumLampTests = 0;
+#endif
+    }
+
     // Work is claimed in chunks: cells first, then lamps.
     private const int CellsPerClaim = 8, LampsPerClaim = 512;
     private static int _nextClaim;

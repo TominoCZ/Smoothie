@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>1.0.8</Version>
+    <Version>1.0.9</Version>
     <AssemblyName>Smoothie</AssemblyName>
     <RootNamespace>Smoothie</RootNamespace>
   </PropertyGroup>

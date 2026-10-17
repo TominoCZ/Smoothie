@@ -14,7 +14,7 @@ using UnityEngine;
 
 namespace Smoothie;
 
-[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.8")]
+[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.9")]
 // Optional: when Fika is installed it has to load first, or its types aren't there yet when
 // Smoothie looks for them and its observed bots aren't recognised. Without Fika this does nothing.
 [BepInDependency("com.fika.core", BepInDependency.DependencyFlags.SoftDependency)]
@@ -136,7 +136,7 @@ public class Plugin : BaseUnityPlugin
             "Most maps have no occlusion culling, so buildings, walls, cars and furniture behind nearer ones are still drawn (on Customs thousands of draw calls). With this on, level objects beyond the distance set below (3 m by default) stop drawing while the last frame's picture shows them completely covered by something nearer, checked on another CPU core. Covered objects' shadows: see \"Covered objects also stop casting shadows\". Something coming into view can appear a few frames late (about 1/50 s), only when you move, not when you turn. Doors, loot, players and anything that moves are left alone. Collecting the objects takes a moment 10 seconds into each raid.", 84);
         HideBeyond = Bind(other, "Hide covered objects only beyond (m)", 3f,
             "With \"Hide objects covered by nearer ones\" on: everything nearer than this stays drawn, all around you (behind you the game doesn't draw anyway). Lower hides more close by, like the room next to yours; higher is safer if something close ever shows up late, where it's big on screen.", 83, false,
-            new AcceptableValueRange<float>(1f, 10f));
+            new AcceptableValueRange<float>(1f, 64f));
         SkipCoveredLamps = Bind(other, "Skip lamps lighting only covered areas", true,
             "With \"Hide objects covered by nearer ones\" on: a lamp or area light (the game's glowing panels, signs and windows) whose whole lit area is hidden behind nearer things (the next room, the other side of a wall) lights nothing you can see, so it stops lighting and drawing its shadows until any of that area may come into view. Each lamp with shadows draws everything around it again for its shadow (on Factory up to ~100 draw calls each). Its light can come on a moment late when the area comes into view, like hidden objects. The sun and moon are left alone.", 81);
         HideShadows = Bind(other, "Covered objects also stop casting shadows", true,
