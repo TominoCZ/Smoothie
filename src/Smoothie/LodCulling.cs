@@ -132,7 +132,7 @@ internal static class LodCulling
         }
 
         if (!On) return;
-        var start = Stopwatch.GetTimestamp();
+        var start = Diagnostics.Measuring ? Stopwatch.GetTimestamp() : 0;
         try
         {
             TestCells(camera);
@@ -144,7 +144,7 @@ internal static class LodCulling
             Plugin.SkipOutOfView.Value = false;
         }
 
-        Ms = Ms * 0.95 + (Stopwatch.GetTimestamp() - start) * Diagnostics.TickMs * 0.05;
+        if (start != 0) Ms = Ms * 0.95 + (Stopwatch.GetTimestamp() - start) * Diagnostics.TickMs * 0.05;
     }
 
     private static void TestCells(Camera camera)

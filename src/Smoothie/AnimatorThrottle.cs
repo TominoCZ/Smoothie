@@ -334,10 +334,10 @@ internal static class AnimatorThrottle
     private static void StepDeferredArms(Player player, float dt)
     {
         if (dt <= 0f) return;
-        var start = Stopwatch.GetTimestamp();
+        var start = Diagnostics.Measuring ? Stopwatch.GetTimestamp() : 0;
         UpdateDeferredArms(player, dt);
         _steps++;
-        _stepTicks += Stopwatch.GetTimestamp() - start;
+        if (start != 0) _stepTicks += Stopwatch.GetTimestamp() - start;
     }
 
     private static void UpdateDeferredArms(Player player, float dt)
@@ -529,7 +529,7 @@ internal static class AnimatorThrottle
         state.Pending = 0f;
         if (dt <= 0f) return;
 
-        var start = Stopwatch.GetTimestamp();
+        var start = Diagnostics.Measuring ? Stopwatch.GetTimestamp() : 0;
 
         // Movement is root motion: MovementState.OnStateMove runs inside the animator update
         // and passes the animator's deltaPosition to the character controller together with
@@ -553,7 +553,7 @@ internal static class AnimatorThrottle
         }
 
         _steps++;
-        _stepTicks += Stopwatch.GetTimestamp() - start;
+        if (start != 0) _stepTicks += Stopwatch.GetTimestamp() - start;
     }
 
     // Hands the animators back to Unity. True when that takes one more frame (a last Unity

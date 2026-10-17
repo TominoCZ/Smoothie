@@ -108,9 +108,9 @@ internal static class Occlusion
             return false;
         }
 
-        var start = System.Diagnostics.Stopwatch.GetTimestamp();
+        var start = Diagnostics.Measuring ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         state.Hidden = state.Sight.Hidden(Time.time, AnimatorThrottle.InView(position, out _));
-        _ticks += System.Diagnostics.Stopwatch.GetTimestamp() - start;
+        if (start != 0) _ticks += System.Diagnostics.Stopwatch.GetTimestamp() - start;
         if (state.Hidden) _hiddenCount++;
         return state.Hidden;
     }

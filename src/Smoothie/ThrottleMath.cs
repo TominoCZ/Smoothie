@@ -281,7 +281,7 @@ public sealed unsafe class DepthPyramid
     {
         try
         {
-            UseNative = sm_version() == 1;
+            UseNative = sm_version() == 2;
         }
         catch (Exception)
         {
@@ -585,6 +585,127 @@ public sealed unsafe class DepthPyramid
         for (var cx = xFrom; cx <= xTo; cx++)
         {
             if (ShowsBehind(ref p, shift, cx, cr)) return true;
+        }
+
+        return false;
+    }
+}
+
+// The worker's walk over one cell of covered-object checking (DepthCulling.TestCell): which
+// objects are due for a depth test, and which stay wanted hidden without one. Every object of
+// every cell, every round (tens of thousands on Streets), so with DepthPyramid.UseNative it runs
+// in SmoothieNative (src/SmoothieNative/walk.c, SSE2); the C# below is the fallback and the
+// reference the self-check compares it against. Both do the same, in the same order.
+public static unsafe class CellWalk
+{
+    private const string Native = "SmoothieNative";
+
+    // Per object, indexed alike (DepthCulling's Set, pinned by the caller). CheckedFrom, Min and
+    // Max hold 3 floats each. Hidden: 1 while hidden (the main thread's, read as it is).
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Units
+    {
+        public float* RetryAt, NextCheck, Slack, CheckedFrom, Min, Max;
+        public byte* Streak, Hidden;
+        public int* WantedIn;
+    }
+
+    [DllImport(Native, CallingConvention = CallingConvention.Cdecl), SuppressUnmanagedCodeSecurity]
+    private static extern void sm_walk_in(Units* u, int from, int to, float* eye, float now, float gameTime, int round,
+        float* planes, int hideAfter, int* due, int* want, int* maybeTry, int* counts);
+
+    [DllImport(Native, CallingConvention = CallingConvention.Cdecl), SuppressUnmanagedCodeSecurity]
+    private static extern int sm_walk_out(Units* u, int from, int to, float* eye, int round, int hideAfter,
+        int* want, int* stale, int* counts);
+
+    // A cell in view. Due: not hidden and waiting to retry, or past its next check, or covered and
+    // the eye moved past its slack. Wanted (not due, covered hideAfter rounds): WantedIn set to
+    // round, listed, and listed again in maybeTry when not hidden, not waiting to retry and in view
+    // (planes: the view's left, right, bottom and top, 4 floats each). Counts out: due, want, maybeTry.
+    public static void InView(Units* u, int from, int to, float* eye, float now, float gameTime, int round, float* planes,
+        int hideAfter, int* due, int* want, int* maybeTry, int* counts)
+    {
+        if (DepthPyramid.UseNative)
+        {
+            sm_walk_in(u, from, to, eye, now, gameTime, round, planes, hideAfter, due, want, maybeTry, counts);
+            return;
+        }
+
+        int nd = 0, nw = 0, nt = 0;
+        for (var i = from; i < to; i++)
+        {
+            bool isDue;
+            if (u->Hidden[i] == 0 && u->RetryAt[i] > gameTime) isDue = false;
+            else if (now >= u->NextCheck[i]) isDue = true;
+            else if (u->Streak[i] == 0) isDue = false;
+            else isDue = Moved2(eye, u->CheckedFrom + i * 3) >= u->Slack[i];
+            if (isDue) due[nd++] = i;
+            else if (u->Streak[i] >= hideAfter)
+            {
+                u->WantedIn[i] = round;
+                want[nw++] = i;
+                if (u->Hidden[i] == 0 && u->RetryAt[i] <= gameTime && !OutOfView(planes, u->Min + i * 3, u->Max + i * 3)) maybeTry[nt++] = i;
+            }
+        }
+
+        counts[0] = nd;
+        counts[1] = nw;
+        counts[2] = nt;
+    }
+
+    // A cell out of view: a covered object whose cover may have shifted (the eye moved past its
+    // slack) is forgotten and checked again once back in view; covered ones stay wanted, hidden
+    // ones too and are listed stale. True when nothing in it is covered or hidden. Counts out:
+    // want, stale.
+    public static bool OutOfViewCell(Units* u, int from, int to, float* eye, int round, int hideAfter, int* want, int* stale, int* counts)
+    {
+        if (DepthPyramid.UseNative) return sm_walk_out(u, from, to, eye, round, hideAfter, want, stale, counts) != 0;
+        int nw = 0, ns = 0;
+        var quiet = true;
+        for (var i = from; i < to; i++)
+        {
+            if (u->Streak[i] == 0 && u->Hidden[i] == 0) continue;
+            if (u->Streak[i] != 0 && Moved2(eye, u->CheckedFrom + i * 3) >= u->Slack[i])
+            {
+                u->Streak[i] = 0;
+                u->NextCheck[i] = 0f;
+            }
+
+            if (u->Streak[i] >= hideAfter)
+            {
+                u->WantedIn[i] = round;
+                want[nw++] = i;
+            }
+            else if (u->Hidden[i] != 0)
+            {
+                u->WantedIn[i] = round;
+                want[nw++] = i;
+                stale[ns++] = i;
+            }
+
+            quiet &= u->Streak[i] == 0 && u->Hidden[i] == 0;
+        }
+
+        counts[0] = nw;
+        counts[1] = ns;
+        return quiet;
+    }
+
+    private static float Moved2(float* eye, float* at)
+    {
+        float dx = eye[0] - at[0], dy = eye[1] - at[1], dz = eye[2] - at[2];
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    // As DepthCulling's Sides.Out, same order of operations.
+    public static bool OutOfView(float* planes, float* min, float* max)
+    {
+        float cx = (min[0] + max[0]) * 0.5f, cy = (min[1] + max[1]) * 0.5f, cz = (min[2] + max[2]) * 0.5f;
+        float ex = (max[0] - min[0]) * 0.5f, ey = (max[1] - min[1]) * 0.5f, ez = (max[2] - min[2]) * 0.5f;
+        for (var k = 0; k < 4; k++)
+        {
+            var p = planes + k * 4;
+            if (p[0] * cx + p[1] * cy + p[2] * cz + p[3] + Math.Abs(p[0]) * ex + Math.Abs(p[1]) * ey + Math.Abs(p[2]) * ez < 0f) return true;
         }
 
         return false;

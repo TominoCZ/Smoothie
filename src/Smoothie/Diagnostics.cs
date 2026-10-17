@@ -99,6 +99,11 @@ internal static class Diagnostics
     // Performance lines go to the log only with a diagnostics setting on that asks for them.
     internal static bool Logging => Profiling || Plugin.On(Plugin.LogDrops);
 
+    // Something shows or logs Smoothie's own timings (overlay, stats panel, logging): set once a
+    // frame by Plugin.Update. Off, those timings aren't taken: under Proton every clock read is a
+    // Wine system call.
+    internal static bool Measuring;
+
     // Engine stages: a timestamp before every step of Unity's player loop (animation,
     // physics, skinned meshes, UI, rendering, ...), so the frame time outside scripts can
     // be split up too. Works in release builds.
@@ -1462,10 +1467,10 @@ internal static class Diagnostics
 #if DEBUG
         if (_censusDue > 0f && Time.unscaledTime >= _censusDue) FinishPhysicsCensus();
 #endif
-        var stamp = Stopwatch.GetTimestamp();
-        var ms = _lastTickStamp == 0 ? Time.unscaledDeltaTime * 1000f : (float)((stamp - _lastTickStamp) * 1000.0 / Stopwatch.Frequency);
+        var stamp = Measuring ? Stopwatch.GetTimestamp() : 0;
+        var ms = _lastTickStamp == 0 || stamp == 0 ? Time.unscaledDeltaTime * 1000f : (float)((stamp - _lastTickStamp) * 1000.0 / Stopwatch.Frequency);
         _lastTickStamp = stamp;
-        if (FrameTimes.Count < 4096) FrameTimes.Add(ms);
+        if (Measuring && FrameTimes.Count < 4096) FrameTimes.Add(ms);
         if (Logging && InRaid && Time.unscaledTime - _physicsCheckAt >= 1f)
         {
             _physicsCheckAt = Time.unscaledTime;

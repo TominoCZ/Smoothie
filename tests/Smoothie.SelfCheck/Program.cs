@@ -295,6 +295,105 @@ if (DepthPyramid.UseNative)
     DepthPyramid.UseNative = false;
 }
 
+// The native cell walk (src/SmoothieNative/walk.c, SSE2) lists and writes exactly what the C#
+// one does: random cells (odd lengths for the scalar tail, long empty runs for the 16-at-a-time
+// skip), covered, hidden, waiting and moved objects, a view that leaves some boxes out.
+if (DepthPyramid.TryNative())
+{
+    unsafe
+    {
+        var rng = new Random(7);
+        const int n = 4000;
+        float R(float lo, float hi) => lo + (float)rng.NextDouble() * (hi - lo);
+        var retry = new float[n]; var next = new float[n]; var slack = new float[n];
+        var from3 = new float[n * 3]; var min3 = new float[n * 3]; var max3 = new float[n * 3];
+        var streak = new byte[n]; var hidden = new byte[n];
+        for (var i = 0; i < n; i++)
+        {
+            // Every 200 objects, a run of 100 with nothing covered or hidden.
+            var empty = i % 200 < 100;
+            retry[i] = rng.Next(3) == 0 ? 0f : R(0f, 10f);
+            next[i] = R(0f, 10f);
+            slack[i] = R(0f, 4f);
+            for (var a = 0; a < 3; a++)
+            {
+                from3[i * 3 + a] = R(-2f, 2f);
+                var c = R(-60f, 60f);
+                var e = R(0.1f, 8f);
+                min3[i * 3 + a] = c - e;
+                max3[i * 3 + a] = c + e;
+            }
+
+            streak[i] = empty ? (byte)0 : (byte)rng.Next(4);
+            hidden[i] = empty || rng.Next(5) != 0 ? (byte)0 : (byte)1;
+        }
+
+        // Left, right, bottom, top of a view looking down +z.
+        var planes = new[] { 1f, 0f, 0.8f, 0f, -1f, 0f, 0.8f, 0f, 0f, 1f, 0.6f, 0f, 0f, -1f, 0.6f, 0f };
+        var eye = new[] { 0.3f, -0.2f, 0.1f };
+        int walkMismatches = 0, cellsChecked = 0;
+        (byte[] Streak, float[] Next, int[] WantedIn, List<int> Lists, bool Quiet) Walk(bool useNative, int from, int to, bool inView)
+        {
+            DepthPyramid.UseNative = useNative;
+            var s = (byte[])streak.Clone(); var nx = (float[])next.Clone(); var w = new int[n];
+            var a = new int[n]; var b = new int[n]; var c = new int[n]; var counts = new int[3];
+            var quiet = false;
+            fixed (float* pr = retry, pn = nx, ps = slack, pf = from3, pmin = min3, pmax = max3, pe = eye, pp = planes)
+            fixed (byte* pst = s, ph = hidden)
+            fixed (int* pw = w, pa = a, pb = b, pc = c, pcount = counts)
+            {
+                var u = new CellWalk.Units { RetryAt = pr, NextCheck = pn, Slack = ps, CheckedFrom = pf, Min = pmin, Max = pmax, Streak = pst, Hidden = ph, WantedIn = pw };
+                if (inView) CellWalk.InView(&u, from, to, pe, 5f, 5f, 42, pp, 2, pa, pb, pc, pcount);
+                else quiet = CellWalk.OutOfViewCell(&u, from, to, pe, 42, 2, pa, pb, pcount);
+            }
+
+            var lists = new List<int>();
+            for (var k = 0; k < (inView ? 3 : 2); k++)
+            {
+                lists.Add(-1 - k);
+                lists.AddRange((k == 0 ? a : k == 1 ? b : c).Take(counts[k]));
+            }
+
+            return (s, nx, w, lists, quiet);
+        }
+
+        for (var from = 0; from < n; from += rng.Next(1, 300))
+        {
+            var to = Math.Min(n, from + rng.Next(1, 300));
+            foreach (var inView in new[] { true, false })
+            {
+                var managed = Walk(false, from, to, inView);
+                var native = Walk(true, from, to, inView);
+                cellsChecked++;
+                if (!managed.Streak.SequenceEqual(native.Streak) || !managed.Next.SequenceEqual(native.Next) || !managed.WantedIn.SequenceEqual(native.WantedIn)
+                    || !managed.Lists.SequenceEqual(native.Lists) || managed.Quiet != native.Quiet) walkMismatches++;
+            }
+        }
+
+        Check(walkMismatches == 0, $"native cell walk disagrees with the C# one in {walkMismatches} of {cellsChecked} cells");
+        // ponytail: rough speed check only, printed, not asserted (machines differ; this is .NET's
+        // JIT, which does far better than the game's Mono).
+        fixed (float* qr = retry, qn = next, qs = slack, qf = from3, qmin = min3, qmax = max3, qe = eye, qp = planes)
+        fixed (byte* qst = streak, qh = hidden)
+        {
+            var w = new int[n]; var a = new int[n]; var b = new int[n]; var c = new int[n]; var counts = new int[3];
+            fixed (int* qw = w, qa = a, qb = b, qc = c, qcount = counts)
+            {
+                var u = new CellWalk.Units { RetryAt = qr, NextCheck = qn, Slack = qs, CheckedFrom = qf, Min = qmin, Max = qmax, Streak = qst, Hidden = qh, WantedIn = qw };
+                foreach (var useNative in new[] { false, true })
+                {
+                    DepthPyramid.UseNative = useNative;
+                    var watch = System.Diagnostics.Stopwatch.StartNew();
+                    for (var k = 0; k < 2000; k++) CellWalk.InView(&u, 0, n, qe, 5f, 5f, 42, qp, 2, qa, qb, qc, qcount);
+                    Console.WriteLine($"{(useNative ? "native" : "C#    ")}: {watch.Elapsed.TotalMilliseconds * 1e6 / 2000 / n:0.0} ns per object walked in view");
+                }
+            }
+        }
+
+        DepthPyramid.UseNative = false;
+    }
+}
+
 // Growth while moving: reversed-Z projection with near 0.05 m, far 10 km; depth of a distance z
 // is p23 / z - p22. Cover at 2 m, the box's far point at 20 m, eye 0.18 m: 0.18 * (1/2 - 1/20)
 // = 0.081 rad, about 8.9 texels of 0.0091 rad.
@@ -355,7 +454,7 @@ if (failures.Count > 0)
     return 1;
 }
 
-Console.WriteLine($"OK: throttle intervals, zoom, depth cover, the depth pyramid and the animator pause hooks behave, {binds.Count} config names are valid.");
+Console.WriteLine($"OK: throttle intervals, zoom, depth cover, the depth pyramid, the cell walk and the animator pause hooks behave, {binds.Count} config names are valid.");
 return 0;
 
 static string SourcePath([System.Runtime.CompilerServices.CallerFilePath] string path = "") => path;

@@ -241,16 +241,17 @@ internal static class Overlay
 
     // Harmony hands __state from prefix to postfix only within one class, so the overlay
     // keeps its own timestamp prefix instead of sharing Diagnostics'.
-    private static void Begin(out long __state) => __state = Stopwatch.GetTimestamp();
+    // Patched only once the overlay was first switched on; switched off again, no clock reads.
+    private static void Begin(out long __state) => __state = _on ? Stopwatch.GetTimestamp() : 0;
 
     private static void PhysicsEnd(long __state)
     {
-        if (_on) _physicsTicks += Stopwatch.GetTimestamp() - __state;
+        if (_on && __state != 0) _physicsTicks += Stopwatch.GetTimestamp() - __state;
     }
 
     private static void SyncEnd(long __state)
     {
-        if (!_on) return;
+        if (!_on || __state == 0) return;
         var took = Stopwatch.GetTimestamp() - __state;
         _physicsTicks += took;
         _syncTicks += took;
@@ -274,12 +275,12 @@ internal static class Overlay
 
     private static void AiEnd(long __state)
     {
-        if (_on) _aiTicks += Stopwatch.GetTimestamp() - __state;
+        if (_on && __state != 0) _aiTicks += Stopwatch.GetTimestamp() - __state;
     }
 
     private static void IkEnd(Player __instance, long __state)
     {
-        if (_on && !__instance.IsYourPlayer) _ikTicks += Stopwatch.GetTimestamp() - __state;
+        if (_on && __state != 0 && !__instance.IsYourPlayer) _ikTicks += Stopwatch.GetTimestamp() - __state;
     }
 
     internal static void MarkChange() => _changedNow = true;

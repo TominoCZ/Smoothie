@@ -45,7 +45,7 @@ typedef struct
     int gearCover;
 } Probe;
 
-EXPORT int32_t sm_version(void) { return 1; }
+EXPORT int32_t sm_version(void) { return 2; }
 
 // Level `level` from level - 1: each texel the min of far, the max of nearWorld and the OR of
 // gear over the 2x2 below it; an odd last row or column pairs with itself.
