@@ -7,6 +7,8 @@ behind a wall, buildings drawn behind other buildings, level of detail worked ou
 for objects too far away to draw. Smoothie cuts that waste without changing what bots do or
 what you see.
 
+<img width="640" height="360" alt="thumnail" src="https://github.com/user-attachments/assets/2c7bd555-796e-449d-b380-178652a6d9f7" />
+
 ## What it does
 
 | | Vanilla | With Smoothie |
