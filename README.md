@@ -2,7 +2,7 @@
 
 A client-side performance mod for SPT. Bots stay sharp, your frame rate stays smooth.
 
-Much of what eats your CPU in Tarkov is work nobody sees: bots animated at full speed 200 m
+Much of what eats your CPU in SPT is work nobody sees: bots animated at full speed 200 m
 behind a wall, buildings drawn behind other buildings, level of detail worked out every frame
 for objects too far away to draw. Smoothie cuts that waste without changing what bots do or
 what you see.
