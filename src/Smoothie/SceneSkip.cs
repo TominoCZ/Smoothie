@@ -8,51 +8,102 @@ namespace Smoothie;
 
 // Takes LOD groups out of Unity's per-frame LOD work without switching anything off, and holds
 // the build check every native trick in Smoothie relies on (EnginePatch too).
-// Unity's LOD pass (LODGroupManager::CalculateLODMasks, RVA 0x4FC670) works out every LOD group's
+// Unity's LOD pass (LODGroupManager::CalculateLODMasks, RVA 0xA49020) works out every LOD group's
 // level (~134k on Streets) for every camera each frame; its per-group step
-// (CalculateLODMask, 0x4FC400) first reads the group's forced-level byte and returns at once when
-// it's set (LODGroup.ForceLOD writes 1 << min(level, 7) there: LODGroup_CUSTOM_ForceLOD, 0xCC620).
+// (CalculateLODMask, 0x6A6070) first reads the group's forced-level byte and returns at once when
+// it's set (LODGroup.ForceLOD writes 1 << min(level, 7) there: its internal call, 0x19EF70).
 // Forcing level 7, which no group here has, draws nothing and skips that step's math. Done
 // natively, a byte through the group's slot in Unity's LOD manager: ForceLOD through the scripting
 // layer costs ~0.4 µs a call. The game never calls ForceLOD; a byte someone else set is left alone.
 // Measured: a one-shot managed ForceLOD(7) test gained ~0.7-1 ms (95k groups), but forced groups
 // are still visited by the loop (slot read, distance, square root, call), so the per-frame feature
 // alone gained little; EnginePatch.LodLoop makes the loop skip that work for forced groups.
-// Where the offsets come from: the global LOD manager pointer, slot layout and LODGroup+0x70 from
-// ForceLOD's and AddLODGroup's (0x4FCF50) code; the slot's back-pointer at +0x58 from
-// UpdateLODGroupParameters (0x4FD1D0). Found and checked the way EnginePatch describes (Unity's
-// public symbols for this exact build, disassembly); background in
-// tools/engine-patches/unity-internals.md. They hold for this exact UnityPlayer.dll only: any
-// other build (Check), or a slot that doesn't point back at its group, leaves everything alone.
+// Where the offsets come from: the global LOD manager pointer, slot layout and LODGroup+0x98 from
+// ForceLOD's and AddLODGroup's (0x90F120) code; the slot's back-pointer at +0x58 from the slot
+// set-up AddLODGroup calls (0x92CB20). Found and checked the way EnginePatch describes (this build
+// has no public symbols: Unity's own 2022.3.43f1 IL2CPP player is the named reference);
+// background in tools/engine-patches/unity-internals.md. They hold for this exact UnityPlayer.dll
+// only: any other build (Check), or a slot that doesn't point back at its group, leaves
+// everything alone.
 // (The scene entries' own skip bit, Unity's "being removed" mark, works too but saved only
 // ~0.1 ms for 84k meshes and costs a scattered write per mesh to undo: not used.)
 internal static unsafe class SceneSkip
 {
-    // UnityPlayer_Win64_player_mono_x64.pdb of Unity 2022.3.43f1, EFT's build.
-    private const string BuildId = "BD9605D7A8BC4F21AF766D4707334ADC1";
-    private const long LodManagerRva = 0x1CF96A0; // LODGroupManager* (global)
+    // UnityPlayer_Win64_player_il2cpp_x64.pdb of Unity 2022.3.43f2, the game's (BSG's) build for
+    // SPT 5.0 / EFT 1.2. Its Object base is 0x28 bytes bigger than public Unity's: every native
+    // object field below is 0x28 further in than in 2022.3.43f1.
+    private const string BuildId = "3C9C828B7504489DB8FD348F0F90ADE01";
+    private const long LodManagerRva = 0x1A88FF8; // LODGroupManager* (global)
     private const int LodSlots = 0x8, LodSlotCount = 0x18, LodSlotSize = 0x68; // its group slots
     private const int SlotGroup = 0x58, SlotForced = 0x60; // slot: LODGroup*, forced-level mask
-    private const int GroupSlot = 0x70; // LODGroup: its slot's index, 0 when not registered
+    private const int GroupSlot = 0x98; // LODGroup: its slot's index, 0 when not registered
     private const byte NothingMask = 0x80; // level 7
-    // Native Renderer fields read by Unity's own property getters (Renderer_Get_Custom_PropIsVisible
-    // 0xA2A50: visible = flags & 0x1000 and scene handle != -1; the forceRenderingOff setter
-    // 0xA31D0 only writes the byte at +0x140).
-    private const int RendererFlags = 0x128, RendererVisible = 0x1000, RendererHandle = 0x168, RendererForceOff = 0x140;
+    // Native Renderer fields read by Unity's own property getters (Renderer.isVisible's internal
+    // call 0xBC4A30: visible = flags & 0x1000 and scene handle != -1; forceRenderingOff's setter
+    // 0x259960 only writes the byte at +0x168).
+    private const int RendererFlags = 0x150, RendererVisible = 0x1000, RendererHandle = 0x190, RendererForceOff = 0x168;
 
     private static bool _checked;
     private static byte* _lodManagerPointer;
     // UnityPlayer.dll in memory, once the build matched (EnginePatch).
     internal static byte* Module;
-    // UnityEngine.Object.m_CachedPtr: the native object, zero once destroyed.
-    private static readonly AccessTools.FieldRef<UnityEngine.Object, IntPtr> _cachedPtr =
-        AccessTools.FieldRefAccess<UnityEngine.Object, IntPtr>("m_CachedPtr");
     internal static bool Available { get; private set; }
-    internal static IntPtr NativeOf(UnityEngine.Object o) => _cachedPtr(o);
+    // UnityEngine.Object.m_CachedPtr: the native object, zero once destroyed.
+    internal static IntPtr NativeOf(UnityEngine.Object o) => o.m_CachedPtr;
     internal static string Note = "not checked";
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr GetModuleHandleW(string name);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
+    private static extern IntPtr GetProcAddress(IntPtr module, string name);
+
+    // SmoothieNative's byte per LOD slot (lodflags.c): 1 where Smoothie forced the group in that
+    // slot. EnginePatch.LodLoop reads them instead of the slots; null without SmoothieNative.dll.
+    private static byte* _flags;
+    private static int _flagCount;
+    private static bool _flagsLooked;
+
+    internal static byte* Flags
+    {
+        get
+        {
+            if (_flagsLooked) return _flags;
+            _flagsLooked = true;
+            var native = GetModuleHandleW("SmoothieNative.dll");
+            var flags = GetProcAddress(native, "SmoothieLodFlags");
+            var count = GetProcAddress(native, "SmoothieLodFlagCount");
+            if (native == IntPtr.Zero || flags == IntPtr.Zero || count == IntPtr.Zero) return null;
+            _flagCount = ((delegate* unmanaged[Cdecl]<int>)count)();
+            _flags = ((delegate* unmanaged[Cdecl]<byte*>)flags)();
+            return _flags;
+        }
+    }
+
+    private static void SetFlag(uint index, bool forced)
+    {
+        var flags = Flags;
+        if (flags != null && index < (uint)_flagCount) flags[index] = forced ? (byte)1 : (byte)0;
+    }
+
+    // Every byte from scratch, for the groups Smoothie has forced (the hook that keeps them in step
+    // with Unity's slot moves was off until now, so the old ones may point at moved slots).
+    internal static bool RebuildFlags(System.Collections.Generic.IEnumerable<LODGroup> forced)
+    {
+        var flags = Flags;
+        if (flags == null || !Available) return false;
+        new Span<byte>(flags, _flagCount).Clear();
+        foreach (var group in forced)
+        {
+            var n = group is null ? null : (byte*)group.m_CachedPtr;
+            if (n == null) continue;
+            var index = *(uint*)(n + GroupSlot);
+            var slot = Slot(index, n);
+            if (slot != null && slot[SlotForced] == NothingMask) SetFlag(index, true);
+        }
+
+        return true;
+    }
 
     internal static bool Check()
     {
@@ -103,12 +154,13 @@ internal static unsafe class SceneSkip
     {
         native = IntPtr.Zero;
         if (!Available || group is null) return 0;
-        var n = (byte*)_cachedPtr(group);
+        var n = (byte*)group.m_CachedPtr;
         if (n == null) return 0;
         var index = *(uint*)(n + GroupSlot);
         var slot = Slot(index, n);
         if (slot == null || slot[SlotForced] != 0) return 0;
         slot[SlotForced] = NothingMask;
+        SetFlag(index, true);
         native = (IntPtr)n;
         return index;
     }
@@ -129,7 +181,7 @@ internal static unsafe class SceneSkip
         if (slot == null)
         {
             if (group is null) return;
-            var n = (byte*)_cachedPtr(group);
+            var n = (byte*)group.m_CachedPtr;
             if (n == null) return;
             index = *(uint*)(n + GroupSlot);
             slot = Slot(index, n);
@@ -137,28 +189,7 @@ internal static unsafe class SceneSkip
 
         if (slot == null || slot[SlotForced] != NothingMask) return;
         slot[SlotForced] = 0;
-        ClearResults(index);
-    }
-
-    // Every camera's LOD results, kept from frame to frame on the manager (one entry per camera,
-    // its masks a byte per slot; RemoveLODGroup moves them along with the slots). The LOD loop
-    // patch passes over a group whose last mask is ours without reading its slot
-    // (EnginePatch.LodLoop), so un-forcing one clears that mask everywhere: the next pass works
-    // the group out again, before the frame it could show in culls.
-    private const int LodResults = 0x38, LodResultCount = 0x48, ResultMasks = 0x10, ResultMaskCount = 0x20;
-
-    private static void ClearResults(uint index)
-    {
-        var manager = *(byte**)_lodManagerPointer;
-        var entries = *(byte***)(manager + LodResults);
-        var count = *(ulong*)(manager + LodResultCount);
-        for (ulong e = 0; e < count; e++)
-        {
-            var entry = entries[e];
-            if (entry == null || index >= *(ulong*)(entry + ResultMaskCount)) continue;
-            var masks = *(byte**)(entry + ResultMasks);
-            if (masks[index] == NothingMask) masks[index] = 0;
-        }
+        SetFlag(index, false);
     }
 
     // renderer.isVisible and forceRenderingOff without a call into Unity per renderer: the same
@@ -168,19 +199,19 @@ internal static unsafe class SceneSkip
     // destroyed renderer (m_CachedPtr zero) reads as not visible and not switched off.
     internal static bool IsVisible(Renderer renderer)
     {
-        var native = (byte*)_cachedPtr(renderer);
+        var native = (byte*)renderer.m_CachedPtr;
         return native != null && (*(int*)(native + RendererFlags) & RendererVisible) != 0 && *(int*)(native + RendererHandle) != -1;
     }
 
     internal static bool ForceRenderingOff(Renderer renderer)
     {
-        var native = (byte*)_cachedPtr(renderer);
+        var native = (byte*)renderer.m_CachedPtr;
         return native != null && native[RendererForceOff] != 0;
     }
 
     internal static void SetForceRenderingOff(Renderer renderer, bool off)
     {
-        var native = (byte*)_cachedPtr(renderer);
+        var native = (byte*)renderer.m_CachedPtr;
         if (native != null) native[RendererForceOff] = off ? (byte)1 : (byte)0;
     }
 

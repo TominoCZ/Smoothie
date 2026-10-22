@@ -11,7 +11,7 @@ using GPUInstancer;
 using Koenigz.PerfectCulling;
 using Koenigz.PerfectCulling.EFT;
 using HarmonyLib;
-using SPT.Reflection.Patching;
+using SPTushonka.Reflection.Patching;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -184,8 +184,10 @@ internal static class DepthCulling
     // The readback in flight. Unity asks the render thread about it once a frame, at the start,
     // and reads the answer only at the next start: a copy the GPU finished early in a frame landed
     // two frames later. Asking again in Update and the main camera's pre-cull (Poll) gets the
-    // answer within the frame; Update() runs the callback itself once it's there.
-    private static AsyncGPUReadbackRequest _pending;
+    // answer within the frame. IL2CPP: Unity's callback takes an Il2CppSystem.Action of a struct
+    // Il2CppInterop can't make, so Poll checks the request and calls the handler itself.
+    private static AsyncGPUReadbackRequest _pending, _scopePending;
+    private static Action<AsyncGPUReadbackRequest>? _pendingDone, _scopeDone;
     // A new depth is asked for at most this often (the slowest round rate before results landed
     // sooner), so landing sooner never means more rounds.
     private const int MinRoundFrames = 4;
@@ -333,13 +335,12 @@ internal static class DepthCulling
 
     internal static void Enable()
     {
-        Camera.onPreCull += PreCull;
-        Camera.onPreRender += StartAfterCull;
-        Camera.onPostRender += DrawCells;
+        Camera.onPreCull += (System.Action<Camera>)PreCull;
+        Camera.onPreRender += (System.Action<Camera>)StartAfterCull;
+        Camera.onPostRender += (System.Action<Camera>)DrawCells;
         new PyramidBuiltPatch(nameof(GPUInstancerHiZOcclusionGenerator.OnEndCameraRendering)).Enable();
         new PyramidBuiltPatch(nameof(GPUInstancerHiZOcclusionGenerator.OnEndCameraRenderingBlit)).Enable();
         new BakedSwitchPatch().Enable();
-        new AreaLightPatch().Enable();
         LoadNative();
     }
 
@@ -391,7 +392,7 @@ internal static class DepthCulling
     private static readonly long ScanSlice = (long)(2.0 / Diagnostics.TickMs);
     internal static double ScanMs;
     private static int _skipLayers;
-    private static HashSet<Renderer> _gameSwitched = new();
+    private static HashSet<Renderer> _gameSwitched = new(Diagnostics.ReferenceComparer.Instance);
 
     internal static void Scan()
     {
@@ -416,8 +417,8 @@ internal static class DepthCulling
     private static IEnumerator<bool> ScanLevel()
     {
         var sliceStart = Stopwatch.GetTimestamp();
-        var gameSwitched = new HashSet<Renderer>();
-        var standIns = new HashSet<Renderer>();
+        var gameSwitched = new HashSet<Renderer>(Diagnostics.ReferenceComparer.Instance);
+        var standIns = new HashSet<Renderer>(Diagnostics.ReferenceComparer.Instance);
         foreach (var switcher in UnityEngine.Object.FindObjectsByType<Koenigz.PerfectCulling.EFT.ScreenDistanceSwitcher>(FindObjectsInactive.Include, FindObjectsSortMode.None))
         {
             // Its own children: forceRenderingOff when the culling sampler isn't running (Show).
@@ -451,8 +452,8 @@ internal static class DepthCulling
         _skipLayers = skipLayers;
         standIns.ExceptWith(gameSwitched);
         _gameSwitched = gameSwitched;
-        var moving = new Dictionary<Transform, bool>();
-        var groupsSeen = new HashSet<LODGroup>();
+        var moving = new Dictionary<Transform, bool>(Diagnostics.ReferenceComparer.Instance);
+        var groupsSeen = new HashSet<LODGroup>(Diagnostics.ReferenceComparer.Instance);
         var unit = new List<Renderer>();
         var all = 0;
         foreach (var renderer in UnityEngine.Object.FindObjectsByType<MeshRenderer>(FindObjectsSortMode.None))
@@ -545,21 +546,6 @@ internal static class DepthCulling
         for (var l = 0; l < cells.Length; l++) cells[l] = LampCell(lampArray[l]);
         Array.Sort(cells, lampArray);
         SetLamps(lampArray);
-        var areas = new List<AreaLight>();
-        var boxes = new List<Bounds>();
-        foreach (var area in UnityEngine.Object.FindObjectsByType<AreaLight>(FindObjectsInactive.Include, FindObjectsSortMode.None))
-        {
-            if (!OfLevel(area) || (skipLayers & (1 << area.gameObject.layer)) != 0 || Moves(area.transform, moving)) continue;
-            // Its source mesh's bounds are the volume it lights (AreaLight.GetFrustumBounds).
-            var source = area.GetComponent<MeshRenderer>();
-            if (source == null) continue;
-            var bounds = source.bounds;
-            if (bounds.size.sqrMagnitude < 1e-6f || !(bounds.extents.sqrMagnitude < MaxExtent * MaxExtent)) continue;
-            areas.Add(area);
-            boxes.Add(bounds);
-        }
-
-        SetAreas(areas.ToArray(), boxes);
     }
 
     // Part of the map, not of a camera rig the game keeps across scenes: the item icon camera
@@ -569,7 +555,7 @@ internal static class DepthCulling
     private static bool OfLevel(Component light) =>
         light.gameObject.scene.name != "DontDestroyOnLoad" && light.GetComponentInChildren<Camera>(true) == null;
 
-    // A round on the worker reads the lamp and area arrays: they're only swapped between rounds.
+    // A round on the worker reads the lamp arrays: they're only swapped between rounds.
     // (A report from Interchange: arrays replaced while a round still ran, an index past the new
     // ones.) Its results were for the old arrays, so they're dropped.
     private static void WaitForRound()
@@ -743,109 +729,6 @@ internal static class DepthCulling
         if (!OnScreen(_lampRect[l])) _offList[_offCount++] = l;
     }
 
-    // EFT's area lights (AreaLight: a mesh plus a script) rebuild a command buffer for the main
-    // and scope cameras before every frame and draw their lit volume in it, whether it can be
-    // seen or not (117 of them drawn facing a wall on Streets). A covered one is skipped for the
-    // main camera: its buffer there emptied once, and its PreCull skipped (AreaLightPatch) while
-    // it stays covered. Only one whose lit area lay wholly on screen when checked: turning can't
-    // bring such an area into view uncovered (only moving can, which the boxes are grown for),
-    // so there's no per-frame turn check as for lamps. Back on through its own PreCull, at once.
-    // The scope camera is never touched. Switching is a flag, so it isn't capped.
-    private static AreaLight[] _areas = Array.Empty<AreaLight>();
-    private static Vector3[] _areaMin = Array.Empty<Vector3>(), _areaMax = Array.Empty<Vector3>();
-    private static Vector4[] _areaRect = Array.Empty<Vector4>();
-    private static byte[] _areaStreak = Array.Empty<byte>();
-    private static bool[] _areaWant = Array.Empty<bool>();
-    // By reference: asked for every area light, camera and frame (~1.2k on Streets), and Unity's
-    // own Equals/GetHashCode made that ~0.7% of the main thread.
-    private static readonly HashSet<AreaLight> SkippedAreas = new(Diagnostics.ReferenceComparer.Instance);
-    internal static int AreasOff;
-    private static readonly AccessTools.FieldRef<AreaLight, Dictionary<Camera, CommandBuffer>> AreaBuffers =
-        AccessTools.FieldRefAccess<AreaLight, Dictionary<Camera, CommandBuffer>>("m_Cameras");
-
-    private static void SetAreas(AreaLight[] areas, List<Bounds> boxes)
-    {
-        WaitForRound();
-        RestoreAreas();
-        var n = areas.Length;
-        _areaMin = new Vector3[n];
-        _areaMax = new Vector3[n];
-        for (var l = 0; l < n; l++)
-        {
-            _areaMin[l] = boxes[l].min;
-            _areaMax[l] = boxes[l].max;
-        }
-
-        _areaRect = new Vector4[n];
-        _areaStreak = new byte[n];
-        _areaWant = new bool[n];
-        _areas = areas;
-    }
-
-    // Worker: as lamps.
-    private static void TestAreas(Lane lane, int from, int to, ref Matrix4x4 m)
-    {
-        for (var l = from; l < to; l++)
-        {
-            var covered = BoxWhy(lane, _areaMin[l], _areaMax[l], ref m) == WhyCovered;
-            if (covered && Project(_areaMin[l], _areaMax[l], ref m, out var x0, out var y0, out var x1, out var y1, out _, out _))
-                _areaRect[l] = new Vector4(x0, y0, x1, y1);
-            else covered = false;
-            _areaStreak[l] = covered ? (byte)Math.Min(_areaStreak[l] + 1, HideAfter) : (byte)0;
-            _areaWant[l] = _areaStreak[l] >= HideAfter;
-        }
-    }
-
-    // Main thread, after a result is applied.
-    private static void ApplyAreas(bool fits)
-    {
-        var on = fits && _roundLamps && Plugin.On(Plugin.SkipCoveredLamps) && _camera != null;
-        for (var l = 0; l < _areas.Length; l++)
-        {
-            var area = _areas[l];
-            if (area is null) continue;
-            var want = on && _areaWant[l] && OnScreen(_areaRect[l]);
-            if (want == SkippedAreas.Contains(area)) continue;
-            if (want) SkipArea(area);
-            else ReleaseArea(area);
-        }
-
-        AreasOff = SkippedAreas.Count;
-    }
-
-    private static void SkipArea(AreaLight area)
-    {
-        if (area == null || _camera == null) return;
-        SkippedAreas.Add(area);
-        // What it drew last frame stays in the buffer until it's rebuilt.
-        if (AreaBuffers(area).TryGetValue(_camera, out var buffer) && buffer != null) buffer.Clear();
-    }
-
-    // Back on: rebuilt now through its own PreCull (which checks it's lit and set up), so this
-    // frame already draws it, whether or not its PreCull already ran this frame.
-    private static void ReleaseArea(AreaLight area)
-    {
-        if (!SkippedAreas.Remove(area) || area == null || _camera == null) return;
-        if (area.isActiveAndEnabled) area.PreCull(_camera);
-    }
-
-    private static void RestoreAreas()
-    {
-        if (SkippedAreas.Count == 0) return;
-        foreach (var area in new List<AreaLight>(SkippedAreas)) ReleaseArea(area);
-        SkippedAreas.Clear();
-        AreasOff = 0;
-    }
-
-    private class AreaLightPatch : ModulePatch
-    {
-        protected override MethodBase GetTargetMethod() => AccessTools.Method(typeof(AreaLight), nameof(AreaLight.PreCull));
-
-        [PatchPrefix]
-        private static bool Prefix(AreaLight __instance, Camera cam) =>
-            !ReferenceEquals(cam, _camera) || SkippedAreas.Count == 0 || !SkippedAreas.Contains(__instance);
-    }
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool OnScreen(Vector4 rect) => rect.x >= 0f && rect.y >= 0f && rect.z <= 1f && rect.w <= 1f;
 
@@ -955,7 +838,7 @@ internal static class DepthCulling
         if ((_skipLayers & (1 << renderer.gameObject.layer)) != 0) return $"not tracked: on a left-out layer ({LayerMask.LayerToName(renderer.gameObject.layer)})";
         if (renderer is not MeshRenderer) return "not tracked: not a mesh renderer";
         if (_gameSwitched.Contains(renderer)) return "not tracked: switched by the game's distance stand-ins";
-        if (Moves(renderer.transform, new Dictionary<Transform, bool>())) return "not tracked: moves or can be used";
+        if (Moves(renderer.transform, new Dictionary<Transform, bool>(Diagnostics.ReferenceComparer.Instance))) return "not tracked: moves or can be used";
         var lod = renderer.GetComponentInParent<LODGroup>();
         if (lod == null) return renderer.enabled ? "not tracked: appeared after the scan" : "not tracked: switched off at the scan";
         foreach (var member in lod.GetComponentsInChildren<Renderer>(true))
@@ -1000,7 +883,7 @@ internal static class DepthCulling
             NextCheck = new float[count],
             CheckedFrom = new Vector3[count],
             Slack = new float[count],
-            UnitOf = new Dictionary<Renderer, int>(count * 2),
+            UnitOf = new Dictionary<Renderer, int>(count * 2, Diagnostics.ReferenceComparer.Instance),
             WantedIn = new int[count],
             Off = new Renderer[count][],
             IsHidden = new byte[count],
@@ -1119,7 +1002,7 @@ internal static class DepthCulling
         _native = SceneSkip.Check();
 
         int withCuller = 0, withLod = 0, layerCulled = 0;
-        var cull = Camera.main != null ? Camera.main.layerCullDistances : new float[32];
+        var cull = Camera.main != null ? System.Linq.Enumerable.ToArray(Camera.main.layerCullDistances) : new float[32];
         for (var i = 0; i < count; i++)
         {
             if (set.Culler[i] is not null) withCuller++;
@@ -1167,7 +1050,6 @@ internal static class DepthCulling
                     PartTicks[PartApply] += lampStart - applyStart;
                     var fits = (camera.transform.position - _roundEye).sqrMagnitude <= MaxDrift * MaxDrift;
                     ApplyLamps(fits);
-                    ApplyAreas(fits);
                     if (timing) PartTicks[PartLamps] += Stopwatch.GetTimestamp() - lampStart;
                     _appliedAge = _appliedAge * 0.9f + (Time.frameCount - _requestFrame) * 0.1f;
                     if (_lastApplyFrame > 0) _resultEvery = _resultEvery * 0.9f + (Time.frameCount - _lastApplyFrame) * 0.1f;
@@ -1388,18 +1270,16 @@ internal static class DepthCulling
         // settings. The blit shader may not be loaded on a map without grass; the compute
         // shaders always are (built-in resources), so it's switched over then. Both feed the
         // grass system's own culling, so the pyramid reads the same either way.
-        var settings = Traverse.Create(generator);
-        var switched = settings.Field("occlusionCullingType").GetValue<GPUIOcclusionCullingType>() == GPUIOcclusionCullingType.Default
-                       && settings.Field("_depthBlitMaterial").GetValue() == null;
+        var switched = generator.occlusionCullingType == GPUIOcclusionCullingType.Default && generator._depthBlitMaterial == null;
         if (switched)
         {
             generator.enabled = false;
-            settings.Field("occlusionCullingType").SetValue(GPUIOcclusionCullingType.CopyTexture);
+            generator.occlusionCullingType = GPUIOcclusionCullingType.CopyTexture;
             generator.enabled = true;
         }
 
         generator.Initialize(camera);
-        how = switched ? "blit shader not loaded, using compute shaders" : settings.Field("occlusionCullingType").GetValue().ToString();
+        how = switched ? "blit shader not loaded, using compute shaders" : generator.occlusionCullingType.ToString();
         return generator;
     }
 
@@ -1413,7 +1293,7 @@ internal static class DepthCulling
             _scopeAdded = AddGenerator(camera, out _);
             // Sized to this camera's own picture: its anti-aliasing component reports the main
             // screen's size, which isn't what this camera renders (its depth is its pixel size).
-            Traverse.Create(_scopeAdded).Field("_ssaa").SetValue(null);
+            _scopeAdded._ssaa = null;
         }
 
         return camera;
@@ -1451,24 +1331,61 @@ internal static class DepthCulling
         var viewProjection = _scopeRenderView;
         _scopeReading = true;
         _scopeRequestFrame = Time.frameCount;
-        AsyncGPUReadback.Request(texture, mip, TextureFormat.RFloat, request =>
+        _scopePending = Readback(texture, mip);
+        _scopeDone = request =>
         {
             _scopeReading = false;
-            if (request.hasError) return;
-            var data = request.GetData<float>();
-            if (data.Length != width * height) return;
-            if (_scopeNext.Length != data.Length) _scopeNext = new float[data.Length];
-            data.CopyTo(_scopeNext);
+            if (request.hasError || !CopyReadback(request, width * height, ref _scopeNext)) return;
             _scopeNextWidth = width;
             _scopeNextHeight = height;
             _scopeNextViewProjection = viewProjection;
             _scopeNextFrame = Time.frameCount;
-        });
+        };
+    }
+
+    // IL2CPP: GetData<T> wraps Unity's NativeArray in an interop object; the raw pointer copies
+    // straight into the array. False if the readback isn't the expected size.
+    private static unsafe bool CopyReadback(AsyncGPUReadbackRequest request, int count, ref float[] into)
+    {
+        if (request.layerDataSize != count * sizeof(float)) return false;
+        if (into.Length != count) into = new float[count];
+        System.Runtime.InteropServices.Marshal.Copy(request.GetDataRaw(0), into, 0, count);
+        return true;
+    }
+
+    // IL2CPP: the game's build stripped AsyncGPUReadback's C# side (no game script uses it, and every
+    // Request overload is a stub that throws); the engine's internal call underneath is still there,
+    // and called directly here. Its C# wrapper only added a format check and the callback, which the
+    // polling here doesn't need. RFloat is R32_SFloat.
+    private unsafe delegate void RequestTextureCall(IntPtr src, int mipIndex, UnityEngine.Experimental.Rendering.GraphicsFormat dstFormat,
+        IntPtr nativeArrayData, AsyncGPUReadbackRequest* request);
+
+    private static RequestTextureCall? _requestTexture;
+
+    private static unsafe AsyncGPUReadbackRequest Readback(Texture texture, int mip)
+    {
+        _requestTexture ??= Il2CppInterop.Runtime.IL2CPP.ResolveICall<RequestTextureCall>(
+            "UnityEngine.Rendering.AsyncGPUReadback::Request_Internal_Texture_2_Injected");
+        AsyncGPUReadbackRequest request = default;
+        _requestTexture(Il2CppInterop.Runtime.IL2CPP.Il2CppObjectBaseToPtrNotNull(texture), mip,
+            UnityEngine.Experimental.Rendering.GraphicsFormat.R32_SFloat, IntPtr.Zero, &request);
+        return request;
     }
 
     private static void Poll()
     {
-        if (_state == Reading) _pending.Update();
+        Poll(ref _pending, ref _pendingDone);
+        Poll(ref _scopePending, ref _scopeDone);
+    }
+
+    private static void Poll(ref AsyncGPUReadbackRequest request, ref Action<AsyncGPUReadbackRequest>? done)
+    {
+        if (done == null) return;
+        request.Update();
+        if (!request.done) return;
+        var handler = done;
+        done = null;
+        handler(request);
     }
 
     // A depth read at the main camera's pre-cull starts its check once the cull is over (its
@@ -1535,7 +1452,8 @@ internal static class DepthCulling
         _requestFrame = Time.frameCount;
         _state = Reading;
         var id = ++_roundId;
-        _pending = AsyncGPUReadback.Request(texture, mip, TextureFormat.RFloat, request => Read(request, id));
+        _pending = Readback(texture, mip);
+        _pendingDone = request => Read(request, id);
         if (start == 0) return;
         var took = Stopwatch.GetTimestamp() - start;
         _frameTicks += took;
@@ -1855,16 +1773,13 @@ internal static class DepthCulling
         var start = Diagnostics.Measuring ? Stopwatch.GetTimestamp() : 0;
         _arriveFrames = _arriveFrames * 0.9f + (Time.frameCount - _requestFrame) * 0.1f;
         _arriveMs = _arriveMs * 0.9f + (Time.realtimeSinceStartup - _roundTime) * 1000f * 0.1f;
-        var data = request.GetData<float>();
-        if (data.Length != _width * _height)
+        if (!CopyReadback(request, _width * _height, ref _depth))
         {
-            Status = $"readback size {data.Length}, expected {_width}x{_height}";
+            Status = $"readback size {request.layerDataSize / sizeof(float)}, expected {_width}x{_height}";
             _state = Idle;
             return;
         }
 
-        if (_depth.Length != data.Length) _depth = new float[data.Length];
-        data.CopyTo(_depth);
         // The scope's latest depth, if it's from the last few frames.
         _roundScopeDepth = _roundScoped && Time.frameCount - _scopeNextFrame <= 4 && _scopeNext.Length == _scopeNextWidth * _scopeNextHeight;
         if (_roundScopeDepth)
@@ -1890,7 +1805,6 @@ internal static class DepthCulling
             Array.Clear(set.NextCheck, 0, set.NextCheck.Length);
             Array.Clear(_lampStreak, 0, _lampStreak.Length);
             Array.Clear(_lampNextCheck, 0, _lampNextCheck.Length);
-            Array.Clear(_areaStreak, 0, _areaStreak.Length);
             _resetStreaks = false;
         }
 
@@ -1973,7 +1887,7 @@ internal static class DepthCulling
             if (Diagnostics.Measuring) Status = $"{_width}x{_height} depth (arrives after {_arriveFrames:0.0} frames, {_arriveMs:0.0} ms; results applied {_appliedAge:0.0} frames old, one every {_resultEvery:0.0} frames), "
                      + $"{Tested} tested, depth checks {(DepthPyramid.UseNative ? "native" : "C#")} ({CoveredDeep} covered deep, checked again later; {GameSkipped} covered not asked about, the game draws none of them now); cells: {CellsOut} of {Cells} out of view, {CellsCovered} covered whole"
                      + (_roundReach.sqrMagnitude > 0.0001f ? $"; moving {_roundReach.x:0.00} m sideways, {_roundReach.y:0.00} up, {_roundReach.z:0.00} forward before the next result, {MovingKept} kept drawn for it, {GearParts} parts of what you hold not counted as sliding cover" + (MovingKept > 0 ? $" (grown up to {_movingGrow:0.0} texels, cover as near as {_movingCover:0.0} m)" : "") : "")
-                     + (_roundLamps ? $"; lamps: {LampsOff} of {_lamps.Length} skipped (their lit area covered); area lights: {AreasOff} of {_areas.Length} skipped" : "")
+                     + (_roundLamps ? $"; lamps: {LampsOff} of {_lamps.Length} skipped (their lit area covered)" : "")
                      + (_roundScoped ? _roundScopeDepth ? $"; scope: {_scopeWidth}x{_scopeHeight} depth, {ScopeTested} checked against it, view {ScopeFov:0.0}°, lead {ScopeLeadDegrees:0.0}°" : "; scope: no depth of its own, its view stays drawn" : "");
             TimeParts(pyramidTicks, lanesTicks, Stopwatch.GetTimestamp() - phase);
         }
@@ -1995,7 +1909,7 @@ internal static class DepthCulling
         var cells = set.CellStart.Length - 1;
         var cellClaims = (cells + CellsPerClaim - 1) / CellsPerClaim;
         var lampClaims = (_lamps.Length + LampsPerClaim - 1) / LampsPerClaim;
-        var claims = cellClaims + lampClaims + (_areas.Length + LampsPerClaim - 1) / LampsPerClaim;
+        var claims = cellClaims + lampClaims;
         int claim;
         long since = 0;
         Mark(ref since);
@@ -2008,15 +1922,10 @@ internal static class DepthCulling
                 Stamp(ref lane.CellTicks, ref since);
                 continue;
             }
-            else if (claim < cellClaims + lampClaims)
+            else
             {
                 var from = (claim - cellClaims) * LampsPerClaim;
                 TestLamps(lane, from, Math.Min(_lamps.Length, from + LampsPerClaim), ref m);
-            }
-            else
-            {
-                var from = (claim - cellClaims - lampClaims) * LampsPerClaim;
-                TestAreas(lane, from, Math.Min(_areas.Length, from + LampsPerClaim), ref m);
             }
 
             Stamp(ref lane.LampTicks, ref since);
@@ -2357,7 +2266,7 @@ internal static class DepthCulling
         _testNote = $"depth test, {_testRounds} rounds: round {(_sumPyramid + _sumLanes + _sumMerge) / n:0.00} ms avg, {_worstRound:0.00} worst | pyramid {_sumPyramid / n:0.00}, "
                     + $"{Lanes.Length} threads {_sumLanes / n:0.00} wall ({_worstLanes:0.00} worst; summed over threads: walking cells {_sumWalk / n:0.00} ({(_sumWalk - _sumCellsWalked * _clockReadMs) / n:0.00} without the clock reads: {_sumCellsWalked / n:0} cells at {_clockReadMs * 1e6:0} ns), testing {_sumTests / n:0.00}, lamps {_sumLamps / n:0.00}), merge {_sumMerge / n:0.00} | "
                     + $"per round: walked {_sumWalked / n:0} objects in view + {_sumWalkedOut / n:0} out of view, {_sumDue / n:0} due, {_sumTested / n:0} tested, "
-                    + $"lamps {_sumLampsOn / n:0} on of {_lamps.Length} ({_sumLampsInView / n:0} reaching into view, {_sumLampTests / n:0} tested), {_areas.Length} area lights | "
+                    + $"lamps {_sumLampsOn / n:0} on of {_lamps.Length} ({_sumLampsInView / n:0} reaching into view, {_sumLampTests / n:0}  tested) | "
                     + $"arrives after {_arriveFrames:0.0} frames, applied {_appliedAge:0.0} old, one every {_resultEvery:0.0}, {_testAfterCull} started after the cull";
         _testSince = now;
         _testRounds = _testAfterCull = 0;
@@ -2943,15 +2852,17 @@ internal static class DepthCulling
             AccessTools.Method(typeof(PerfectCullingCrossSceneGroup), nameof(PerfectCullingCrossSceneGroup.UpdateSwitchQueues));
 
         [PatchPrefix]
-        private static void Prefix(PerfectCullingCrossSceneGroup __instance, FastArray<ushort> ____queueActivate)
+        private static void Prefix(PerfectCullingCrossSceneGroup __instance)
         {
             var set = _set;
-            if (set == null || Time.frameCount - _activeFrame > 1 || ____queueActivate == null) return;
+            if (set == null || Time.frameCount - _activeFrame > 1) return;
+            var queue = __instance._queueActivate;
+            if (queue == null) return;
             try
             {
                 var groups = __instance.bakeGroups;
-                var count = ____queueActivate.Count;
-                var buffer = ____queueActivate.Buffer;
+                var count = queue.Count;
+                var buffer = queue.Buffer;
                 var take = Math.Min(count, PerfectCullingSettings.Instance.numActivationsPerVolume / 2);
                 for (var k = 1; k <= take; k++)
                 {
@@ -2980,7 +2891,6 @@ internal static class DepthCulling
         _resetStreaks = true;
         if (_set != null) ShowHidden(_set);
         RestoreLamps();
-        RestoreAreas();
     }
 
     // Leaving a raid: its objects are gone with the scene.
@@ -2988,7 +2898,6 @@ internal static class DepthCulling
     {
         ShowAll();
         SetLamps(Array.Empty<Light>());
-        SetAreas(Array.Empty<AreaLight>(), new List<Bounds>());
         _set = null;
         PendingRenderers.Clear();
         PendingBounds.Clear();
@@ -2996,7 +2905,7 @@ internal static class DepthCulling
         PendingLod.Clear();
         Tracked = 0;
         Hidden = 0;
-        _gameSwitched = new HashSet<Renderer>();
+        _gameSwitched = new HashSet<Renderer>(Diagnostics.ReferenceComparer.Instance);
         Rounds = 0;
         _lastApplyFrame = 0;
         _lastApplyTime = 0f;
@@ -3018,6 +2927,7 @@ internal static class DepthCulling
         _scopeCamera = null;
         _scopeAdded = null;
         _scopeReading = false;
+        _scopeDone = null;
         _scopeNextFrame = -1000;
         ScopeTested = 0;
     }

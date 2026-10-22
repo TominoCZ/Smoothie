@@ -4,23 +4,24 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using BepInEx;
+using BepInEx.Unity.IL2CPP;
 using Comfort.Common;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using EFT;
 using HarmonyLib;
-using SPT.Reflection.Patching;
+using SPTushonka.Reflection.Patching;
 using UnityEngine;
 
 namespace Smoothie;
 
-[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.9")]
+[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.1.0")]
 // Optional: when Fika is installed it has to load first, or its types aren't there yet when
 // Smoothie looks for them and its observed bots aren't recognised. Without Fika this does nothing.
 [BepInDependency("com.fika.core", BepInDependency.DependencyFlags.SoftDependency)]
-public class Plugin : BaseUnityPlugin
+public class Plugin : BasePlugin
 {
-    internal static ManualLogSource Log = null!;
+    internal new static ManualLogSource Log = null!;
 
     internal static ConfigEntry<bool> ThrottleAnimators = null!;
     internal static ConfigEntry<bool> UnityStepping = null!;
@@ -74,14 +75,25 @@ public class Plugin : BaseUnityPlugin
     // The part of OwnTicks spent drawing the overlays (OnGUI).
     internal static long OverlayTicks;
 
-    private static ISender? _vanillaSender;
-    private static BackendSender? _sender;
-
-    private void Awake()
+    // IL2CPP: BepInEx 6 has no plugin MonoBehaviour, so Unity's per-frame calls come through
+    // this one, added to BepInEx's hidden object.
+    internal sealed class Runner : MonoBehaviour
     {
-        Log = Logger;
+        public Runner(IntPtr pointer) : base(pointer) { }
+
         // The overlays draw with GUI, not GUILayout: no layout pass for OnGUI every frame.
-        useGUILayout = false;
+        public void Awake() => useGUILayout = false;
+        public void Update() => Plugin.Update();
+        public void LateUpdate() => Plugin.LateUpdate();
+        public void OnGUI() => Plugin.OnGUI();
+    }
+
+    public override void Load()
+    {
+        Log = base.Log;
+        // First: registers Runner with IL2CPP, which the engine timing uses as its marker type.
+        // Unity calls its Update from the next frame on, after everything below is set up.
+        AddComponent<Runner>();
 
         const string bots = "1. Bots";
         ThrottleAnimators = Bind(bots, "Fewer animation updates for far or unseen bots", true,
@@ -140,7 +152,7 @@ public class Plugin : BaseUnityPlugin
             "With \"Hide objects covered by nearer ones\" on: everything nearer than this stays drawn, all around you (behind you the game doesn't draw anyway). Lower hides more close by, like the room next to yours; higher is safer if something close ever shows up late, where it's big on screen.", 83, false,
             new AcceptableValueRange<float>(1f, 64f));
         SkipCoveredLamps = Bind(other, "Skip lamps lighting only covered areas", true,
-            "With \"Hide objects covered by nearer ones\" on: a lamp or area light (the game's glowing panels, signs and windows) whose whole lit area is hidden behind nearer things (the next room, the other side of a wall) lights nothing you can see, so it stops lighting and drawing its shadows until any of that area may come into view. Each lamp with shadows draws everything around it again for its shadow (on Factory up to ~100 draw calls each). Its light can come on a moment late when the area comes into view, like hidden objects. The sun and moon are left alone.", 81);
+            "With \"Hide objects covered by nearer ones\" on: a lamp whose whole lit area is hidden behind nearer things (the next room, the other side of a wall) lights nothing you can see, so it stops lighting and drawing its shadows until any of that area may come into view. Each lamp with shadows draws everything around it again for its shadow (on Factory up to ~100 draw calls each). Its light can come on a moment late when the area comes into view, like hidden objects. The sun and moon are left alone.", 81);
         HideShadows = Bind(other, "Covered objects also stop casting shadows", true,
             "With \"Hide objects covered by nearer ones\" on: a covered object isn't drawn into shadow maps either, and the game's separate shadow-only meshes (simplified shadow casters for big structures) are checked and switched off when covered too. In buildings most of what's drawn is shadows: on Factory over a thousand draw calls a frame. Off: covered objects keep casting their shadows, which is always right but costs those draws.", 82);
         SkipOutOfView = Bind(other, "Skip LOD work for objects you cannot see", true,
@@ -166,6 +178,7 @@ public class Plugin : BaseUnityPlugin
             "Draws everything solid grouped by material instead of nearest first, so the game switches materials less often (on Streets ~270 fewer switches a frame). That moves a little work from your CPU, which Tarkov is almost always waiting on, to your graphics card (things hidden behind nearer ones get shaded too). Nothing you see changes. If the overlay shows GPU wait going up with this on, your graphics card is the limit: switch it off.", 79);
         KeepCleanupPaused = Bind(other, "Prevent memory cleanup stutters in raids", false,
             "On PCs with enough RAM the game pauses memory cleanup during a raid, so it can't stutter in a fight. Opening your inventory (an SPT feature) runs a cleanup and leaves cleanup on for the rest of the raid, which then stutters every minute or two. With this on, that cleanup still runs, then cleanup is paused again; if 4 GB of garbage piles up, one more runs. Only in raids, and only on PCs the game itself pauses cleanup on (the server's RAM limit, 25 GB by default): below that, cleanup stays on as the game wants. If something else switches it back on right after every pause (another mod), it's left on for the rest of that raid.", 75);
+
         KeepBackendConnection = Bind(other, "Keep server connection open (faster menus)", true,
             "Keeps one connection to the SPT server open instead of reconnecting for every request. Speeds up menus, most of all when the server runs on another PC.", 80);
 
@@ -224,7 +237,7 @@ public class Plugin : BaseUnityPlugin
         Safely("animation throttling", () =>
         {
             new PlayerLateUpdatePatch().Enable();
-            Camera.onPreCull += AnimatorThrottle.OpticPreCull;
+            Camera.onPreCull += (System.Action<Camera>)AnimatorThrottle.OpticPreCull;
             new ArmsUpdatePatch().Enable();
             new MovementUpdatePatch().Enable();
         });
@@ -244,7 +257,10 @@ public class Plugin : BaseUnityPlugin
         Safely("diagnostics", () =>
         {
             Diagnostics.Start();
-            if (ProfileScripts.Value) Diagnostics.StartProfiling();
+            // Left on from last time: started in the first raid (Update), not here. IL2CPP: its
+            // hooks put in while the game was still starting crashed it outright (no log);
+            // switched on in a raid they're fine.
+            _profileInRaid = ProfileScripts.Value;
         });
         Safely("stats overlay", Overlay.Apply);
         Safely("forced-GC watch", () => Diagnostics.WatchForcedCollections(new Harmony("com.tominocz.smoothie.gcwatch")));
@@ -432,9 +448,13 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
+    private static ISender? _vanillaSender;
+    private static BackendSender? _sender;
+
     private static void ApplySender()
     {
-        _vanillaSender ??= SenderHelper._senders[SenderHelper.EConnectionType.Default];
+        var senders = SenderHelper._senders;
+        _vanillaSender ??= senders[SenderHelper.EConnectionType.Default];
 
         ISender sender = _vanillaSender;
         if (On(KeepBackendConnection))
@@ -442,7 +462,7 @@ public class Plugin : BaseUnityPlugin
             // If the runtime can't build it, lose this one feature, not the whole plugin.
             try
             {
-                sender = _sender ??= new BackendSender();
+                sender = _sender ??= BackendSender.Create(_vanillaSender);
             }
             catch (Exception ex)
             {
@@ -450,10 +470,10 @@ public class Plugin : BaseUnityPlugin
             }
         }
 
-        SenderHelper._senders[SenderHelper.EConnectionType.Default] = sender;
+        senders[SenderHelper.EConnectionType.Default] = sender;
     }
 
-    private bool _wasInRaid;
+    private static bool _wasInRaid;
 
     // After each flip of an A/B setting: FlipSettle s to settle, then FlipWindow s of frame times, draw calls and
     // SetPass averaged into one log line (with logging on), so on and off can be compared
@@ -667,7 +687,7 @@ public class Plugin : BaseUnityPlugin
         if (series) SeriesWindowDone(flipOn, (float)average, sync);
 #endif
     }
-    private float _lastSweep;
+    private static float _lastSweep;
 
     // Player types that replace Player.LateUpdate without calling it (Fika's observed bots
     // on a client), so the patch on it never runs for them. They're driven from here, once
@@ -676,7 +696,30 @@ public class Plugin : BaseUnityPlugin
     // IK (AnimatorThrottle.PickInterval), and a curve read a frame late is a footstep a frame late.
     private static readonly Dictionary<Type, bool> OwnLateUpdate = new();
 
-    private void LateUpdate()
+    // An override of LateUpdate between this type and Player that doesn't call its base's (the game's
+    // ClientPlayer does). IL2CPP: whether it does is read from its native code (Diagnostics.CallsOf);
+    // can't tell (patched by someone), counted as its own, which is only handled once a frame anyway.
+    private static bool SkipsPlayerLateUpdate(Type type)
+    {
+        for (var t = type; t != null && t != typeof(Player); t = t.BaseType)
+        {
+            var method = AccessTools.DeclaredMethod(t, nameof(Player.LateUpdate), Type.EmptyTypes);
+            if (method == null || t.BaseType == null) continue;
+            var baseMethod = AccessTools.Method(t.BaseType, nameof(Player.LateUpdate), Type.EmptyTypes);
+            try
+            {
+                if (!Diagnostics.CallsOf(method).Contains(baseMethod)) return true;
+            }
+            catch (Exception)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static void LateUpdate()
     {
         try
         {
@@ -698,7 +741,7 @@ public class Plugin : BaseUnityPlugin
                 var type = player.GetType();
                 if (!OwnLateUpdate.TryGetValue(type, out var own))
                 {
-                    own = AccessTools.Method(type, nameof(Player.LateUpdate), Type.EmptyTypes)?.DeclaringType != typeof(Player);
+                    own = SkipsPlayerLateUpdate(type);
                     OwnLateUpdate[type] = own;
                     if (own) Log.LogInfo($"{type.Name} has its own LateUpdate, throttling it from Smoothie's");
                 }
@@ -714,7 +757,9 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
-    private void Update()
+    private static bool _profileInRaid;
+
+    private static void Update()
     {
         Diagnostics.Measuring = On(ShowCosts) || On(ShowStats) || Diagnostics.Logging;
         var start = Diagnostics.Measuring ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -722,6 +767,11 @@ public class Plugin : BaseUnityPlugin
         {
             _inHideout = Diagnostics.InHideout;
             if (!_checkedSetup) CheckSetup();
+            if (_profileInRaid && Diagnostics.InRaid)
+            {
+                _profileInRaid = false;
+                if (ProfileScripts.Value) Diagnostics.StartProfiling();
+            }
             if (_notice != null) ShowNotice();
 #if DEBUG
             // Debug builds: Delete flips "Turn off all fixes (A/B test)" and measures it, without
@@ -766,6 +816,7 @@ public class Plugin : BaseUnityPlugin
                 DistantDetail.RestoreAll();
                 DepthCulling.Clear();
                 LodCulling.Clear();
+                AnimatorThrottle.OnRaidStart();
                 Occlusion.OnRaidStart();
                 Diagnostics.OnRaidEnd();
                 // Its state is cleared above: what failed once this raid gets another go.
@@ -787,12 +838,12 @@ public class Plugin : BaseUnityPlugin
             if (inRaid && Time.unscaledTime - _lastSweep > 5f)
             {
                 _lastSweep = Time.unscaledTime;
+                Guard(ThrottleAnimators, AnimatorThrottle.Prune);
+                Guard(SkipHiddenIk, Occlusion.Prune);
                 Guard(HideCulledWeapons, HandsCulling.Sweep);
                 Guard(SimplifyDistant, DistantDetail.Sweep);
+                Guard(HotPathFixes, HotPaths.PruneStopBotSpawn);
                 Guard(HotPathFixes, HotPaths.ResyncMenuVideos);
-#if DEBUG
-                JitNames.Poll();
-#endif
             }
 
             if (inRaid) Guard(SkipOutOfView, LodCulling.Tick);
@@ -819,10 +870,10 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
-    private string _overlay = "";
-    private float _overlayAt;
+    private static string _overlay = "";
+    private static float _overlayAt;
 
-    private void OnGUI()
+    private static void OnGUI()
     {
         var start = Diagnostics.Measuring ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         try
@@ -840,7 +891,7 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
-    private void DrawOverlays()
+    private static void DrawOverlays()
     {
         var top = 10f;
         if (On(ShowCosts)) top = Overlay.Draw(10, top) + 6;

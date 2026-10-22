@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Iced ships with BepInEx 6: build with SPT_PATH set to the SPT 5.0 folder. -->
+    <Reference Include="$(SPT_PATH)/BepInEx/core/Iced.dll" />
+  </ItemGroup>
+</Project>

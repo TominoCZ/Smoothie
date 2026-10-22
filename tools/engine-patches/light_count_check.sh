@@ -1,5 +1,5 @@
 #!/bin/bash
-# Checks EnginePatch.LightCount: its Original bytes are the DLL's at RVA 0x3FC771, its Routine bytes
+# Checks EnginePatch.LightCount: its Original bytes are the DLL's at RVA 0xD437A0, its Routine bytes
 # are what light_count.s assembles to, and the routine, run natively on fake LightManagers, leaves
 # the count Unity's code would size its buffers with. Linux x86-64, needs as and gcc.
 # usage: light_count_check.sh [path to UnityPlayer.dll, default $SPT_PATH/UnityPlayer.dll]
@@ -24,7 +24,7 @@ e = struct.unpack_from('<I', d, 0x3c)[0]; n = struct.unpack_from('<H', d, e + 6)
 osz = struct.unpack_from('<H', d, e + 20)[0]; opt = e + 24
 for s in range(n):
     vs, va, rs, rp = struct.unpack_from('<IIII', d, opt + osz + s * 40 + 8)
-    if va <= 0x3FC771 < va + vs: at = 0x3FC771 - va + rp
+    if va <= 0xD437A0 < va + vs: at = 0xD437A0 - va + rp
 assert d[at:at + len(original)] == original, 'Original bytes differ from the DLL'
 assert open(asm, 'rb').read() == routine, 'Routine bytes differ from light_count.s'
 with open(out, 'w') as f:
@@ -46,13 +46,14 @@ static struct node lights[50];
 
 static uint64_t run(uint8_t *code, uint64_t *rax)
 {
-    uint64_t r14, a;
-    // Entered as Unity enters it (rcx = manager, r8 = 0, r14 garbage); the back slot points at a
-    // ret, so the jmp back returns here.
-    __asm__ volatile("mov $0xdeadbeefdeadbeef, %%r14\n\tcall *%[fn]\n\tmov %%r14, %[r14]"
-                     : [r14] "=&r"(r14), "=a"(a) : [fn] "r"(code), "c"(&manager), "d"(0) : "r8", "r14", "memory", "cc");
+    uint64_t count, a;
+    // Entered as Unity enters it (rax = manager, r12 = 0, rdi garbage); the back slot points at a
+    // ret, so the jmp back returns here. Leaves the count in rdi.
+    __asm__ volatile("push %%rdi\n\tpush %%r12\n\txor %%r12d, %%r12d\n\tmov $0xdeadbeefdeadbeef, %%rdi\n\t"
+                     "call *%%rsi\n\tmov %%rdi, %%rcx\n\tpop %%r12\n\tpop %%rdi"
+                     : "=c"(count), "=a"(a) : "S"(code), "a"(&manager) : "rdx", "memory", "cc");
     *rax = a;
-    return r14;
+    return count;
 }
 
 int main(void)
@@ -60,9 +61,9 @@ int main(void)
     uint8_t *code = mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     memcpy(code, routine, sizeof routine);
     code[0x40] = 0xC3;
-    *(uint64_t *)(code + 0x20) = (uint64_t)(code + 0x40);
+    *(uint64_t *)(code + 0x1e) = (uint64_t)(code + 0x40);
     int failed = 0;
-    // (lights in the list, the set's count, what r14 must be)
+    // (lights in the list, the set's count, what rdi must be)
     int cases[][3] = { {0, 0, 0}, {5, 0, 5}, {1, 0, 1}, {50, 50, 50}, {598 % 50, 598 % 50, 598 % 50}, {50, 7, 7} };
     for (unsigned c = 0; c < sizeof cases / sizeof cases[0]; c++)
     {
@@ -71,12 +72,11 @@ int main(void)
         for (int i = 0; i < n; i++) { at->next = &lights[i]; at = &lights[i]; }
         at->next = &manager.head;
         manager.count = cases[c][1];
-        uint64_t rax, r14 = run(code, &rax);
-        int walked = cases[c][1] == 0;
-        if (r14 != (uint64_t)cases[c][2] || (walked && rax != (uint64_t)&manager.head))
+        uint64_t rax, count = run(code, &rax);
+        if (count != (uint64_t)cases[c][2] || rax != (uint64_t)&manager.head)
         {
-            printf("FAIL: %d lights, count %d: r14 %llu, want %d%s\n", n, cases[c][1], (unsigned long long)r14,
-                   cases[c][2], walked && rax != (uint64_t)&manager.head ? ", rax not the manager" : "");
+            printf("FAIL: %d lights, count %d: rdi %llu, want %d%s\n", n, cases[c][1], (unsigned long long)count,
+                   cases[c][2], rax != (uint64_t)&manager.head ? ", rax not the manager" : "");
             failed = 1;
         }
     }

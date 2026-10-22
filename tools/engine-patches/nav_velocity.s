@@ -1,48 +1,59 @@
 .intel_syntax noprefix
 .text
-# Replacement for the velocity read in NavMeshManager::UpdateNavMeshObstacles (RVA 0xA47831).
-# For every NavMeshObstacle, every frame, Unity asks the physics module for the velocity of the
-# obstacle's object (virtual call +0xd8, PhysicsModule::GetObjectVelocity) and stores it at
-# obstacle+0x6c. Only the crowd part reads it back (agent avoidance; see nav_crowd.s), and the
-# C# NavMeshObstacle.velocity getter, which neither EFT nor the usual mods call. ~0.8% of the
-# main thread on Streets.
-# Entered by jmp inside the per-obstacle loop: r13 = NavMeshManager, crowd at [r13+0x90],
-# rbx = obstacle. Skips the read while no agent slot is active (same test as nav_crowd.s);
-# otherwise does Unity's instructions and goes on to the call.
-# rax, rcx, rdx are free at both exits: 0xA47840 sets rdx and gets rcx/rax as Unity's code
-# leaves them; Unity's own skip path reaches 0xA47862 with them in any state, and the code there
-# loads them before use. Flags aren't read after either exit.
-# Patch site (EnginePatch.NavVelocity): the 15 bytes at RVA 0xA47831
-#   48 8B 0D B0 1F 2B 01         mov rcx,[rip+0x12b1fb0]   (physics module pointer, RVA 0x1CF97E8)
-#   48 85 C9                     test rcx,rcx
-#   74 25                        je 0xA47862
-#   48 8B 01                     mov rax,[rcx]
-# become jmp [rip+0] + this routine's address + 1 nop. Address slots, filled at runtime:
-# physics_slot = RVA 0x1CF97E8, back_slot = RVA 0xA47840 (the call), skip_slot = RVA 0xA47862.
-# Unity 2022.3.43f1, UnityPlayer_Win64_player_mono_x64.pdb id BD9605D7A8BC4F21AF766D4707334ADC1.
-# Assemble with assemble.sh; how this was found and how to redo it: EnginePatch.cs header.
+# Replacement for the velocity read in NavMeshManager::UpdateNavMeshObstacles' per-obstacle step
+# (function 0xD5180, its only caller the obstacle loop at 0x702022; site RVA 0xD527B).
+# For every NavMeshObstacle, every frame, Unity asks the physics module (getter 0x15B1F0) for the
+# velocity of the obstacle's object (virtual call +0xd8) and stores it at obstacle+0x94. Only the
+# crowd part reads it back (agent avoidance; see nav_crowd.s), and the C# NavMeshObstacle.velocity
+# getter, which neither the game nor the usual mods call. ~0.8% of the main thread on Streets in 0.16.
+# This step doesn't get the manager, so it's read from Unity's global (RVA 0x1AB97E8, what
+# NavMeshManager::Update 0xECA200 passes to the loop). Skips the read while the crowd is missing
+# or no agent slot is active (same test as nav_crowd.s); otherwise does Unity's instructions and
+# goes on to the virtual call. No manager at all: Unity's way.
+# rax, r10, r11 are free at both exits: 0xD528D (the call's setup) and 0xD52BA (the function's
+# end) don't read them before writing. Flags aren't read after either exit. The routine's own
+# call to the getter is made with rsp exactly as Unity's was (entered by jmp).
+# Patch site (EnginePatch.NavVelocity): the 18 bytes at RVA 0xD527B
+#   E8 70 5F 08 00               call 0x15B1F0             (physics module getter)
+#   48 85 C0                     test rax,rax
+#   74 35                        je 0xD52BA
+#   48 8B 08                     mov rcx,[rax]
+#   4C 8D 44 24 20               lea r8,[rsp+0x20]
+# become jmp [rip+0] + this routine's address + 4 nops. Address slots, filled at runtime:
+# manager_slot = RVA 0x1AB97E8, module_slot = RVA 0x15B1F0, back_slot = RVA 0xD528D (mov rdx,
+# [rbx+0x58], the call's setup), skip_slot = RVA 0xD52BA.
+# Unity 2022.3.43f2 (BSG's build, SPT 5.0 / EFT 1.2), UnityPlayer_Win64_player_il2cpp_x64.pdb id
+# 3C9C828B7504489DB8FD348F0F90ADE01. Assemble with assemble.sh; how this was found and how to
+# redo it: EnginePatch.cs header and unity-internals.md.
 cave:
-    mov rcx, [r13+0x90]
-    test rcx, rcx
+    mov rax, [rip+manager_slot]
+    mov rax, [rax]
+    test rax, rax
+    jz unity
+    mov rax, [rax+0x90]
+    test rax, rax
     jz skip
-    mov eax, [rcx+0x80]
-    mov rdx, [rcx+0xa0]
+    mov r10d, [rax+0x80]
+    mov r11, [rax+0xa0]
 slot:
-    dec eax
+    dec r10d
     js skip
-    imul rcx, rax, 0x2c0
-    test byte ptr [rdx+rcx+0x2ba], 1
+    imul rax, r10, 0x2c0
+    test byte ptr [r11+rax+0x2ba], 1
     jz slot
-    mov rcx, [rip+physics_slot]
-    mov rcx, [rcx]
-    test rcx, rcx
+unity:
+    call qword ptr [rip+module_slot]
+    test rax, rax
     jz skip
-    mov rax, [rcx]
+    mov rcx, [rax]
+    lea r8, [rsp+0x20]
     jmp qword ptr [rip+back_slot]
 skip:
     jmp qword ptr [rip+skip_slot]
 .balign 8
-physics_slot:
+manager_slot:
+    .quad 0
+module_slot:
     .quad 0
 back_slot:
     .quad 0

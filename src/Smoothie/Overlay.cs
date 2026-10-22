@@ -4,6 +4,7 @@ using System.Linq;
 using BepInEx.Configuration;
 using EFT;
 using HarmonyLib;
+using SPTushonka.Reflection.Il2Cpp;
 using UnityEngine;
 
 namespace Smoothie;
@@ -39,7 +40,8 @@ internal static class Overlay
         // This frame's value, for Other (the rest of the frame) to subtract.
         public float Last;
         public readonly float[] History = new float[Samples];
-        public readonly Texture2D Graph = new(Samples, GraphHeight, TextureFormat.RGBA32, false) { filterMode = FilterMode.Point };
+        // IL2CPP: Smoothie holding it doesn't stop Unity unloading it with the scene.
+        public readonly Texture2D Graph = new Texture2D(Samples, GraphHeight, TextureFormat.RGBA32, false) { filterMode = FilterMode.Point }.KeepLoaded();
         public double Sum;
         public string Shown = "", Share = "", Tag = "";
 
@@ -201,8 +203,9 @@ internal static class Overlay
         _harmony.Patch(AccessTools.Method(typeof(Physics), nameof(Physics.Simulate), new[] { typeof(float) }),
             prefix, new HarmonyMethod(typeof(Overlay), nameof(PhysicsEnd)));
         // Collider positions brought up to date for raycasts, once a frame for your own player
-        // (Unity's automatic sync is off in EFT). Physics.SyncTransforms itself is native.
-        _harmony.Patch(AccessTools.Method(typeof(PhysicsExtensions.Simulation), nameof(PhysicsExtensions.Simulation.ForceSyncTransforms)),
+        // (Unity's automatic sync is off in EFT). Physics.SyncTransforms itself is native, and
+        // IL2CPP inlined ForceSyncTransforms into this.
+        _harmony.Patch(AccessTools.Method(typeof(PhysicsExtensions.Simulation), nameof(PhysicsExtensions.Simulation.SyncTransforms)),
             prefix, new HarmonyMethod(typeof(Overlay), nameof(SyncEnd)));
         // The whole AI tick: brains (AICoreController, where BigBrain/SAIN layers run), AI
         // tasks (vision), smoke vision and every bot's BotOwner.UpdateManual.
@@ -210,11 +213,17 @@ internal static class Overlay
             prefix, new HarmonyMethod(typeof(Overlay), nameof(AiEnd)) { priority = Priority.Last });
         // Building bot profiles, by whoever builds them: the game per spawn attempt
         // (BotProfileClient.CreateProfile, 197 at once in a vanilla Horde spawn check), the
-        // game's LoadBots and Smoothie's budget (both through this Profile constructor).
+        // game's LoadBots (its descriptor => new Profile lambda) and Smoothie's budget (which calls
+        // ProfileBegin/End itself). IL2CPP: not Profile's constructor: a Harmony patch on an IL2CPP
+        // constructor runs it on a newly made object and leaves the game's profile empty.
         _mainThread = System.Threading.Thread.CurrentThread;
         var profileBegin = new HarmonyMethod(typeof(Overlay), nameof(ProfileBegin)) { priority = Priority.First };
         var profileEnd = new HarmonyMethod(typeof(Overlay), nameof(ProfileEnd));
-        _harmony.Patch(AccessTools.Constructor(typeof(Profile), new[] { typeof(ProfileDescriptor) }), profileBegin, finalizer: profileEnd);
+        foreach (var method in AccessTools.GetDeclaredMethods(AccessTools.Inner(typeof(ClientBackendSession), "__c"))
+                     .Where(m => m.Name.StartsWith("_LoadBots_b__") && m.ReturnType == typeof(Profile)))
+        {
+            _harmony.Patch(method, profileBegin, finalizer: profileEnd);
+        }
         if (Plugin.FindType("BotProfileClient") is { } client)
         {
             foreach (var method in AccessTools.GetDeclaredMethods(client).Where(m => m.Name == "CreateProfile" && !m.IsAbstract))
@@ -227,14 +236,14 @@ internal static class Overlay
     // Outermost call only, so a profile built inside CreateProfile isn't counted twice; a
     // finalizer, so a throw can't leave the depth stuck. Main thread only: the experimental
     // worker builds profiles off it, and they don't cost the frame.
-    private static void ProfileBegin()
+    internal static void ProfileBegin()
     {
         if (System.Threading.Thread.CurrentThread != _mainThread || _profileDepth++ != 0) return;
         _profileStart = Stopwatch.GetTimestamp();
         Diagnostics.NoteProfileBuilt();
     }
 
-    private static void ProfileEnd()
+    internal static void ProfileEnd()
     {
         if (System.Threading.Thread.CurrentThread == _mainThread && --_profileDepth == 0 && _on) _profileTicks += Stopwatch.GetTimestamp() - _profileStart;
     }
@@ -325,7 +334,7 @@ internal static class Overlay
             }
 
             _frameMs = frameMs;
-            var gcCount = GC.CollectionCount(0);
+            var gcCount = Il2CppSystem.GC.CollectionCount(0);
             _gcThisFrame = _lastGcCount < 0 ? 0 : gcCount - _lastGcCount;
             _lastGcCount = gcCount;
             if (_gcThisFrame > 0) _collectedNow = true;

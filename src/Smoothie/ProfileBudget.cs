@@ -8,8 +8,11 @@ using System.Threading.Tasks;
 using EFT;
 using EFT.Bots;
 using HarmonyLib;
-using SPT.Reflection.Patching;
+using Il2CppInterop.Runtime.InteropTypes.Arrays;
+using SPTushonka.Reflection.Il2Cpp;
+using SPTushonka.Reflection.Patching;
 using UnityEngine;
+using Il2CppConditions = Il2CppSystem.Collections.Generic.List<EFT.CountTypeBotWave>;
 
 namespace Smoothie;
 
@@ -19,6 +22,9 @@ namespace Smoothie;
 // 10 s. Here the profiles of every request share one time budget per frame. Same request,
 // same Profile constructor, same main thread as the game's LoadBots; nothing sees a profile
 // before its whole batch is built, so to the game this is the server answering later.
+// IL2CPP: the request is rebuilt as the game's LoadBots builds it (read from its compiled code,
+// ClientBackendSession+<LoadBots>d__214.MoveNext in GameAssembly.dll): a SendRequest with the URL,
+// an anonymous { conditions } as Params and SendRequest.DefaultRetries, through Backend.Send.
 internal static class ProfileBudget
 {
     private const double BudgetMs = 3.0;
@@ -97,7 +103,7 @@ internal static class ProfileBudget
     }
 
     // The game's LoadBots, with the profiles built under the shared budget.
-    private static async Task<Profile[]> Load(ClientBackendSession session, List<CountTypeBotWave> conditions)
+    private static async Task<Il2CppReferenceArray<Profile>> Load(ClientBackendSession session, Il2CppConditions conditions)
     {
         // The spawner counts bots whose profiles are loading (ProfilesLoadingProcess), but the
         // game's own bot client never adds to it: a bot waiting for its profile counted as a
@@ -116,14 +122,15 @@ internal static class ProfileBudget
         }
     }
 
-    private static async Task<Profile[]> LoadCounted(ClientBackendSession session, List<CountTypeBotWave> conditions)
+    private static async Task<Il2CppReferenceArray<Profile>> LoadCounted(ClientBackendSession session, Il2CppConditions conditions)
     {
-        var descriptors = await session.Send<ProfileDescriptor[]>(new SendRequest
+        var request = new SendRequest
         {
             Url = session._backendUrls.Main + "/client/game/bot/generate",
-            Params = new BotGenerateRequestParams<List<CountTypeBotWave>>(conditions),
-            Retries = SendRequest.DefaultRetries,
-        });
+            Params = new __f__AnonymousType23<Il2CppConditions>(conditions),
+            Retries = new Il2CppSystem.Nullable<byte>(SendRequest.DefaultRetries),
+        };
+        Il2CppReferenceArray<ProfileDescriptor> descriptors = await session.Send<Il2CppReferenceArray<ProfileDescriptor>>(request).AsManaged();
 
         Diagnostics.NoteProfilesReceived(descriptors.Length);
 
@@ -137,7 +144,14 @@ internal static class ProfileBudget
             await Worker.WaitAsync();
             try
             {
-                return await Task.Run(() => descriptors.Select(d => new Profile(d)).ToArray());
+                return await Task.Run(() =>
+                {
+                    // A thread IL2CPP doesn't know yet: attached for the build, detached after.
+                    using var attached = MainThread.AttachToIl2Cpp();
+                    var built = new Profile[descriptors.Length];
+                    for (var i = 0; i < built.Length; i++) built[i] = new Profile(descriptors[i]);
+                    return new Il2CppReferenceArray<Profile>(built);
+                });
             }
             catch (Exception ex)
             {
@@ -158,7 +172,16 @@ internal static class ProfileBudget
             {
                 while (Plugin.On(Plugin.SpreadProfiles) && !HasBudget()) await Task.Yield();
                 var start = Stopwatch.GetTimestamp();
-                profiles[i] = new Profile(descriptors[i]);
+                Overlay.ProfileBegin();
+                try
+                {
+                    profiles[i] = new Profile(descriptors[i]);
+                }
+                finally
+                {
+                    Overlay.ProfileEnd();
+                }
+
                 var took = Stopwatch.GetTimestamp() - start;
                 _spent += took;
                 _averageTicks += (took - _averageTicks) / 8;
@@ -171,7 +194,7 @@ internal static class ProfileBudget
             throw;
         }
 
-        return profiles;
+        return new Il2CppReferenceArray<Profile>(profiles);
     }
 
     // The game's spawn check (NonWavesSpawnScenario, every 15 s) fills up to the location's bot
@@ -273,15 +296,16 @@ internal static class ProfileBudget
             AccessTools.Method(typeof(ClientBackendSession), nameof(ClientBackendSession.LoadBots));
 
         [PatchPrefix]
-        private static bool Prefix(ClientBackendSession __instance, List<CountTypeBotWave> conditions, ref Task<Profile[]> __result)
+        private static bool Prefix(ClientBackendSession __instance, Il2CppConditions conditions,
+            ref Il2CppSystem.Threading.Tasks.Task<Il2CppReferenceArray<Profile>> __result)
         {
             try
             {
                 // Taken over for the budget, and for counting the request as a loading bot.
                 if (!Plugin.On(Plugin.SpreadProfiles) && !Plugin.On(Plugin.CapSpawnAttempts)) return true;
-                // Only on the main thread, where a yield means the next frame.
-                if (SynchronizationContext.Current == null) return true;
-                __result = Load(__instance, conditions);
+                // Only on the main thread (SPT's context there runs a yield's continuation next frame).
+                if (!MainThread.IsCurrent || SynchronizationContext.Current == null) return true;
+                __result = Load(__instance, conditions).ToIl2Cpp();
                 return false;
             }
             catch (Exception ex)

@@ -2,7 +2,7 @@
 // in ThrottleMath.cs (which stays as the fallback and as the reference the self-check compares
 // against), compiled ahead of time with SSE2. Every round the worker walks every object of every
 // cell (tens of thousands on Streets) to find the few due for a depth test; under the game's Mono
-// JIT that walk was most of the round.
+// JIT that walk was most of the round (on .NET the self-check still measures the C# ~3x slower).
 //
 // SSE2 only (x86-64 baseline, no CPUID check). Arrays are the worker's (or read racily from the
 // main thread's Hidden, as the C# does): nothing here allocates or keeps a pointer.

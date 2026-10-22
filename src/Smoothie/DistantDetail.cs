@@ -12,7 +12,7 @@ internal static class DistantDetail
 {
     private sealed class Entry
     {
-        public readonly HashSet<Renderer> Hidden = new();
+        public readonly HashSet<Renderer> Hidden = new(Diagnostics.ReferenceComparer.Instance);
         public bool Simplified;
         public float NextRefresh;
     }
@@ -24,11 +24,11 @@ internal static class DistantDetail
     private const float SmallWeaponPart = 0.15f;
 
     // ponytail: one entry per bot; cleared on raid end and on toggle-off.
-    private static readonly Dictionary<Player, Entry> Entries = new();
+    private static readonly Dictionary<Player, Entry> Entries = new(Diagnostics.ReferenceComparer.Instance);
 
     // Every pooled object above each hidden renderer, so nothing hidden ever goes back to
     // the pool (the next user, possibly you, would get invisible parts).
-    private static readonly Dictionary<AssetPoolObject, HashSet<Renderer>> ByPool = new();
+    private static readonly Dictionary<AssetPoolObject, HashSet<Renderer>> ByPool = new(Diagnostics.ReferenceComparer.Instance);
 
     private static readonly List<Renderer> Scratch = new();
 
@@ -126,7 +126,7 @@ internal static class DistantDetail
         var hands = player.HandsController != null ? player.HandsController.ControllerGameObject : null;
         var handsRoot = hands != null ? hands.transform : null;
 
-        player.GetComponentsInChildren(true, Scratch);
+        Scratch.AddRange(player.GetComponentsInChildren<Renderer>(true));
         foreach (var renderer in Scratch)
         {
             if (renderer == null || renderer.forceRenderingOff) continue;
@@ -140,7 +140,7 @@ internal static class DistantDetail
 
             for (var pool = renderer.GetComponentInParent<AssetPoolObject>(); pool != null; pool = Above(pool))
             {
-                if (!ByPool.TryGetValue(pool, out var set)) ByPool[pool] = set = new HashSet<Renderer>();
+                if (!ByPool.TryGetValue(pool, out var set)) ByPool[pool] = set = new HashSet<Renderer>(Diagnostics.ReferenceComparer.Instance);
                 set.Add(renderer);
             }
         }

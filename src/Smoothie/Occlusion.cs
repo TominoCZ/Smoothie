@@ -1,11 +1,10 @@
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
-using System.Reflection.Emit;
-using System.Runtime.CompilerServices;
 using EFT;
 using EFT.Ballistics;
 using HarmonyLib;
-using SPT.Reflection.Patching;
+using SPTushonka.Reflection.Patching;
 using UnityEngine;
 
 namespace Smoothie;
@@ -31,14 +30,15 @@ internal static class Occlusion
     // See-through hits passed before giving up on a line.
     private const int MaxHops = 4;
 
-    private static readonly ConditionalWeakTable<Player, State> States = new();
+    // IL2CPP: by the player's wrapper, held strongly (see AnimatorThrottle.States); cleared at raid start and end.
+    private static readonly Dictionary<Player, State> States = new(Diagnostics.ReferenceComparer.Instance);
 
     // What bots use for line of sight, minus grass and foliage, which you can see through.
     internal static readonly int SightMask =
         (1 << LayerMask.NameToLayer("Terrain")) | (1 << LayerMask.NameToLayer("HighPolyCollider"));
 
     // Colliders on the sight layers that don't block the view.
-    private static readonly Dictionary<Collider, bool> SeeThroughCache = new();
+    private static readonly Dictionary<Collider, bool> SeeThroughCache = new(Diagnostics.ReferenceComparer.Instance);
     private static readonly Vector3[] Points = new Vector3[10];
 
     internal static int HiddenCount;
@@ -53,7 +53,17 @@ internal static class Occlusion
 
     internal static void Enable() => new IkVisibilityPatch().Enable();
 
-    internal static void OnRaidStart() => SeeThroughCache.Clear();
+    internal static void OnRaidStart()
+    {
+        SeeThroughCache.Clear();
+        States.Clear();
+    }
+
+    // Every few seconds, with AnimatorThrottle.Prune: dead or destroyed bots are dropped.
+    internal static void Prune()
+    {
+        foreach (var player in States.Keys.Where(p => p == null || p.HealthController?.IsAlive != true).ToList()) States.Remove(player);
+    }
 
     // Replaces Player.IsVisible in the game's "run IK this frame?" test.
     public static bool VisibleForIk(Player player)
@@ -78,7 +88,7 @@ internal static class Occlusion
         if (!AnimatorThrottle.HasCamera || !AnimatorThrottle.IsBot(player)) return false;
         if (player.HealthController?.IsAlive != true) return false;
 
-        var state = States.GetValue(player, p => new State(p));
+        if (!States.TryGetValue(player, out var state)) States[player] = state = new State(player);
         if (state.Frame == Time.frameCount) return state.Hidden;
         state.Frame = Time.frameCount;
 
@@ -186,46 +196,30 @@ internal static class Occlusion
     }
 
     // Player.VisualPass decides whether to run IK with
-    // "IsVisible && distance <= CULL_GROUNDER". Only that one read is swapped, so nothing
-    // else in the game (muzzle effects, AI, sounds) sees a different visibility.
+    // "IsVisible && distance <= CULL_GROUNDER". IL2CPP has no IL to swap the IsVisible read in,
+    // so for a hidden bot the distance limit is set below zero for just this call: same result,
+    // and nothing else reads CULL_GROUNDER (only VisualPass and Fika-style observed views).
+    // Nothing else in the game (muzzle effects, AI, sounds) sees a different visibility.
     private class IkVisibilityPatch : ModulePatch
     {
         protected override MethodBase GetTargetMethod() =>
             AccessTools.Method(typeof(Player), nameof(Player.VisualPass));
 
-        [PatchTranspiler]
-        private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> code, MethodBase __originalMethod) =>
-            SwapIsVisible(code, __originalMethod);
-
-        // Swaps the one Player.IsVisible read for VisibleForIk. Anything else (none, several,
-        // or a getter that isn't a plain bool property, e.g. after a game update) and
-        // the method is left exactly as it was.
-        internal static IEnumerable<CodeInstruction> SwapIsVisible(IEnumerable<CodeInstruction> code, MethodBase original)
+        [PatchPrefix]
+        private static void Prefix(Player __instance, out float __state)
         {
-            var list = new List<CodeInstruction>(code);
-            var matches = new List<CodeInstruction>();
-            foreach (var instruction in list)
-            {
-                if ((instruction.opcode == OpCodes.Callvirt || instruction.opcode == OpCodes.Call)
-                    && instruction.operand is MethodInfo { Name: "get_IsVisible", IsStatic: false } method
-                    && method.ReturnType == typeof(bool)
-                    && method.GetParameters().Length == 0
-                    && typeof(Player).IsAssignableFrom(method.DeclaringType))
-                {
-                    matches.Add(instruction);
-                }
-            }
+            __state = float.NaN;
+            if (VisibleForIk(__instance) || !__instance.IsVisible) return;
+            var settings = EFTHardSettings.Instance;
+            __state = settings.CULL_GROUNDER;
+            settings.CULL_GROUNDER = -1f;
+        }
 
-            if (matches.Count != 1)
-            {
-                Plugin.Log.LogWarning($"{original.DeclaringType?.Name}.{original.Name}: expected one IsVisible read, found {matches.Count}; left unchanged");
-                return list;
-            }
-
-            // Swapped in place so jump labels pointing here still land.
-            matches[0].opcode = OpCodes.Call;
-            matches[0].operand = AccessTools.Method(typeof(Occlusion), nameof(VisibleForIk));
-            return list;
+        // A finalizer so the limit is put back even if the original throws.
+        [PatchFinalizer]
+        private static void Finalizer(float __state)
+        {
+            if (!float.IsNaN(__state)) EFTHardSettings.Instance.CULL_GROUNDER = __state;
         }
     }
 

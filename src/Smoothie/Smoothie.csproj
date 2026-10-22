@@ -2,38 +2,30 @@
 
   <PropertyGroup>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>1.0.9</Version>
+    <Version>1.1.0</Version>
     <AssemblyName>Smoothie</AssemblyName>
     <RootNamespace>Smoothie</RootNamespace>
   </PropertyGroup>
 
-  <!-- Supplied by the running game. -->
+  <!-- Supplied by the running game: BepInEx 6, the interop assemblies it generates from the
+       game's IL2CPP code, and SPT's patching helpers. -->
   <ItemGroup>
-    <Reference Include="Assembly-CSharp"><HintPath>$(SptManaged)/Assembly-CSharp.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine"><HintPath>$(SptManaged)/UnityEngine.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.CoreModule"><HintPath>$(SptManaged)/UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.AnimationModule"><HintPath>$(SptManaged)/UnityEngine.AnimationModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="AnimationSystem.Types"><HintPath>$(SptManaged)/AnimationSystem.Types.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.IMGUIModule"><HintPath>$(SptManaged)/UnityEngine.IMGUIModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.InputLegacyModule"><HintPath>$(SptManaged)/UnityEngine.InputLegacyModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(SptManaged)/UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.AudioModule"><HintPath>$(SptManaged)/UnityEngine.AudioModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.ParticleSystemModule"><HintPath>$(SptManaged)/UnityEngine.ParticleSystemModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.UIModule"><HintPath>$(SptManaged)/UnityEngine.UIModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.VideoModule"><HintPath>$(SptManaged)/UnityEngine.VideoModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.TerrainModule"><HintPath>$(SptManaged)/UnityEngine.TerrainModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.PhysicsModule"><HintPath>$(SptManaged)/UnityEngine.PhysicsModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="Comfort"><HintPath>$(SptManaged)/Comfort.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="BepInEx"><HintPath>$(SptPath)/BepInEx/core/BepInEx.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="$(SptInterop)/*.dll" Private="false" />
+    <Reference Include="BepInEx.Core"><HintPath>$(SptPath)/BepInEx/core/BepInEx.Core.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BepInEx.Unity.IL2CPP"><HintPath>$(SptPath)/BepInEx/core/BepInEx.Unity.IL2CPP.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BepInEx.Unity.Common"><HintPath>$(SptPath)/BepInEx/core/BepInEx.Unity.Common.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Il2CppInterop.Runtime"><HintPath>$(SptPath)/BepInEx/core/Il2CppInterop.Runtime.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Il2CppInterop.Common"><HintPath>$(SptPath)/BepInEx/core/Il2CppInterop.Common.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="0Harmony"><HintPath>$(SptPath)/BepInEx/core/0Harmony.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="spt-reflection"><HintPath>$(SptPath)/BepInEx/plugins/spt/spt-reflection.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="SPTushonka.Reflection"><HintPath>$(SptPath)/BepInEx/plugins/sptushonka/SPTushonka.Reflection.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="SPTushonka.Common"><HintPath>$(SptPath)/BepInEx/plugins/sptushonka/SPTushonka.Common.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 
   <!-- The native depth pyramid and cell walk (src/SmoothieNative, needs mingw-w64), shipped next to the plugin. -->
   <PropertyGroup>
     <NativeDir>$(MSBuildThisFileDirectory)../SmoothieNative</NativeDir>
   </PropertyGroup>
-  <Target Name="BuildNative" BeforeTargets="BeforeBuild" Inputs="$(NativeDir)/pyramid.c;$(NativeDir)/walk.c;$(NativeDir)/animpause.c;$(NativeDir)/build.sh" Outputs="$(NativeDir)/bin/SmoothieNative.dll">
+  <Target Name="BuildNative" BeforeTargets="BeforeBuild" Inputs="$(NativeDir)/pyramid.c;$(NativeDir)/walk.c;$(NativeDir)/animpause.c;$(NativeDir)/lodflags.c;$(NativeDir)/build.sh" Outputs="$(NativeDir)/bin/SmoothieNative.dll">
     <Exec Command="bash &quot;$(NativeDir)/build.sh&quot;" />
   </Target>
   <ItemGroup>

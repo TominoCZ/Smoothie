@@ -6,9 +6,10 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 using EFT.CameraControl;
 using HarmonyLib;
+using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using Koenigz.PerfectCulling;
 using Koenigz.PerfectCulling.EFT;
-using SPT.Reflection.Patching;
+using SPTushonka.Reflection.Patching;
 using UnityEngine;
 
 namespace Smoothie;
@@ -54,7 +55,7 @@ internal static class LodCulling
     private static IntPtr[] _native = Array.Empty<IntPtr>();
     // Per group whose meshes are all the baked visibility's: its meshes (else null).
     private static Renderer[]?[] _bakedParts = Array.Empty<Renderer[]?>();
-    private static readonly Dictionary<Renderer, int> GroupOf = new();
+    private static readonly Dictionary<Renderer, int> GroupOf = new(Diagnostics.ReferenceComparer.Instance);
     // Cells: groups CellStart[c] to CellStart[c + 1] - 1, a sphere around all of them, out now.
     private static int[] _cellStart = Array.Empty<int>();
     private static Vector3[] _cellCenter = Array.Empty<Vector3>();
@@ -88,7 +89,7 @@ internal static class LodCulling
     internal static void Enable()
     {
         _mainThread = Thread.CurrentThread.ManagedThreadId;
-        Camera.onPreCull += PreCull;
+        Camera.onPreCull += (System.Action<Camera>)PreCull;
         new SwitchPatch().Enable();
     }
 
@@ -284,6 +285,15 @@ internal static class LodCulling
     }
 
     // Everything back (setting off, A/B, an error, leaving the raid).
+    // The LOD loop patch is going on: SceneSkip's flag bytes from the groups forced now.
+    internal static bool RebuildFlags()
+    {
+        var forced = new List<LODGroup>(Forced);
+        for (var g = 0; g < _slot.Length; g++)
+            if (_slot[g] != 0) forced.Add(_groups[g]);
+        return SceneSkip.RebuildFlags(forced);
+    }
+
     internal static void ShowAll()
     {
         for (var g = 0; g < _reason.Length; g++)
@@ -338,7 +348,7 @@ internal static class LodCulling
     {
         var slice = (long)(2.0 / Diagnostics.TickMs);
         var start = Stopwatch.GetTimestamp();
-        var baked = new HashSet<Renderer>();
+        var baked = new HashSet<Renderer>(Diagnostics.ReferenceComparer.Instance);
         foreach (var crossScene in UnityEngine.Object.FindObjectsByType<PerfectCullingCrossSceneGroup>(FindObjectsInactive.Include, FindObjectsSortMode.None))
         {
             if (crossScene.bakeGroups == null) continue;
@@ -353,7 +363,7 @@ internal static class LodCulling
             if (index >= 0) skipLayers |= 1 << index;
         }
 
-        var moving = new Dictionary<Transform, bool>();
+        var moving = new Dictionary<Transform, bool>(Diagnostics.ReferenceComparer.Instance);
         int grown = 0, alone = 0;
         var found = new List<(long Key, LODGroup Group, Vector3 Center, float Radius, Renderer[]? Baked, float FarAt, Renderer[] Parts)>();
         var all = UnityEngine.Object.FindObjectsByType<LODGroup>(FindObjectsSortMode.None);
@@ -533,7 +543,7 @@ internal static class LodCulling
             AccessTools.Method(typeof(PerfectCullingCrossSceneGroup), nameof(PerfectCullingCrossSceneGroup.UpdateSwitchQueues));
 
         [PatchPrefix]
-        private static void Prefix(PerfectCullingCrossSceneGroup __instance, FastArray<ushort> ____queueActivate, FastArray<ushort> ____queueDeactivate)
+        private static void Prefix(PerfectCullingCrossSceneGroup __instance)
         {
             if (Forced == 0 && ToCheck.Count == 0 && GroupOf.Count == 0) return;
             try
@@ -541,8 +551,8 @@ internal static class LodCulling
                 var take = PerfectCullingSettings.Instance.numActivationsPerVolume / 2;
                 var groups = __instance.bakeGroups;
                 var main = Thread.CurrentThread.ManagedThreadId == _mainThread;
-                Visit(groups, ____queueActivate, take, true, main);
-                if (main) Visit(groups, ____queueDeactivate, take, false, true);
+                Visit(groups, __instance._queueActivate, take, true, main);
+                if (main) Visit(groups, __instance._queueDeactivate, take, false, true);
             }
             catch (Exception ex)
             {
@@ -550,7 +560,7 @@ internal static class LodCulling
             }
         }
 
-        private static void Visit(PerfectCullingBakeGroup[] groups, FastArray<ushort>? queue, int take, bool activate, bool main)
+        private static void Visit(Il2CppReferenceArray<PerfectCullingBakeGroup> groups, FastArray<ushort>? queue, int take, bool activate, bool main)
         {
             if (queue == null) return;
             var count = queue.Count;

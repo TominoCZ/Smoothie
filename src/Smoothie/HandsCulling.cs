@@ -3,7 +3,7 @@ using System.Reflection;
 using EFT;
 using EFT.AssetsManager;
 using HarmonyLib;
-using SPT.Reflection.Patching;
+using SPTushonka.Reflection.Patching;
 using UnityEngine;
 
 namespace Smoothie;
@@ -30,7 +30,7 @@ internal static class HandsCulling
     private static readonly List<Hidden> All = new();
     private static readonly List<Renderer> Scratch = new();
     private static readonly List<AssetPoolObject> PoolScratch = new();
-    private static readonly Dictionary<AssetPoolObject, Hidden> ByPool = new();
+    private static readonly Dictionary<AssetPoolObject, Hidden> ByPool = new(Diagnostics.ReferenceComparer.Instance);
 
     internal static void Enable()
     {
@@ -38,13 +38,10 @@ internal static class HandsCulling
         new PoolReturnPatch().Enable();
     }
 
-    private static readonly AccessTools.FieldRef<LocalPlayer, OfflinePlayerCulling> Culler =
-        AccessTools.FieldRefAccess<LocalPlayer, OfflinePlayerCulling>("botPlayerCulling");
-
     // Have the game's culler apply its state again (it hides a culled bot's renderers).
     internal static void Reapply(LocalPlayer player)
     {
-        var culler = Culler(player);
+        var culler = player.botPlayerCulling;
         if (culler != null) culler.ApplyVisibleState();
     }
 
@@ -92,7 +89,7 @@ internal static class HandsCulling
         if (hands == null) return;
 
         var entry = new Hidden { Player = player, Root = hands };
-        hands.GetComponentsInChildren(true, Scratch);
+        Scratch.AddRange(hands.GetComponentsInChildren<Renderer>(true));
         foreach (var renderer in Scratch)
         {
             if (renderer == null || renderer.forceRenderingOff) continue;
@@ -102,7 +99,7 @@ internal static class HandsCulling
 
         Scratch.Clear();
 
-        hands.GetComponentsInChildren(true, PoolScratch);
+        PoolScratch.AddRange(hands.GetComponentsInChildren<AssetPoolObject>(true));
         var parentPool = hands.GetComponentInParent<AssetPoolObject>();
         if (parentPool != null) PoolScratch.Add(parentPool);
         foreach (var pool in PoolScratch)

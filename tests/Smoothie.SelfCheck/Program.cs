@@ -447,6 +447,32 @@ unsafe
     foreach (var output in outputs) System.Runtime.InteropServices.Marshal.FreeHGlobal(output);
 }
 
+// The LOD flag bytes (src/SmoothieNative/lodflags.c): Unity's RemoveLODGroup (a recording stand-in)
+// still gets every call, and the bytes move as Unity moves its slots (the last into the removed
+// one), for the manager the global points at only.
+unsafe
+{
+    var manager = stackalloc ulong[8];
+    var other = stackalloc ulong[8];
+    var global = stackalloc IntPtr[] { (IntPtr)manager };
+    var flags = LodHooks.SmoothieLodFlags();
+    LodHooks.SmoothieLodInit((IntPtr)(delegate* unmanaged<IntPtr, uint, void>)&LodHooks.Remove, (IntPtr)global);
+    for (var i = 0; i < 12; i++) flags[i] = (byte)(i % 3 == 0 ? 1 : 0);   // 0, 3, 6, 9 ours
+    manager[3] = 10;                                                         // count: slots 1..9
+    LodHooks.SmoothieRemoveLODGroup((IntPtr)manager, 4);                     // 9 moves into 4
+    Check(flags[4] == 1 && flags[9] == 0, $"removing slot 4 of 10: bytes 4 = {flags[4]}, 9 = {flags[9]}, want 1, 0");
+    manager[3] = 9;
+    flags[8] = 1;
+    LodHooks.SmoothieRemoveLODGroup((IntPtr)manager, 8);                     // the last one itself
+    Check(flags[8] == 0, $"removing the last slot left its byte {flags[8]}");
+    other[3] = 8;
+    LodHooks.SmoothieRemoveLODGroup((IntPtr)other, 3);                       // not our manager
+    Check(flags[3] == 1 && flags[7] == 0, "another manager's removal moved the bytes");
+    Check(LodHooks.Removed.SequenceEqual(new[] { ((IntPtr)manager, 4U), ((IntPtr)manager, 8U), ((IntPtr)other, 3U) }),
+        $"Unity's RemoveLODGroup saw {string.Join(", ", LodHooks.Removed)}");
+    for (var i = 0; i < 12; i++) flags[i] = 0;
+}
+
 if (failures.Count > 0)
 {
     Console.Error.WriteLine($"FAIL ({failures.Count}):");
@@ -454,7 +480,7 @@ if (failures.Count > 0)
     return 1;
 }
 
-Console.WriteLine($"OK: throttle intervals, zoom, depth cover, the depth pyramid, the cell walk and the animator pause hooks behave, {binds.Count} config names are valid.");
+Console.WriteLine($"OK: throttle intervals, zoom, depth cover, the depth pyramid, the cell walk, the animator pause hooks and the LOD flag bytes behave, {binds.Count} config names are valid.");
 return 0;
 
 static string SourcePath([System.Runtime.CompilerServices.CallerFilePath] string path = "") => path;
@@ -484,4 +510,16 @@ static unsafe class AnimHooks
     [System.Runtime.InteropServices.UnmanagedCallersOnly]
     internal static void Prepare(IntPtr graph, int type, double time, float delta, ulong frame, uint index, int context) =>
         Prepares.Add((graph, type, time, delta, frame, index, context));
+}
+
+static unsafe class LodHooks
+{
+    internal static readonly List<(IntPtr, uint)> Removed = new();
+
+    [System.Runtime.InteropServices.DllImport("SmoothieNative")] internal static extern byte* SmoothieLodFlags();
+    [System.Runtime.InteropServices.DllImport("SmoothieNative")] internal static extern void SmoothieLodInit(IntPtr remove, IntPtr managerGlobal);
+    [System.Runtime.InteropServices.DllImport("SmoothieNative")] internal static extern void SmoothieRemoveLODGroup(IntPtr manager, uint index);
+
+    [System.Runtime.InteropServices.UnmanagedCallersOnly]
+    internal static void Remove(IntPtr manager, uint index) => Removed.Add((manager, index));
 }

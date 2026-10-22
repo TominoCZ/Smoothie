@@ -47,13 +47,10 @@ internal static class AnimatorThrottle
         public bool Releasing;
     }
 
-    private static readonly ConditionalWeakTable<Player, State> States = new();
-
-    private static readonly AccessTools.FieldRef<MovementContext, Player> MovementPlayer =
-        AccessTools.FieldRefAccess<MovementContext, Player>("_player");
-
-    private static readonly AccessTools.FieldRef<Player, BetterSource> StepSource =
-        AccessTools.FieldRefAccess<Player, BetterSource>("NestedStepSoundSource");
+    // IL2CPP: by the player's wrapper, held strongly (a weak table loses its entry whenever the
+    // wrapper is collected, and with it the animators switched off here). Removed on death and
+    // release, pruned of dead or destroyed players (Prune), cleared when the raid ends.
+    private static readonly Dictionary<Player, State> States = new(Diagnostics.ReferenceComparer.Instance);
 
     // Box around a standing bot, padded so bots at the edge of the screen count as on it.
     private static readonly Vector3 BotBox = new(2f, 2.5f, 2f);
@@ -110,7 +107,12 @@ internal static class AnimatorThrottle
     private static int _steps;
     private static long _stepTicks;
 
-    internal static void OnRaidStart() => _audibleRange = 0f;
+    internal static void OnRaidStart()
+    {
+        _audibleRange = 0f;
+        States.Clear();
+        HandledFrame.Clear();
+    }
 
     internal static float AudibleRange => Mathf.Max(_audibleRange, Plugin.FootstepRange.Value);
 
@@ -128,8 +130,30 @@ internal static class AnimatorThrottle
         public sbyte Bot = -1;
     }
 
-    private static readonly ConditionalWeakTable<Player, Handled> HandledFrame = new();
-    private static readonly ConditionalWeakTable<Player, Handled>.CreateValueCallback NewHandled = _ => new Handled();
+    private static readonly Dictionary<Player, Handled> HandledFrame = new(Diagnostics.ReferenceComparer.Instance);
+
+    private static Handled HandledOf(Player player)
+    {
+        if (!HandledFrame.TryGetValue(player, out var handled)) HandledFrame[player] = handled = new Handled();
+        return handled;
+    }
+
+    // Every few seconds: players dead or destroyed are dropped, so a long raid doesn't keep them
+    // (their wrappers keep the game's objects alive). A dead one's state already went in its
+    // LateUpdate; a destroyed one gets none, and its animators went with it.
+    internal static void Prune()
+    {
+        Dead.Clear();
+        foreach (var player in HandledFrame.Keys)
+            if (player == null || player.HealthController?.IsAlive != true) Dead.Add(player!);
+        foreach (var player in Dead)
+        {
+            HandledFrame.Remove(player);
+            if (player == null) States.Remove(player!);
+        }
+    }
+
+    private static readonly List<Player> Dead = new();
 
     // For the snapshot: did the animation step see this player in the last frame or this one.
     internal static bool HandledRecently(Player player) =>
@@ -137,7 +161,7 @@ internal static class AnimatorThrottle
 
     internal static void BeforeLateUpdateSafe(Player player)
     {
-        var handled = HandledFrame.GetValue(player, NewHandled);
+        var handled = HandledOf(player);
         if (handled.Frame == Time.frameCount) return;
         handled.Frame = Time.frameCount;
         var bot = IsBot(player, handled);
@@ -324,7 +348,7 @@ internal static class AnimatorThrottle
     {
         // Called for every player every frame; nearly always no step is running.
         if (Time.frameCount - _lastStepStart > 1) return;
-        var player = MovementPlayer(movement);
+        var player = movement._player;
         if (player != null && States.TryGetValue(player, out var state) && state.StepScale > 0f)
         {
             movement.LastDeltaTime = deltaTime * state.StepScale;
@@ -433,7 +457,7 @@ internal static class AnimatorThrottle
 
         // The step source's range is set from the bot's movement, gear and the player's
         // hearing each time it plays a step.
-        var source = StepSource(player);
+        var source = player.NestedStepSoundSource;
         if (source != null && source.MaxDistance > _audibleRange)
         {
             _audibleRange = Mathf.Min(source.MaxDistance, MaxAudibleRange);
@@ -484,7 +508,7 @@ internal static class AnimatorThrottle
 
     internal static float ZoomAt(Vector3 position) => InView(position, out var inOptic) && inOptic ? _opticZoom : _mainZoom;
 
-    internal static bool IsBot(Player player) => player.IsAI || IsBot(player, HandledFrame.GetValue(player, NewHandled));
+    internal static bool IsBot(Player player) => player.IsAI || IsBot(player, HandledOf(player));
 
     private static bool IsBot(Player player, Handled handled)
     {

@@ -131,7 +131,7 @@ internal static class Diagnostics
             foreach (var step in steps)
             {
                 // Ours from an earlier start: wrapped again, every marker would double up.
-                if (step.type == typeof(Diagnostics)) continue;
+                if (step.type == MarkerType) continue;
                 timed.Add(Marker(names.Count));
                 names.Add($"{phase.type?.Name}.{step.type?.Name}");
                 timed.Add(step);
@@ -151,10 +151,14 @@ internal static class Diagnostics
         PlayerLoop.SetPlayerLoop(loop);
     }
 
+    // IL2CPP: the loop takes an IL2CPP type; Smoothie's own registered component marks its steps.
+    private static Il2CppSystem.Type? _markerType;
+    private static Il2CppSystem.Type MarkerType => _markerType ??= Il2CppInterop.Runtime.Il2CppType.Of<Plugin.Runner>();
+
     private static PlayerLoopSystem Marker(int stage) => new()
     {
-        type = typeof(Diagnostics),
-        updateDelegate = () =>
+        type = MarkerType,
+        updateDelegate = (Action)(() =>
         {
             var now = Stopwatch.GetTimestamp();
             if (_currentStage >= 0)
@@ -165,7 +169,7 @@ internal static class Diagnostics
 
             _currentStage = stage;
             _stageStart = now;
-        },
+        }),
     };
 
     // Stage timing runs while the profiler or the cost overlay uses it.
@@ -240,7 +244,7 @@ internal static class Diagnostics
 
     internal static void Start()
     {
-        _gcCountAtStart = GC.CollectionCount(0);
+        _gcCountAtStart = Il2CppSystem.GC.CollectionCount(0);
         ApplyRecorders();
     }
 
@@ -250,9 +254,9 @@ internal static class Diagnostics
     // thread's share of drawing that camera (culling, shadow maps, submitting draws). Shows
     // how many cameras render and which cost what; summed over the snapshot window. Culling is
     // up to onPreRender; after it come shadow maps and the draws.
-    private static readonly Dictionary<Camera, (long Ticks, long CullTicks, int Frames)> CameraTimes = new();
-    private static readonly Dictionary<Camera, long> CameraCulled = new();
-    private static readonly Dictionary<Camera, long> CameraStart = new();
+    private static readonly Dictionary<Camera, (long Ticks, long CullTicks, int Frames)> CameraTimes = new(Diagnostics.ReferenceComparer.Instance);
+    private static readonly Dictionary<Camera, long> CameraCulled = new(Diagnostics.ReferenceComparer.Instance);
+    private static readonly Dictionary<Camera, long> CameraStart = new(Diagnostics.ReferenceComparer.Instance);
     private static bool _cameraHooks;
     internal static int CamerasThisFrame;
     private static int _camerasCounting, _cameraFrame = -1;
@@ -280,24 +284,40 @@ internal static class Diagnostics
         CameraTimes[camera] = (time.Ticks + Stopwatch.GetTimestamp() - start, time.CullTicks + culled - start, time.Frames + 1);
     }
 
+    // IL2CPP delegates made once: removing one needs the very instance that was added.
+    private static readonly Camera.CameraCallback PreCullHook = (System.Action<Camera>)CameraPreCull;
+    private static readonly Camera.CameraCallback PreRenderHook = (System.Action<Camera>)CameraPreRender;
+    private static readonly Camera.CameraCallback PostRenderHook = (System.Action<Camera>)CameraPostRender;
+
     private static void HookCameras(bool on)
     {
         if (on == _cameraHooks) return;
         _cameraHooks = on;
         if (on)
         {
-            Camera.onPreCull += CameraPreCull;
-            Camera.onPreRender += CameraPreRender;
-            Camera.onPostRender += CameraPostRender;
+            Camera.onPreCull += PreCullHook;
+            Camera.onPreRender += PreRenderHook;
+            Camera.onPostRender += PostRenderHook;
             return;
         }
 
-        Camera.onPreCull -= CameraPreCull;
-        Camera.onPreRender -= CameraPreRender;
-        Camera.onPostRender -= CameraPostRender;
+        Camera.onPreCull -= PreCullHook;
+        Camera.onPreRender -= PreRenderHook;
+        Camera.onPostRender -= PostRenderHook;
         CameraTimes.Clear();
         CameraStart.Clear();
         CameraCulled.Clear();
+    }
+
+    // IL2CPP: Il2CppInterop's rebuilt ProfilerRecorder.StartNew(category, string) hands Unity a pointer
+    // 20 bytes into the name (it adds IL2CPP's string data offset to a .NET string's characters), so
+    // no counter was ever found (draw calls and the rest read -1). The char* constructor it calls,
+    // with the right pointer and StartNew's own default options (markers such as "Main Thread" need
+    // SumAllSamplesInFrame).
+    private static unsafe ProfilerRecorder Recorder(ProfilerCategory category, string name)
+    {
+        fixed (char* chars = name)
+            return new ProfilerRecorder(category, chars, name.Length, 15, ProfilerRecorderOptions.Default | ProfilerRecorderOptions.StartImmediately);
     }
 
     internal static void ApplyRecorders()
@@ -306,14 +326,14 @@ internal static class Diagnostics
         if (want == _drawCalls.Valid) return;
         if (want)
         {
-            _mainThread = ProfilerRecorder.StartNew(ProfilerCategory.Internal, "Main Thread", 15);
-            _renderThread = ProfilerRecorder.StartNew(ProfilerCategory.Internal, "Render Thread", 15);
-            _gcAlloc = ProfilerRecorder.StartNew(ProfilerCategory.Memory, "GC Allocated In Frame", 15);
-            _drawCalls = ProfilerRecorder.StartNew(ProfilerCategory.Render, "Draw Calls Count", 15);
-            _shadowCasters = ProfilerRecorder.StartNew(ProfilerCategory.Render, "Shadow Casters Count", 15);
-            _setPassCalls = ProfilerRecorder.StartNew(ProfilerCategory.Render, "SetPass Calls Count", 15);
-            _batches = ProfilerRecorder.StartNew(ProfilerCategory.Render, "Batches Count", 15);
-            _skinnedMeshes = ProfilerRecorder.StartNew(ProfilerCategory.Render, "Visible Skinned Meshes Count", 15);
+            _mainThread = Recorder(ProfilerCategory.Internal, "Main Thread");
+            _renderThread = Recorder(ProfilerCategory.Internal, "Render Thread");
+            _gcAlloc = Recorder(ProfilerCategory.Memory, "GC Allocated In Frame");
+            _drawCalls = Recorder(ProfilerCategory.Render, "Draw Calls Count");
+            _shadowCasters = Recorder(ProfilerCategory.Render, "Shadow Casters Count");
+            _setPassCalls = Recorder(ProfilerCategory.Render, "SetPass Calls Count");
+            _batches = Recorder(ProfilerCategory.Render, "Batches Count");
+            _skinnedMeshes = Recorder(ProfilerCategory.Render, "Visible Skinned Meshes Count");
             HookCameras(true);
             return;
         }
@@ -369,8 +389,8 @@ internal static class Diagnostics
         if (_raidEndAt >= 0f)
         {
             // A collection that starts 10 s or more after the raid, once the game has let go of it.
-            if (Time.unscaledTime - _raidEndAt < 10f) _gcAtRaidEnd = GC.CollectionCount(0);
-            else if (GC.CollectionCount(0) != _gcAtRaidEnd) ReportLeftovers();
+            if (Time.unscaledTime - _raidEndAt < 10f) _gcAtRaidEnd = Il2CppSystem.GC.CollectionCount(0);
+            else if (Il2CppSystem.GC.CollectionCount(0) != _gcAtRaidEnd) ReportLeftovers();
             return;
         }
 
@@ -385,7 +405,7 @@ internal static class Diagnostics
     private static void ReportLeftovers()
     {
         _raidEndAt = -1f;
-        var alive = SeenPlayers.Select(w => w.Target).Where(o => o != null).ToList();
+        var alive = SeenPlayers.Select(w => w.Target).OfType<object>().ToList();
         var total = SeenPlayers.Count;
         SeenPlayers.Clear();
         SeenPlayerIds.Clear();
@@ -393,7 +413,7 @@ internal static class Diagnostics
         {
             var held = HeldBySmoothie(alive);
             Plugin.Log.LogInfo($"{DateTime.Now:HH:mm:ss.fff} after the raid, with a memory cleanup run since: {alive.Count} of its {total} players still in memory " +
-                               $"(mono heap {UsedHeap() >> 20} MB); reachable from Smoothie's fields: {(held.Count == 0 ? "none" : string.Join(", ", held))}");
+                               $"(game heap {UsedHeap() >> 20} MB); reachable from Smoothie's fields: {(held.Count == 0 ? "none" : string.Join(", ", held))}");
         }
         catch (Exception ex)
         {
@@ -469,7 +489,7 @@ internal static class Diagnostics
     internal sealed class ReferenceComparer : IEqualityComparer<object>
     {
         internal static readonly ReferenceComparer Instance = new();
-        bool IEqualityComparer<object>.Equals(object x, object y) => ReferenceEquals(x, y);
+        bool IEqualityComparer<object>.Equals(object? x, object? y) => ReferenceEquals(x, y);
         public int GetHashCode(object o) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(o);
     }
 
@@ -496,7 +516,8 @@ internal static class Diagnostics
         foreach (var scene in scenes)
         {
             if (!scene.isLoaded) continue;
-            scene.GetRootGameObjects(roots);
+            roots.Clear();
+            roots.AddRange(scene.GetRootGameObjects());
             int cameras = 0, videos = 0, sounds = 0, animators = 0, canvases = 0, particles = 0, lights = 0;
             var named = new List<string>();
             foreach (var root in roots)
@@ -553,7 +574,7 @@ internal static class Diagnostics
         _raidStarted = true;
         Cleanup.Start(heap);
         if (!Logging) return;
-        Plugin.Log.LogInfo($"raid started: GC mode {GarbageCollector.GCMode} (incremental {GarbageCollector.isIncremental}), mono heap {heap >> 20} MB, " +
+        Plugin.Log.LogInfo($"raid started: GC mode {GarbageCollector.GCMode} (incremental {GarbageCollector.isIncremental}), game heap {heap >> 20} MB, " +
                            $"RAM {SystemInfo.systemMemorySize / 1024} GB (game disables GC in raid from {InGameMemoryManagement.Settings.GigabytesRequiredToDisableGCDuringRaid} GB)");
     }
 
@@ -569,7 +590,7 @@ internal static class Diagnostics
         if (!_raidStarted || !Plugin.On(Plugin.KeepCleanupPaused)) return;
         if (InGameMemoryManagement.CurrentMemorySize < InGameMemoryManagement.Settings.GigabytesRequiredToDisableGCDuringRaid) return;
         var gaveUp = Cleanup.GaveUp;
-        switch (Cleanup.Tick(GarbageCollector.GCMode != GarbageCollector.Mode.Disabled, GC.CollectionCount(0),
+        switch (Cleanup.Tick(GarbageCollector.GCMode != GarbageCollector.Mode.Disabled, Il2CppSystem.GC.CollectionCount(0),
                     UnityEngine.Profiling.Profiler.GetMonoUsedSizeLong, Time.unscaledTime, Time.frameCount))
         {
             case CleanupPause.Action.Pause:
@@ -594,7 +615,7 @@ internal static class Diagnostics
     internal static void WatchForcedCollections(Harmony harmony)
     {
         var prefix = new HarmonyMethod(typeof(Diagnostics), nameof(ForcedCollectionPrefix));
-        foreach (var method in typeof(GC).GetMethods(BindingFlags.Public | BindingFlags.Static).Where(m => m.Name == nameof(GC.Collect)))
+        foreach (var method in typeof(Il2CppSystem.GC).GetMethods(BindingFlags.Public | BindingFlags.Static).Where(m => m.Name == nameof(Il2CppSystem.GC.Collect)))
         {
             harmony.Patch(method, prefix);
         }
@@ -634,7 +655,7 @@ internal static class Diagnostics
         ProfileCallers.Clear();
     }
 
-    private static void BotRequestPrefix(List<CountTypeBotWave> conditions)
+    private static void BotRequestPrefix(Il2CppSystem.Collections.Generic.List<CountTypeBotWave> conditions)
     {
         if (!Logging || !InRaid || conditions == null) return;
         var asked = string.Join(", ", conditions.Select(c => $"{c.Limit}x {c.Role} {c.Difficulty}"));
@@ -720,7 +741,7 @@ internal static class Diagnostics
         ("EFT.GameWorld", "RegisterPlayer"),
         ("EFT.BotOwner", "Create"),
         ("EFT.BotOwner", "PreActivate"),
-        ("EFT.BotOwner", "method_10"),
+        ("EFT.BotOwner", "Activate"),
         ("EFT.BotSpawner", "ActivateBotCallback"),
         ("Fika.Core.Main.GameMode.HostGameController", "CreateBot"),
     };
@@ -734,7 +755,7 @@ internal static class Diagnostics
     private static readonly (Type Type, string Method)[] Opened =
     {
         (typeof(BotOwner), nameof(BotOwner.PreActivate)),
-        (typeof(BotOwner), nameof(BotOwner.method_10)),
+        (typeof(BotOwner), nameof(BotOwner.Activate)),
 #if DEBUG
         // Debug builds only: the hooks stay until the game closes, and a death sequence rebuilt
         // by Harmony (OnDead, everything it calls, every mod's death handler) is too much to
@@ -763,9 +784,9 @@ internal static class Diagnostics
             }
         }
 
-        // Overrides too (Fika's players override OnDead).
-        var opened = Opened.SelectMany(o => AccessTools.AllTypes().Where(t => o.Type.IsAssignableFrom(t))
-            .SelectMany(t => AccessTools.GetDeclaredMethods(t).Where(m => m.Name == o.Method && !m.IsAbstract)));
+        // IL2CPP: the methods as declared; no overrides from other mods' types (Fika isn't on SPT 5.0)
+        // and no scan of every loaded type for them (it took the game down here).
+        var opened = Opened.SelectMany(o => AccessTools.GetDeclaredMethods(o.Type).Where(m => m.Name == o.Method && !m.IsAbstract));
         foreach (var parent in opened.ToList()) OpenUp(parent);
 #if DEBUG
         TimeHandlers(null);
@@ -777,7 +798,7 @@ internal static class Diagnostics
         if (TimeStep(Steps, parent, $"{parent.DeclaringType?.Name}.{parent.Name}") == null) return;
         try
         {
-            _harmony!.Patch(parent, new HarmonyMethod(typeof(Diagnostics), nameof(Enter)) { priority = Priority.First },
+            Hook(parent, new HarmonyMethod(typeof(Diagnostics), nameof(Enter)) { priority = Priority.First },
                 finalizer: new HarmonyMethod(typeof(Diagnostics), nameof(Leave)));
             foreach (var callee in Callees(parent)) TimeInner(callee, $"{parent.Name} > {callee.DeclaringType!.Name}.{callee.Name}");
         }
@@ -810,7 +831,7 @@ internal static class Diagnostics
         var parent = $"{best.DeclaringType?.Name}.{best.Name}";
         try
         {
-            _harmony!.Patch(best, new HarmonyMethod(typeof(Diagnostics), nameof(EnterDrilled)) { priority = Priority.First },
+            Hook(best, new HarmonyMethod(typeof(Diagnostics), nameof(EnterDrilled)) { priority = Priority.First },
                 finalizer: new HarmonyMethod(typeof(Diagnostics), nameof(LeaveDrilled)));
             foreach (var callee in Callees(best))
             {
@@ -819,7 +840,7 @@ internal static class Diagnostics
                 Parts[callee] = part;
                 try
                 {
-                    _harmony.Patch(callee, new HarmonyMethod(typeof(Diagnostics), nameof(Prefix)) { priority = Priority.First },
+                    Hook(callee, new HarmonyMethod(typeof(Diagnostics), nameof(Prefix)) { priority = Priority.First },
                         new HarmonyMethod(typeof(Diagnostics), nameof(PartPostfix)) { priority = Priority.Last });
                 }
                 catch (Exception)
@@ -848,9 +869,33 @@ internal static class Diagnostics
     // them costs whole frames, and patching its rendering internals broke the picture. Never
     // generic ones either: Mono shares their code between instantiations, and patching
     // MyExtensions.RandomElement<ISpawnPoint> crashed the game natively when a bot started a patrol.
+    // IL2CPP: no IL to read; the native code's direct calls, as Il2CppInterop's xref scan finds them.
+    // What a method's machine code calls, read once and kept. IL2CPP: not XrefScanner.XrefScan, which
+    // reads each global the method loads as an object; in a method that hasn't run yet those are
+    // Unity 2022's unresolved metadata tokens, and reading one crashed the game outright. These are
+    // the same decoded call targets, globals left alone. A method someone already patched starts
+    // with a jump into Harmony's code instead, so
+    // Hook reads a method before hooking it, and one patched by someone else counts as calling nothing.
+    private static readonly Dictionary<MethodBase, List<MethodBase>> CallsCache = new();
+
+    internal static List<MethodBase> CallsOf(MethodBase method)
+    {
+        if (CallsCache.TryGetValue(method, out var known)) return known;
+        var calls = new List<MethodBase>();
+        var info = Il2CppInterop.Common.Il2CppInteropUtils.GetIl2CppMethodInfoPointerFieldForGeneratedMethod(method)?.GetValue(null);
+        if (info is IntPtr pointer && pointer != IntPtr.Zero && Harmony.GetPatchInfo(method) is not { Owners.Count: > 0 })
+        {
+            calls = Il2CppInterop.Common.XrefScans.XrefScannerLowLevel.JumpTargets(BodyOf(pointer))
+                .Where(target => target != IntPtr.Zero)
+                .Select(Il2CppInterop.Common.XrefScans.XrefScanMethodDb.TryResolvePointer).OfType<MethodBase>().Distinct().ToList();
+        }
+
+        CallsCache[method] = calls;
+        return calls;
+    }
+
     private static IEnumerable<MethodInfo> Callees(MethodBase method) =>
-        PatchProcessor.ReadMethodBody(method)
-            .Select(i => i.Value).OfType<MethodInfo>().Distinct()
+        CallsOf(method).OfType<MethodInfo>()
             .Where(m => !m.IsAbstract && !m.IsGenericMethod && m.DeclaringType != null && !m.DeclaringType.IsGenericType && IsGameCode(m.DeclaringType.Assembly)
                         && !m.Name.StartsWith("get_") && !m.Name.StartsWith("set_") && !m.Name.StartsWith("add_") && !m.Name.StartsWith("remove_")
                         && m.GetMethodBody() != null)
@@ -994,7 +1039,7 @@ internal static class Diagnostics
         try
         {
             into[method] = step;
-            _harmony!.Patch(method, new HarmonyMethod(typeof(Diagnostics), nameof(Prefix)) { priority = Priority.First },
+            Hook(method, new HarmonyMethod(typeof(Diagnostics), nameof(Prefix)) { priority = Priority.First },
                 new HarmonyMethod(typeof(Diagnostics), nameof(StepPostfix)) { priority = Priority.Last });
             return step;
         }
@@ -1100,6 +1145,57 @@ internal static class Diagnostics
 
     // Times the scripts running right now that aren't timed yet. Rerun every few seconds,
     // because bots and most raid scripts appear after the raid starts.
+    // Every profiler hook on game code goes through here. IL2CPP: the compiler gives identical
+    // methods one body (an empty Update shares its body with 3000+ methods), and a hook on it runs
+    // for all of them, reading their arguments as this method's own: the game crashed outright.
+    // Methods without a body of their own are left untimed.
+    private static void Hook(MethodBase method, HarmonyMethod? prefix, HarmonyMethod? postfix = null, HarmonyMethod? finalizer = null)
+    {
+        // A Harmony patch on an IL2CPP constructor runs it on a newly made object, not the game's.
+        if (method.IsConstructor) throw new InvalidOperationException("it's a constructor");
+        var sharers = BodySharers(method);
+        if (sharers > 1) throw new InvalidOperationException($"its machine code is shared with {sharers - 1} other methods");
+        CallsOf(method);
+        _harmony!.Patch(method, prefix, postfix, finalizer: finalizer);
+    }
+
+    // Methods per native body, over every loaded IL2CPP class; counted once (about a second).
+    private static Dictionary<IntPtr, int>? _bodies;
+
+    private static unsafe int BodySharers(MethodBase method)
+    {
+        var info = Il2CppInterop.Common.Il2CppInteropUtils.GetIl2CppMethodInfoPointerFieldForGeneratedMethod(method)?.GetValue(null);
+        if (info is not IntPtr pointer || pointer == IntPtr.Zero) return 0;
+        if (_bodies == null)
+        {
+            _bodies = new Dictionary<IntPtr, int>();
+            uint count = 0;
+            var assemblies = (IntPtr*)Il2CppInterop.Runtime.IL2CPP.il2cpp_domain_get_assemblies(Il2CppInterop.Runtime.IL2CPP.il2cpp_domain_get(), ref count);
+            for (var n = 0; n < count; n++)
+            {
+                var image = Il2CppInterop.Runtime.IL2CPP.il2cpp_assembly_get_image(assemblies[n]);
+                var classes = Il2CppInterop.Runtime.IL2CPP.il2cpp_image_get_class_count(image);
+                for (uint i = 0; i < classes; i++)
+                {
+                    var klass = Il2CppInterop.Runtime.IL2CPP.il2cpp_image_get_class(image, i);
+                    if (klass == IntPtr.Zero) continue;
+                    var iterator = IntPtr.Zero;
+                    IntPtr each;
+                    while ((each = Il2CppInterop.Runtime.IL2CPP.il2cpp_class_get_methods(klass, ref iterator)) != IntPtr.Zero)
+                    {
+                        var body = BodyOf(each);
+                        if (body != IntPtr.Zero) _bodies[body] = _bodies.GetValueOrDefault(body) + 1;
+                    }
+                }
+            }
+        }
+
+        return _bodies.GetValueOrDefault(BodyOf(pointer));
+    }
+
+    private static unsafe IntPtr BodyOf(IntPtr methodInfo) =>
+        Il2CppInterop.Runtime.Runtime.UnityVersionHandler.Wrap((Il2CppInterop.Runtime.Runtime.Il2CppMethodInfo*)methodInfo).MethodPointer;
+
     private static void PatchRunningScripts()
     {
         if (!_profiling) return;
@@ -1117,7 +1213,7 @@ internal static class Diagnostics
             try
             {
                 Buckets[method] = new Bucket { Name = $"{method.DeclaringType?.FullName}.{method.Name}" };
-                _harmony!.Patch(method, prefix, postfix);
+                Hook(method, prefix, postfix);
                 patched++;
             }
             catch (Exception)
@@ -1235,14 +1331,14 @@ internal static class Diagnostics
     // mods' time still shows in the engine stages (ScriptRunBehaviourUpdate and so on).
     private static bool IsGameCode(Assembly assembly)
     {
-        var name = assembly.GetName().Name;
-        return name == "Assembly-CSharp" || name == "Assembly-CSharp-firstpass" || name.StartsWith("spt-") || name == "Fika.Core";
+        var name = assembly.GetName().Name ?? "";
+        return name == "Assembly-CSharp" || name == "Assembly-CSharp-firstpass" || name.StartsWith("SPTushonka.") || name == "Fika.Core";
     }
 
     private static bool IsGameOrSpt(Assembly assembly)
     {
-        var name = assembly.GetName().Name;
-        return name == "Assembly-CSharp" || name == "Assembly-CSharp-firstpass" || name.StartsWith("UnityEngine") || name.StartsWith("Unity.") || name.StartsWith("spt-") || name == "Fika.Core";
+        var name = assembly.GetName().Name ?? "";
+        return name == "Assembly-CSharp" || name == "Assembly-CSharp-firstpass" || name.StartsWith("UnityEngine") || name.StartsWith("Unity.") || name.StartsWith("SPTushonka.") || name == "Fika.Core";
     }
 
     // The timestamp prefix every method timed here shares.
@@ -1558,7 +1654,7 @@ internal static class Diagnostics
     // (at most one a second, loading screens are full of them), marked as such.
     private static void LogHitch(float ms, bool inRaid)
     {
-        var gcCount = GC.CollectionCount(0);
+        var gcCount = Il2CppSystem.GC.CollectionCount(0);
         var players = inRaid ? Singleton<GameWorld>.Instance.AllAlivePlayersList.Count : 0;
 
         // One line a second at most, counting the ones in between, so a stretch of bad frames
@@ -1699,7 +1795,7 @@ internal static class Diagnostics
 
         // Heap growth over the window; meaningless if a collection ran in between.
         var heapNow = UsedHeap();
-        var gcNow = GC.CollectionCount(0);
+        var gcNow = Il2CppSystem.GC.CollectionCount(0);
         _heapGrowthMBps = gcNow == _windowGcCount && _windowHeap > 0 ? (heapNow - _windowHeap) / mb / seconds : -1;
         _windowHeap = heapNow;
         _windowGcCount = gcNow;
@@ -1713,8 +1809,8 @@ internal static class Diagnostics
         var sb = new StringBuilder();
         sb.AppendLine($"  fps {1000f / _fastMs:0} now, {1000f / _slowMs:0} before | frame {_fastMs:0.0} ms" +
                       $" | main thread {Ms(_mainThread)} | render thread {Ms(_renderThread)}");
-        sb.AppendLine($"  GC alloc/frame {Kb(_gcAlloc)} | GC runs since start {GC.CollectionCount(0) - _gcCountAtStart}" +
-                      $" | mono heap {UnityEngine.Profiling.Profiler.GetMonoUsedSizeLong() / (1024 * 1024)} MB" +
+        sb.AppendLine($"  GC alloc/frame {Kb(_gcAlloc)} | GC runs since start {Il2CppSystem.GC.CollectionCount(0) - _gcCountAtStart}" +
+                      $" | game heap {UnityEngine.Profiling.Profiler.GetMonoUsedSizeLong() / (1024 * 1024)} MB" +
                       $" | draw calls {Count(_drawCalls)} | shadow casters {Count(_shadowCasters)}");
         sb.AppendLine($"  batches {Count(_batches)} | SetPass calls {Count(_setPassCalls)} | visible skinned meshes {Count(_skinnedMeshes)}");
         AppendRenderBreakdown(sb);
@@ -1796,7 +1892,7 @@ internal static class Diagnostics
             foreach (var part in _topParts.Take(rows)) sb.AppendLine($"    {part.Ms,7:0.000} ms  {part.Calls,6:0.#} calls  {part.Name}");
         }
 
-        sb.AppendLine(_heapGrowthMBps >= 0 ? $"  mono heap growing {_heapGrowthMBps:0.0} MB/s" : "  mono heap growth: a collection ran, no total this time");
+        sb.AppendLine(_heapGrowthMBps >= 0 ? $"  game heap growing {_heapGrowthMBps:0.0} MB/s" : "  game heap growth: a collection ran, no total this time");
 
         return sb.ToString().TrimEnd();
     }
@@ -1825,7 +1921,7 @@ internal static class Diagnostics
     {
         AnimatorThrottle.NextFrame();
         var camera = AnimatorThrottle.CameraPosition;
-        var baked = new HashSet<Renderer>();
+        var baked = new HashSet<Renderer>(Diagnostics.ReferenceComparer.Instance);
         // The baked groups live on each scene's PerfectCullingCrossSceneGroup (a plain field);
         // the volumes' bakeGroups property throws at runtime, with no bake descriptor active.
         foreach (var crossScene in Object.FindObjectsByType<Koenigz.PerfectCulling.EFT.PerfectCullingCrossSceneGroup>(FindObjectsInactive.Include, FindObjectsSortMode.None))

@@ -19,14 +19,15 @@ All threads (job workers, render thread) instead: -p $pid in place of -t $pid, -
 report; -F 499 and dwarf,32768 keep the file to a few hundred MB.
 Report:
   stacks.py x.data x.maps --syms UnityPlayer.dll=<publics.txt> --syms mono-2.0-bdwgc.dll=<publics.txt>
-    [--names BepInEx]   name C# frames through a Debug build's JitNames (same game process)
+  On SPT 5.0 (IL2CPP) the game's C# is GameAssembly.dll, unwound like any DLL; name it with
+  --syms GameAssembly.dll=<publics.txt from tools/il2cpp-xref: dotnet run -- publics x x>.
     [--focus TEXT]      callers and callees of functions whose name contains TEXT
     [--tree]            top-down tree from the thread's start
     [--folded FILE]     folded stacks for flamegraph.pl or https://www.speedscope.app
     [--check]           fail unless most stacks reach the thread's start (the unwinder works)
 publics.txt files come from publics.py over Unity's public PDBs (see EnginePatch.cs).
 """
-import argparse, bisect, collections, mmap, os, struct, subprocess, sys, time
+import argparse, bisect, collections, mmap, os, struct, subprocess, sys
 
 u16 = lambda d, o: struct.unpack_from('<H', d, o)[0]
 u32 = lambda d, o: struct.unpack_from('<I', d, o)[0]
@@ -474,35 +475,10 @@ def unwind(ip, uip, regs, stack, mods):
     return frames, 'too deep', scanned
 
 
-def name_jit(addresses, bepinex):
-    """Asks the game's Debug build (JitNames) to name C# addresses; same game process only."""
-    out = {}
-    if not bepinex or not addresses:
-        return out
-    request, reply = os.path.join(bepinex, 'smoothie_resolve.txt'), os.path.join(bepinex, 'smoothie_resolved.txt')
-    if os.path.exists(reply):
-        os.remove(reply)
-    with open(request, 'w') as f:
-        f.write('\n'.join(f'{a:x}' for a in sorted(addresses)))
-    for _ in range(40):  # polled every 5 s in raid
-        if os.path.exists(reply) and not os.path.exists(request):
-            break
-        time.sleep(0.5)
-    else:
-        print('C# names: no answer from the game (Debug build, in raid?)', file=sys.stderr)
-        return out
-    for line in open(reply, errors='replace'):
-        p = line.split(' ', 1)
-        if len(p) == 2 and p[1].strip() != '?':
-            out[int(p[0], 16)] = 'C#!' + p[1].strip()
-    return out
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('data'); ap.add_argument('maps')
     ap.add_argument('--syms', action='append', default=[], help='DLL=publics.txt')
-    ap.add_argument('--names', help='BepInEx folder of a running Debug build, to name C# frames')
     ap.add_argument('--focus', action='append', default=[])
     ap.add_argument('--tree', action='store_true')
     ap.add_argument('--folded')
@@ -529,8 +505,6 @@ def main():
     if not total:
         sys.exit('no samples')
 
-    jit = {f for s in stacks for f in s if isinstance(f, int) and mods.find(f)[0] == 'jit'}
-    jit_names = name_jit(jit, a.names)
     names = {}
 
     def name(f):
@@ -538,7 +512,7 @@ def main():
             return f
         if f not in names:
             kind, mod = mods.find(f)
-            names[f] = (jit_names.get(f, f'C#@{f:x}') if kind == 'jit' else '[kernel]' if kind == 'kernel'
+            names[f] = (f'C#@{f:x}' if kind == 'jit' else '[kernel]' if kind == 'kernel'
                         else f'?@{f:x}' if kind == 'other' else mod.symbol(f - mod.base if kind == 'pe' else f))
         return names[f]
 

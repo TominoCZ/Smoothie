@@ -11,8 +11,8 @@ using EFT.CameraControl;
 using EFT.Interactive;
 using EFT.UI;
 using HarmonyLib;
-using SPT.Reflection.Patching;
-using Systems.Effects;
+using SPTushonka.Reflection.Patching;
+using Il2CppSystems.Effects;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Video;
@@ -54,31 +54,31 @@ internal static class HotPaths
         new CorpseStillPatch().Enable();
         new ObservedCorpseStillPatch().Enable();
         new MuzzleShadowsPatch().Enable();
-        new BotCreationDataLeakPatch().Enable();
-        new SpawnDelaysLeakPatch().Enable();
         new DispatcherStopLeakPatch().Enable();
+        new AmbientCamerasPatch().Enable();
         new MenuVideoPatch().Enable();
         new MenuVideoInitPatch().Enable();
         new AirdropLandedPatch().Enable();
         new AirdropInitPatch().Enable();
         new PhysicsRegionsPatch().Enable();
         new PhysicsRatePatch().Enable();
-        new AmbientUpdatePatch().Enable();
-        new AmbientBufferPatch().Enable();
-        new AmbientStencilPatch().Enable();
     }
 
     // AmbientLight (the indoor ambient lighting) re-records two command buffers for every
-    // camera that has ever rendered, every frame in its LateUpdate: about 580 light sources
-    // checked against each camera's view. Only the main camera renders every frame; the scope
-    // and menu cameras rarely do, and what was recorded for them was thrown away unused (half
-    // of the 0.39 ms a frame it cost). Here each camera's recording waits until that camera is
-    // about to render (its pre-cull) and is skipped if it doesn't: the same buffers, recorded
-    // later in the same frame, from the camera's final position.
+    // camera that has ever rendered, every frame in its LateUpdate (RenderCameras): about 580
+    // light sources checked against each camera's view. Only the main camera renders every frame;
+    // the scope and menu cameras rarely do, and what was recorded for them was thrown away unused
+    // (half of the 0.39 ms a frame it cost in 0.16). Here each camera's recording waits until that
+    // camera is about to render (its pre-cull) and is skipped if it doesn't: the same buffers,
+    // recorded later in the same frame, from the camera's final position.
+    // IL2CPP inlined DrawStencil into RenderCameras, so RenderCameras itself is taken over: per
+    // camera it runs InitAmbientBuffer and then DrawStencil's body, and the standalone DrawStencil
+    // (0x19E5EB0 in GameAssembly) is that same body. A destroyed camera in the list: the game's own
+    // pass runs that frame, as it disposes of it.
     // By reference: looked up for every camera before every render, and Unity's own == on a
     // camera is a call into the engine.
     private static readonly Dictionary<Camera, (AmbientLight Light, AmbientLight.CamSettings Settings)> AmbientDue = new(Diagnostics.ReferenceComparer.Instance);
-    private static bool _ambientRecording, _ambientHooked;
+    private static bool _ambientHooked;
 
     private static void AmbientPreCull(Camera camera)
     {
@@ -96,55 +96,44 @@ internal static class HotPaths
         }
     }
 
-    private class AmbientUpdatePatch : ModulePatch
+    private class AmbientCamerasPatch : ModulePatch
     {
-        protected override MethodBase GetTargetMethod() => AccessTools.Method(typeof(AmbientLight), nameof(AmbientLight.method_1));
+        protected override MethodBase GetTargetMethod() => AccessTools.Method(typeof(AmbientLight), nameof(AmbientLight.RenderCameras));
 
         [PatchPrefix]
-        private static void Prefix()
+        private static bool Prefix(AmbientLight __instance)
         {
-            if (!Plugin.On(Plugin.HotPathFixes))
+            try
             {
-                // Off: the game records as before; nothing left waiting for a camera.
-                AmbientDue.Clear();
-                return;
-            }
+                if (!Plugin.On(Plugin.HotPathFixes))
+                {
+                    // Off: the game records as before; nothing left waiting for a camera.
+                    AmbientDue.Clear();
+                    return true;
+                }
 
-            if (!_ambientHooked)
+                var cameras = __instance._cameras;
+                if (cameras == null) return true;
+                foreach (var pair in cameras)
+                    if (pair.Key == null) return true;
+
+                if (!_ambientHooked)
+                {
+                    Camera.onPreCull += (Action<Camera>)AmbientPreCull;
+                    _ambientHooked = true;
+                }
+
+                // Cameras that were due but never rendered (a scope put away, a destroyed camera).
+                if (AmbientDue.Count > 16) AmbientDue.Clear();
+                foreach (var pair in cameras) AmbientDue[pair.Key] = (__instance, pair.Value);
+                return false;
+            }
+            catch (Exception ex)
             {
-                Camera.onPreCull += AmbientPreCull;
-                _ambientHooked = true;
+                Plugin.Fail(Plugin.HotPathFixes, ex);
+                return true;
             }
-
-            // Cameras that were due but never rendered (a scope put away, a destroyed camera).
-            if (AmbientDue.Count > 16) AmbientDue.Clear();
-            _ambientRecording = true;
         }
-
-        [PatchFinalizer]
-        private static void Finalizer() => _ambientRecording = false;
-    }
-
-    private class AmbientBufferPatch : ModulePatch
-    {
-        protected override MethodBase GetTargetMethod() => AccessTools.Method(typeof(AmbientLight), nameof(AmbientLight.InitAmbientBuffer));
-
-        // Only the per-frame recording in LateUpdate waits; set-up and resizes run as they are.
-        [PatchPrefix]
-        private static bool Prefix(AmbientLight __instance, AmbientLight.CamSettings camSettings, Camera currentCamera)
-        {
-            if (!_ambientRecording) return true;
-            AmbientDue[currentCamera] = (__instance, camSettings);
-            return false;
-        }
-    }
-
-    private class AmbientStencilPatch : ModulePatch
-    {
-        protected override MethodBase GetTargetMethod() => AccessTools.Method(typeof(AmbientLight), nameof(AmbientLight.DrawStencil));
-
-        [PatchPrefix]
-        private static bool Prefix() => !_ambientRecording;
     }
 
     // One of the main menu's backgrounds (VideoEnvironmentUIRoot) is four 2048x1024 60 fps
@@ -153,19 +142,10 @@ internal static class HotPaths
     // played on for the whole raid. Under Proton that's FFmpeg decoding them in software on
     // 2-3 cores, the main thread's cores: 80 fps instead of 180 whenever the menu had picked
     // that background. Paused while the background is hidden, played again when it's shown.
-    private static readonly AccessTools.FieldRef<EnvironmentUI, EnvironmentUIRoot> CurrentEnvironment =
-        AccessTools.FieldRefAccess<EnvironmentUI, EnvironmentUIRoot>("_currentEnvironment");
-
-    private static readonly AccessTools.FieldRef<VideoEnvironmentUIRoot, VideoPlayer[]> EnvironmentVideos =
-        AccessTools.FieldRefAccess<VideoEnvironmentUIRoot, VideoPlayer[]>("_videoPlayers");
-
     // For the overlay. Only the menu background's few players, emptied whenever it's shown.
     private static readonly List<VideoPlayer> PausedMenuVideos = new();
 
     internal static int PausedMenuVideoCount => PausedMenuVideos.Count(v => v != null && v.isPaused);
-
-    private static readonly AccessTools.FieldRef<EnvironmentUI, bool> EnvironmentShown =
-        AccessTools.FieldRefAccess<EnvironmentUI, bool>("_lastVisibleStateEnvironment");
 
     // Paused while hidden and this fix is on; everything paused here plays again otherwise.
     private static void SyncMenuVideos(EnvironmentUIRoot? environment, bool shown)
@@ -185,9 +165,10 @@ internal static class HotPaths
                 return;
             }
 
-            if (environment is not VideoEnvironmentUIRoot root || EnvironmentVideos(root) is not { } players) return;
-            foreach (var player in players)
+            if (environment is not VideoEnvironmentUIRoot root || root._videoPlayers is not { } streams) return;
+            foreach (var stream in streams)
             {
+                var player = stream != null ? stream.VideoPlayer : null;
                 if (player == null || !Playing(player)) continue;
                 player.Pause();
                 if (!PausedMenuVideos.Contains(player)) PausedMenuVideos.Add(player);
@@ -211,7 +192,7 @@ internal static class HotPaths
     {
         if (!MonoBehaviourSingleton<EnvironmentUI>.Instantiated) return;
         var ui = MonoBehaviourSingleton<EnvironmentUI>.Instance;
-        SyncMenuVideos(CurrentEnvironment(ui), EnvironmentShown(ui));
+        SyncMenuVideos(ui._currentEnvironment, ui._lastVisibleStateEnvironment);
     }
 
     // The airdrop crate registers its rigidbody with EFT's physics controller when it starts to
@@ -222,7 +203,7 @@ internal static class HotPaths
     // meshes, continuous-collision sweeps, the query tree rebuilt. Once the crate has landed (and
     // finished tipping over) nothing moves it again, so it's unregistered then. EFT only marks it
     // static after its smoke burns out, minutes later; the smoke is particles, not physics.
-    private static readonly HashSet<EFT.Airdrop.ServerAirDrop> LandedAirdrops = new();
+    private static readonly HashSet<EFT.Airdrop.ServerAirDrop> LandedAirdrops = new(Diagnostics.ReferenceComparer.Instance);
 
     private class AirdropLandedPatch : ModulePatch
     {
@@ -394,7 +375,8 @@ internal static class HotPaths
     }
 
     // While anything moves under physics (a grenade, a falling body, dropped loot, a door) EFT
-    // steps the whole scene's physics once per rendered frame (Simulation.SmoothSimulate), and a
+    // steps the whole scene's physics once per rendered frame (Simulation.SmoothSimulate, which
+    // IL2CPP inlined into Simulation.Update, so that's where it's taken over), and a
     // step costs about the same whatever moved: on Streets with bots ~1.2 ms. At 120 fps that's
     // twice the steps a 60 fps player runs, for the same physics. Here the time EFT would have
     // simulated each frame is added up and stepped once 1/60 s of it has built up: physics time
@@ -406,11 +388,14 @@ internal static class HotPaths
     private class PhysicsRatePatch : ModulePatch
     {
         protected override MethodBase GetTargetMethod() =>
-            AccessTools.Method(typeof(PhysicsExtensions.Simulation), nameof(PhysicsExtensions.Simulation.SmoothSimulate));
+            AccessTools.Method(typeof(PhysicsExtensions.Simulation), nameof(PhysicsExtensions.Simulation.Update));
 
         [PatchPrefix]
-        private static bool Prefix(float deltaTime)
+        private static bool Prefix()
         {
+            // The other update modes run as the game has them.
+            if (PhysicsExtensions.Simulation.UpdateMode != PhysicsExtensions.Simulation.UpdateModeType.SmoothSimulate) return true;
+            var deltaTime = Time.deltaTime;
             if (!Plugin.On(Plugin.CapPhysicsRate))
             {
                 _physicsOwed = 0f;
@@ -476,7 +461,7 @@ internal static class HotPaths
             AccessTools.Method(typeof(EnvironmentUI), nameof(EnvironmentUI.ShowEnvironment));
 
         [PatchPostfix]
-        private static void Postfix(EnvironmentUI __instance, bool value) => SyncMenuVideos(CurrentEnvironment(__instance), value);
+        private static void Postfix(EnvironmentUI __instance, bool value) => SyncMenuVideos(__instance._currentEnvironment, value);
     }
 
     // A background is loaded asynchronously and shown or hidden before its Init collects the
@@ -499,46 +484,25 @@ internal static class HotPaths
     // lives as long as the game, nothing ever raises that event (no caller in the game or any
     // installed mod), and the dispatcher's Stop() at raid end clears every event but this one:
     // all of it stayed in memory until the game was closed, gigabytes after a Horde raid.
-    // Unsubscribed as soon as it's made (the event never fires, so nothing else changes), and
-    // the event cleared at raid end for anything that subscribed while this was off.
-    private static readonly AccessTools.FieldRef<GlobalEventDispatcher, Action> StopBotSpawnEvent =
-        AccessTools.FieldRefAccess<GlobalEventDispatcher, Action>("_onStopBotSpawn");
-
-    private class BotCreationDataLeakPatch : ModulePatch
+    // Their subscriptions are dropped every few seconds in a raid (Plugin's sweep; the event never
+    // fires, so nothing else changes), and the event cleared at raid end for anything left.
+    // IL2CPP: not from their constructors, as on 4.1.6. A Harmony patch on an IL2CPP constructor
+    // runs it on a newly made object and leaves the game's one empty: BotCreationData lost its
+    // profile source and no bot could spawn (NRE in ABotProfileCreator.GetNewProfile). A delegate
+    // made here never equals the game's, so subscriptions are found by their target's type.
+    internal static void PruneStopBotSpawn()
     {
-        protected override MethodBase GetTargetMethod() =>
-            AccessTools.Constructor(typeof(BotCreationData), new[] { typeof(IGetProfileData) });
-
-        [PatchPostfix]
-        private static void Postfix(BotCreationData __instance)
+        var dispatcher = Singleton<GlobalEventDispatcher>.Instance;
+        var handlers = dispatcher?.OnStopBotSpawnField;
+        if (handlers == null) return;
+        var kept = handlers;
+        foreach (var handler in handlers.GetInvocationList())
         {
-            try
-            {
-                if (Plugin.On(Plugin.HotPathFixes)) Singleton<GlobalEventDispatcher>.Instance.OnStopBotSpawn -= __instance.StopSpawn;
-            }
-            catch (Exception ex)
-            {
-                Plugin.Fail(Plugin.HotPathFixes, ex);
-            }
+            if (handler.Target is { } target && (target.TryCast<BotCreationData>() != null || target.TryCast<SpawnDelaysService>() != null))
+                kept = Il2CppSystem.Delegate.Remove(kept, handler)?.Cast<Il2CppSystem.Action>();
         }
-    }
 
-    private class SpawnDelaysLeakPatch : ModulePatch
-    {
-        protected override MethodBase GetTargetMethod() => AccessTools.Constructor(typeof(SpawnDelaysService));
-
-        [PatchPostfix]
-        private static void Postfix(SpawnDelaysService __instance)
-        {
-            try
-            {
-                if (Plugin.On(Plugin.HotPathFixes)) Singleton<GlobalEventDispatcher>.Instance.OnStopBotSpawn -= __instance.ClearDelays;
-            }
-            catch (Exception ex)
-            {
-                Plugin.Fail(Plugin.HotPathFixes, ex);
-            }
-        }
+        if (!ReferenceEquals(kept, handlers)) dispatcher!.OnStopBotSpawnField = kept;
     }
 
     private class DispatcherStopLeakPatch : ModulePatch
@@ -549,7 +513,7 @@ internal static class HotPaths
         [PatchPostfix]
         private static void Postfix(GlobalEventDispatcher __instance)
         {
-            if (Plugin.On(Plugin.HotPathFixes)) StopBotSpawnEvent(__instance) = null!;
+            if (Plugin.On(Plugin.HotPathFixes)) __instance.OnStopBotSpawnField = null;
         }
     }
 
@@ -572,9 +536,6 @@ internal static class HotPaths
     // the corpse is snapped to the host's final pose when out of view. Set it with the result.
     private class ObservedCorpseStillPatch : ModulePatch
     {
-        private static readonly AccessTools.FieldRef<ObservedCorpse, bool> IsStill =
-            AccessTools.FieldRefAccess<ObservedCorpse, bool>("_isStill");
-
         protected override MethodBase GetTargetMethod() =>
             AccessTools.Method(typeof(ObservedCorpse), nameof(ObservedCorpse.CheckCorpseIsStill));
 
@@ -583,7 +544,7 @@ internal static class HotPaths
         {
             if (!Plugin.Fixing || __result || timePass < Plugin.CorpseSettleTime.Value || RuptureInstalled) return;
             __result = true;
-            IsStill(__instance) = true;
+            __instance._isStill = true;
         }
     }
 
@@ -598,7 +559,7 @@ internal static class HotPaths
         get
         {
             if (_ruptureInstalled is { } installed) return installed;
-            _ruptureInstalled = BepInEx.Bootstrap.Chainloader.PluginInfos.ContainsKey("com.rootdarkarchon.rupture");
+            _ruptureInstalled = BepInEx.Unity.IL2CPP.IL2CPPChainloader.Instance.Plugins.ContainsKey("com.rootdarkarchon.rupture");
             return _ruptureInstalled.Value;
         }
     }
@@ -609,16 +570,13 @@ internal static class HotPaths
     // iterator and a Coroutine per bot per frame.
     private class FovCoroutinePatch : ModulePatch
     {
-        private static readonly AccessTools.FieldRef<ProceduralWeaponAnimation, IProceduralAnimationStrategy> Strategy =
-            AccessTools.FieldRefAccess<ProceduralWeaponAnimation, IProceduralAnimationStrategy>("_strategy");
-
         protected override MethodBase GetTargetMethod() =>
-            AccessTools.Method(typeof(ProceduralWeaponAnimation), nameof(ProceduralWeaponAnimation.StartFovCoroutine));
+            AccessTools.Method(typeof(ProceduralWeaponAnimation), nameof(ProceduralWeaponAnimation.StartFovCoroutine), new[] { typeof(Player) });
 
         [PatchPrefix]
         private static bool Prefix(ProceduralWeaponAnimation __instance, Player player)
         {
-            if (!Plugin.On(Plugin.HotPathFixes) || player.IsYourPlayer || Strategy(__instance) is not ThirdPersonStrategy) return true;
+            if (!Plugin.On(Plugin.HotPathFixes) || player.IsYourPlayer || __instance._strategy?.TryCast<ThirdPersonStrategy>() == null) return true;
 
             __instance.ResetFovAdjustments(player);
             player.RibcageScaleCurrent = 1f;
@@ -673,27 +631,32 @@ internal static class HotPaths
     private class MuzzleShadowsPatch : ModulePatch
     {
         // As the prefab had them, to put back when the setting is switched off.
-        private static readonly ConditionalWeakTable<MuzzleLight, LightShadows[]> Original = new();
+        // By instance id: a weak table on IL2CPP wrappers loses entries when a wrapper is collected,
+        // and would then take the shadows set here for the prefab's. Muzzles are pooled, so few.
+        private static readonly Dictionary<int, LightShadows[]> Original = new();
         private static bool _touched;
 
+        // MuzzleLight.OnShot, which IL2CPP inlined into MuzzleManager.Shot.
         protected override MethodBase GetTargetMethod() =>
-            AccessTools.Method(typeof(MuzzleLight), nameof(MuzzleLight.OnShot));
+            AccessTools.Method(typeof(MuzzleManager), nameof(MuzzleManager.Shot));
 
         [PatchPostfix]
-        private static void Postfix(MuzzleLight __instance)
+        private static void Postfix(MuzzleManager __instance)
         {
             try
             {
-                var lights = __instance.Lights;
+                var muzzle = __instance.Light;
+                var lights = muzzle != null ? muzzle.Lights : null;
                 var on = Plugin.On(Plugin.NoMuzzleShadows);
                 // Off and never switched on this session: nothing to put back.
                 if (lights == null || !on && !_touched) return;
                 _touched = true;
-                var original = Original.GetValue(__instance, m => Array.ConvertAll(m.Lights, l => l ? l.shadows : LightShadows.None));
+                var id = muzzle!.GetInstanceID();
+                if (!Original.TryGetValue(id, out var original)) Original[id] = original = lights.Select(l => l ? l.shadows : LightShadows.None).ToArray();
 
                 // Checked every shot, not cached: weapons are pooled and change hands.
                 var me = on ? Singleton<GameWorld>.Instance?.MainPlayer : null;
-                var off = on && !(me != null && __instance.transform.IsChildOf(me.Transform.Original));
+                var off = on && !(me != null && muzzle.transform.IsChildOf(me.Transform.Original));
                 for (var i = 0; i < lights.Length && i < original.Length; i++)
                 {
                     var wanted = off ? LightShadows.None : original[i];

@@ -18,7 +18,7 @@
   <PropertyGroup>
     <NativeDir>$(MSBuildThisFileDirectory)../../src/SmoothieNative</NativeDir>
   </PropertyGroup>
-  <Target Name="BuildNative" BeforeTargets="BeforeBuild" Inputs="$(NativeDir)/pyramid.c;$(NativeDir)/walk.c;$(NativeDir)/animpause.c;$(NativeDir)/build.sh" Outputs="$(NativeDir)/bin/libSmoothieNative.so">
+  <Target Name="BuildNative" BeforeTargets="BeforeBuild" Inputs="$(NativeDir)/pyramid.c;$(NativeDir)/walk.c;$(NativeDir)/animpause.c;$(NativeDir)/lodflags.c;$(NativeDir)/build.sh" Outputs="$(NativeDir)/bin/libSmoothieNative.so">
     <Exec Command="bash &quot;$(NativeDir)/build.sh&quot;" />
   </Target>
   <ItemGroup>

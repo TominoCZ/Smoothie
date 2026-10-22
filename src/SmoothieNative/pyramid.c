@@ -1,7 +1,8 @@
 // Native depth pyramid for Smoothie's "Hide objects covered by nearer ones": the same build and
 // box test as DepthPyramid in ThrottleMath.cs (the C# one stays as the fallback and as the
-// reference the self-check compares against), compiled ahead of time with SSE2. The game's Mono
-// JIT does neither SIMD nor much optimising, and the worker runs the test for thousands of
+// reference the self-check compares against), compiled ahead of time with SSE2. Written when the
+// plugin ran on the game's Mono JIT (no SIMD, little optimising); on BepInEx 6's .NET runtime the
+// self-check still measures it ~3x faster than the C#. The worker runs the test for thousands of
 // boxes a round, more while moving; on CPUs with fewer cores the round's length is how stale
 // the result is when it lands.
 //
