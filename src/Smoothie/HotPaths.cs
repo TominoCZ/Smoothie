@@ -46,6 +46,79 @@ internal static class HotPaths
         _sortCamera = camera;
     }
 
+    // Screen effects on the main camera that copy the whole screen every frame while showing
+    // nothing: switched off while idle, back on the moment they have something to show. Only
+    // what this switched off is switched back. Grayscale: the game never sets its amount. Death
+    // fade: the game switches it on at the first death and never off again. Blood: 5 s after the
+    // last hit. Distortion: no distorting objects (heat haze, explosions). Hue focus: amount 0.
+    // A hit shows its blood one frame late at most (checked once a frame, in Update). Streets,
+    // 3080 Ti, lightly GPU-bound (SPT 4.1.6): GPU wait -0.037 ± 0.016 ms, frame -0.054 ± 0.031 ms.
+    private static Camera? _idleCamera;
+    private static Behaviour?[] _idleEffects = Array.Empty<Behaviour?>();
+    private static readonly HashSet<Behaviour> IdleOff = new(Diagnostics.ReferenceComparer.Instance);
+    private static bool _idleBroken;
+
+    internal static void IdleEffects()
+    {
+        var camera = CameraManager.Instance?.Camera;
+        var on = Plugin.On(Plugin.GpuFixes) && camera != null && !_idleBroken;
+        if (!on || !ReferenceEquals(camera, _idleCamera))
+        {
+            RestoreIdleEffects();
+            _idleCamera = on ? camera : null;
+            if (!on) return;
+            _idleEffects = new Behaviour?[]
+            {
+                camera!.GetComponent<PostprocessGrayscale>(), camera.GetComponent<DeathFade>(), camera.GetComponent<BloodOnScreen>(),
+                camera.GetComponent<DistortCameraFX>(), camera.GetComponent<CC_HueFocus>(),
+            };
+        }
+
+        try
+        {
+            foreach (var effect in _idleEffects)
+            {
+                if (effect == null) continue;
+                var idle = IsIdle(effect);
+                if (idle && effect.enabled)
+                {
+                    effect.enabled = false;
+                    IdleOff.Add(effect);
+                }
+                else if (!idle && IdleOff.Remove(effect)) effect.enabled = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _idleBroken = true;
+            RestoreIdleEffects();
+            Plugin.Log.LogWarning($"idle screen effects left on: {ex.Message}");
+        }
+    }
+
+    // The game's private fields (interop properties here), apart: if a game update renames one,
+    // this method fails to compile inside IdleEffects' try and only this stops.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool IsIdle(Behaviour effect) => effect switch
+    {
+        PostprocessGrayscale g => Math.Abs(g.EffectAmount) < Mathf.Epsilon,
+        DeathFade d => !d._isDead && Math.Abs(d._fadeValue) < Mathf.Epsilon && Math.Abs(d._closeEyesValue) < Mathf.Epsilon,
+        BloodOnScreen b => Time.time - b._lastHitTime > b.MaxBloodTime,
+        DistortCameraFX => DistortCameraFX.DistortNBlurRenderers.Count == 0,
+        CC_HueFocus h => h.amount < Mathf.Epsilon,
+        _ => false,
+    };
+
+    private static void RestoreIdleEffects()
+    {
+        foreach (var effect in IdleOff)
+        {
+            if (effect != null) effect.enabled = true;
+        }
+
+        IdleOff.Clear();
+    }
+
     internal static void Enable()
     {
         new FovCoroutinePatch().Enable();
@@ -62,6 +135,8 @@ internal static class HotPaths
         new AirdropInitPatch().Enable();
         new PhysicsRegionsPatch().Enable();
         new PhysicsRatePatch().Enable();
+        // Last: a game update that renames its parameters makes this one throw, not the ones above.
+        new DistantShadowFadePatch().Enable();
     }
 
     // AmbientLight (the indoor ambient lighting) re-records two command buffers for every
@@ -452,6 +527,34 @@ internal static class HotPaths
 
         [PatchPostfix]
         private static void Postfix(EFT.Airdrop.ServerAirDrop __instance) => LandedAirdrops.Remove(__instance);
+    }
+
+    // The distant shadows' mask (a full-screen pass) reads the old and the new distant shadow
+    // map for every pixel: every shadow quality preset turns the fade between them on, though
+    // the old one only counts during the fade after each swap (at most 0.5 s), and a new map
+    // takes seconds to finish (Low: ~37 s, 10 objects a frame). Once the fade is done
+    // (GlobalShadowProj.z, time since the swap over the fade time, reaches 1) the mask is drawn
+    // with the fade keyword off and it's switched back on after: the same picture, one map read.
+    // SPT 4.1.6, Streets, Low, 2560x1408, GPU-bound: frame -0.467 ± 0.057 ms, GPU wait -0.426 ± 0.048 ms.
+    // IL2CPP: checked in 1.2.0's code: its own body, called from DistantShadow.Update; the keyword
+    // is the game's own BlendKeyword ("DISTANT_SHADOWS_BLEND", set in its constructor).
+    private class DistantShadowFadePatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod() =>
+            AccessTools.Method(typeof(DistantShadow), nameof(DistantShadow.SetupComputeShadowMaskCommandBuffer));
+
+        [PatchPrefix]
+        private static void Prefix(DistantShadow __instance, CommandBuffer cmdBuf, Vector4 GlobalShadowProj, out bool __state)
+        {
+            __state = __instance.EnableShadowsBlend && GlobalShadowProj.z >= 1f && Plugin.On(Plugin.GpuFixes);
+            if (__state) cmdBuf.DisableShaderKeyword(__instance.BlendKeyword);
+        }
+
+        [PatchPostfix]
+        private static void Postfix(DistantShadow __instance, CommandBuffer cmdBuf, bool __state)
+        {
+            if (__state) cmdBuf.EnableShaderKeyword(__instance.BlendKeyword);
+        }
     }
 
     // Raid HUD and hideout hide the background, the menu shows it again.

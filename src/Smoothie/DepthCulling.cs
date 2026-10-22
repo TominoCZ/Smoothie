@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reflection;
@@ -189,7 +190,14 @@ internal static class DepthCulling
     private static AsyncGPUReadbackRequest _pending, _scopePending;
     private static Action<AsyncGPUReadbackRequest>? _pendingDone, _scopeDone;
     // A new depth is asked for at most this often (the slowest round rate before results landed
-    // sooner), so landing sooner never means more rounds.
+    // sooner), so landing sooner never means more rounds. Except when the eye speeds up by
+    // RushSpeed over the speed the last request was made with (a peek or strafe from standing): the
+    // round in flight has no margin for it, so the next one is asked for without the wait (still
+    // one at a time). Peeking from cover, by how rounds are scheduled: up to 6-7 frames of pop-in
+    // at the edge -> ~2-3.
+    private const float RushSpeed = 0.5f;
+    private static Vector3 _requestSpeedPlus, _requestSpeedMinus;
+    private static bool _rush;
     private const int MinRoundFrames = 4;
     // How the depth copy travels (averages, overlay): frames and ms from asking for it to
     // having it, how old a result is in frames when it's applied, frames between results.
@@ -411,9 +419,10 @@ internal static class DepthCulling
         Seal();
     }
 
-    // Every static mesh of the level, shadow-only ones included: not on a player, loot, sky,
-    // border-wall or trigger layer, not switched by the game's distance stand-ins (or anyone) with forceRenderingOff, and nothing
-    // that moves or can be used. A LOD group is one object (all its levels hide together).
+    // Every static mesh of the level, shadow-only ones included: not on a player, loot, sky
+    // or border-wall layer, not switched by the game's distance stand-ins (or anyone) with forceRenderingOff, and nothing
+    // that moves or can be used. A LOD group is one object (all its levels hide together), except
+    // big ones, which are cut into chunks (SplitAbove, ChunkSize).
     private static IEnumerator<bool> ScanLevel()
     {
         var sliceStart = Stopwatch.GetTimestamp();
@@ -443,7 +452,10 @@ internal static class DepthCulling
         }
 
         var skipLayers = 0;
-        foreach (var layer in new[] { "Loot", "Interactive", "PlayerRenderers", "Player", "Deadbody", "Sky", "LevelBorder", "Triggers" })
+        // Not the Triggers layer: Customs keeps drawn concrete fence supports and barbed wire there
+        // (20-156 draws a view). Its invisible volumes have their renderers off or are never drawn,
+        // so they're skipped at the scan or never asked about.
+        foreach (var layer in new[] { "Loot", "Interactive", "PlayerRenderers", "Player", "Deadbody", "Sky", "LevelBorder" })
         {
             var index = LayerMask.NameToLayer(layer);
             if (index >= 0) skipLayers |= 1 << index;
@@ -454,6 +466,12 @@ internal static class DepthCulling
         _gameSwitched = gameSwitched;
         var moving = new Dictionary<Transform, bool>(Diagnostics.ReferenceComparer.Instance);
         var groupsSeen = new HashSet<LODGroup>(Diagnostics.ReferenceComparer.Instance);
+        var chunks = new Dictionary<(int, int, int), List<Renderer>>();
+        var triggersLayer = LayerMask.NameToLayer("Triggers");
+#if DEBUG
+        var triggerShaders = new Dictionary<string, int>();
+        var triggerNames = new Dictionary<string, int>();
+#endif
         var unit = new List<Renderer>();
         var all = 0;
         foreach (var renderer in UnityEngine.Object.FindObjectsByType<MeshRenderer>(FindObjectsSortMode.None))
@@ -465,6 +483,19 @@ internal static class DepthCulling
             }
 
             if (renderer == null || !Candidate(renderer) || Moves(renderer.transform, moving)) continue;
+            // On the Triggers layer only real geometry: a material with a shader that draws (Customs:
+            // 767 fence supports and barbed wire, all p0/Cutout/Bumped Diffuse), no invisible volumes.
+            if (renderer.gameObject.layer == triggersLayer && (renderer.sharedMaterial == null || renderer.sharedMaterial.shader == null
+                || renderer.sharedMaterial.shader.name.StartsWith("Hidden/", StringComparison.Ordinal))) continue;
+#if DEBUG
+            // What the Triggers layer adds to the pool (logged after the scan): drawn geometry or invisible volumes.
+            if (renderer.gameObject.layer == triggersLayer && renderer.enabled)
+            {
+                var shader = renderer.sharedMaterial != null && renderer.sharedMaterial.shader != null ? renderer.sharedMaterial.shader.name : "no material";
+                triggerShaders[shader] = triggerShaders.TryGetValue(shader, out var n) ? n + 1 : 1;
+                triggerNames[renderer.name] = triggerNames.TryGetValue(renderer.name, out var m) ? m + 1 : 1;
+            }
+#endif
             var bounds = renderer.bounds;
             unit.Clear();
             var lod = renderer.GetComponentInParent<LODGroup>();
@@ -496,42 +527,47 @@ internal static class DepthCulling
                 if (!ok || unit.Count == 0) continue;
             }
 
-            // No part switched on (helper cubes, blockers): never drawn, so asking about it every
-            // half second only ever found that out. One the game switches on later is just never hidden.
-            var anyOn = standIns.Contains(unit[0]);
-            foreach (var part in unit)
-            {
-                if (!part.enabled) continue;
-                anyOn = true;
-                break;
-            }
-
-            if (!anyOn) continue;
-
-            // The rain's drop mesh claims endless bounds so it's never culled: nothing to cover.
-            if (!(bounds.extents.sqrMagnitude < MaxExtent * MaxExtent)) continue;
-
-            PendingRenderers.Add(unit.ToArray());
-            PendingBounds.Add(bounds);
-            var layer = unit[0].gameObject.layer;
-            foreach (var part in unit)
-            {
-                if (part.gameObject.layer != layer) layer = -1;
-            }
-
-            PendingLayer.Add((sbyte)layer);
             var lods = lod != null ? lod.GetLODs() : null;
             // A disabled LOD group (the game's stand-ins) does no LOD culling of its own.
+            var lodData = (Vector3.zero, 0f, 0f);
             if (lods is { Length: > 0 } && lod!.enabled && lods[lods.Length - 1].screenRelativeTransitionHeight > 0f)
             {
                 var t = lod!.transform;
                 var scale = t.lossyScale;
-                PendingLod.Add((t.TransformPoint(lod.localReferencePoint), lod.size * Mathf.Max(Mathf.Abs(scale.x), Mathf.Abs(scale.y), Mathf.Abs(scale.z)),
-                    lods[lods.Length - 1].screenRelativeTransitionHeight));
+                lodData = (t.TransformPoint(lod.localReferencePoint), lod.size * Mathf.Max(Mathf.Abs(scale.x), Mathf.Abs(scale.y), Mathf.Abs(scale.z)),
+                    lods[lods.Length - 1].screenRelativeTransitionHeight);
             }
-            else PendingLod.Add((Vector3.zero, 0f, 0f));
-            Tracked++;
+
+            // A big LOD group (a whole building with its decals, Customs' Construction_factory: 1,300+
+            // renderers) is one box that always shows sky somewhere: nothing in it was ever covered.
+            // Its renderers are split into chunks of ChunkSize cubes by their centre, one unit each
+            // (hiding parts of a group only ever draws less): small boxes that can be covered, without
+            // a unit per decal to walk and test. Small groups stay one unit, all levels together.
+            if (unit.Count > SplitAbove)
+            {
+                chunks.Clear();
+                foreach (var part in unit)
+                {
+                    var c = part.bounds.center;
+                    var key = (Mathf.FloorToInt(c.x / ChunkSize), Mathf.FloorToInt(c.y / ChunkSize), Mathf.FloorToInt(c.z / ChunkSize));
+                    if (!chunks.TryGetValue(key, out var parts)) chunks[key] = parts = new List<Renderer>();
+                    parts.Add(part);
+                }
+
+                foreach (var parts in chunks.Values)
+                {
+                    var chunkBounds = parts[0].bounds;
+                    foreach (var part in parts) chunkBounds.Encapsulate(part.bounds);
+                    AddUnit(parts.ToArray(), chunkBounds, lodData, standIns);
+                }
+            }
+            else AddUnit(unit.ToArray(), bounds, lodData, standIns);
         }
+#if DEBUG
+        Plugin.Log.LogInfo($"hidden objects: Triggers layer, switched-on renderers collected: {triggerShaders.Values.Sum()}; by shader: " +
+                           string.Join(", ", triggerShaders.OrderByDescending(e => e.Value).Take(12).Select(e => $"{e.Value} {e.Key}")) +
+                           "; by name: " + string.Join(", ", triggerNames.OrderByDescending(e => e.Value).Take(15).Select(e => $"{e.Value} {e.Key}")));
+#endif
 
         var lamps = new List<Light>();
         foreach (var light in UnityEngine.Object.FindObjectsByType<Light>(FindObjectsInactive.Include, FindObjectsSortMode.None))
@@ -1016,6 +1052,41 @@ internal static class DepthCulling
 
     private const float MaxExtent = 5000f;
 
+    // LOD groups with more renderers than this are split into units of ChunkSize-metre cubes (ScanLevel).
+    private const int SplitAbove = 16;
+    private const float ChunkSize = 4f;
+
+    // One unit for the scan: unless nothing of it is ever switched on, or its box is endless.
+    private static void AddUnit(Renderer[] parts, Bounds bounds, (Vector3, float, float) lodData, HashSet<Renderer> standIns)
+    {
+        // No part switched on (helper cubes, blockers): never drawn, so asking about it every
+        // half second only ever found that out. One the game switches on later is just never hidden.
+        var anyOn = standIns.Contains(parts[0]);
+        foreach (var part in parts)
+        {
+            if (!part.enabled) continue;
+            anyOn = true;
+            break;
+        }
+
+        if (!anyOn) return;
+
+        // The rain's drop mesh claims endless bounds so it's never culled: nothing to cover.
+        if (!(bounds.extents.sqrMagnitude < MaxExtent * MaxExtent)) return;
+
+        PendingRenderers.Add(parts);
+        PendingBounds.Add(bounds);
+        var layer = parts[0].gameObject.layer;
+        foreach (var part in parts)
+        {
+            if (part.gameObject.layer != layer) layer = -1;
+        }
+
+        PendingLayer.Add((sbyte)layer);
+        PendingLod.Add(lodData);
+        Tracked++;
+    }
+
     private static void CountCuller(Set set, int[] culled, CullingObject culler, Renderer renderer)
     {
         if (renderer == null || !set.UnitOf.TryGetValue(renderer, out var i) || culled[i] < 0) return;
@@ -1090,6 +1161,10 @@ internal static class DepthCulling
                     var v = camera.transform.InverseTransformDirection(_viewEye - _speedEye) / (float)(now - _speedTime);
                     _eyeSpeedPlus = new Vector3(TrackSpeed(_eyeSpeedPlus.x, v.x), TrackSpeed(_eyeSpeedPlus.y, v.y), TrackSpeed(_eyeSpeedPlus.z, v.z));
                     _eyeSpeedMinus = new Vector3(TrackSpeed(_eyeSpeedMinus.x, -v.x), TrackSpeed(_eyeSpeedMinus.y, -v.y), TrackSpeed(_eyeSpeedMinus.z, -v.z));
+                    // Field by field: Unity's vector operators are runtime calls under IL2CPP.
+                    if (_eyeSpeedPlus.x - _requestSpeedPlus.x > RushSpeed || _eyeSpeedPlus.y - _requestSpeedPlus.y > RushSpeed || _eyeSpeedPlus.z - _requestSpeedPlus.z > RushSpeed
+                        || _eyeSpeedMinus.x - _requestSpeedMinus.x > RushSpeed || _eyeSpeedMinus.y - _requestSpeedMinus.y > RushSpeed || _eyeSpeedMinus.z - _requestSpeedMinus.z > RushSpeed)
+                        _rush = true;
                 }
 
                 _speedEye = _viewEye;
@@ -1405,7 +1480,7 @@ internal static class DepthCulling
     private static void Request(GPUInstancerHiZOcclusionGenerator generator, Camera camera)
     {
         if (_set == null || _state != Idle || !ReferenceEquals(camera, _camera) || _viewFrame != Time.frameCount
-            || Time.frameCount - _activeFrame > 1 || Time.frameCount - _requestFrame < MinRoundFrames) return;
+            || Time.frameCount - _activeFrame > 1 || (Time.frameCount - _requestFrame < MinRoundFrames && !_rush)) return;
         var texture = generator.hiZDepthTexture;
         if (texture == null) return;
         var start = Diagnostics.Measuring ? Stopwatch.GetTimestamp() : 0;
@@ -1450,6 +1525,9 @@ internal static class DepthCulling
         _roundTime = Time.realtimeSinceStartup;
         _roundGameTime = Time.time;
         _requestFrame = Time.frameCount;
+        _requestSpeedPlus = _eyeSpeedPlus;
+        _requestSpeedMinus = _eyeSpeedMinus;
+        _rush = false;
         _state = Reading;
         var id = ++_roundId;
         _pending = Readback(texture, mip);
@@ -2128,6 +2206,21 @@ internal static class DepthCulling
         "in the scope's view, which has no depth of its own",
         "covered, but you're moving and its cover's edge could slide off it before the next check, kept drawn",
     };
+
+#if DEBUG
+    // For the small-mesh census (F10): the hiding unit a renderer belongs to, its renderer count and box.
+    internal static bool UnitOf(Renderer renderer, out int renderers, out Vector3 min, out Vector3 max)
+    {
+        renderers = 0;
+        min = max = Vector3.zero;
+        var set = _set;
+        if (set == null || !set.UnitOf.TryGetValue(renderer, out var i)) return false;
+        renderers = set.Renderers[i].Length;
+        min = set.Min[i];
+        max = set.Max[i];
+        return true;
+    }
+#endif
 
     // For the renderer census (profiling only): what the hiding makes of a drawn renderer.
     internal static string Explain(Renderer renderer)
@@ -2925,7 +3018,8 @@ internal static class DepthCulling
         _lastApplyFrame = 0;
         _lastApplyTime = 0f;
         _speedTime = -1.0;
-        _eyeSpeedPlus = _eyeSpeedMinus = Vector3.zero;
+        _eyeSpeedPlus = _eyeSpeedMinus = _requestSpeedPlus = _requestSpeedMinus = Vector3.zero;
+        _rush = false;
         MovingKept = 0;
         Waiting = 0;
         _applyFrom = 0;
