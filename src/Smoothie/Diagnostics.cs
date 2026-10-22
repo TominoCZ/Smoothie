@@ -527,9 +527,215 @@ internal static class Diagnostics
                           $"canvases {canvases}, particles playing {particles}, shadowed lights {lights}");
             foreach (var line in named.Take(12)) sb.AppendLine($"      {line}");
         }
+#if DEBUG
+        GpuCensus(sb);
+#endif
 
         Plugin.Log.LogInfo(sb.ToString().TrimEnd());
     }
+
+#if DEBUG
+    // Debug: GPU work in the raid that nothing may need (the menu videos were such a find): the
+    // cameras' image effects and command buffers, shadowed lights, realtime reflection probes,
+    // live render textures, and what's drawn that the covered-object hiding can't touch.
+    private static void GpuCensus(StringBuilder sb)
+    {
+        sb.AppendLine("  GPU census:");
+        var manager = EFT.CameraControl.CameraManager.Instance;
+        foreach (var camera in new[] { manager?.Camera, manager?.OpticCameraManager?.Camera })
+        {
+            if (camera == null) continue;
+            sb.AppendLine($"    camera {camera.name} ({(camera.isActiveAndEnabled ? "on" : "off")}): {camera.actualRenderingPath}, {camera.pixelWidth}x{camera.pixelHeight}, " +
+                          $"HDR {camera.allowHDR}, MSAA {camera.allowMSAA}, depth texture {camera.depthTextureMode}, far {camera.farClipPlane:0} m");
+            // Scripts that draw on the camera: image effects (OnRenderImage, in order) and pre/post render hooks.
+            var hooks = camera.GetComponents<MonoBehaviour>().Where(b => b != null)
+                .Select(b => (b, Hooks: string.Join("+", new[] { "OnRenderImage", "OnPreRender", "OnPostRender" }.Where(m => Declares(b.GetType(), m)))))
+                .Where(x => x.Hooks.Length > 0)
+                .Select(x => $"{x.b.GetType().Name} [{x.Hooks}]{(x.b.enabled ? "" : " (off)")}");
+            sb.AppendLine("      scripts drawing: " + string.Join(", ", hooks));
+            foreach (UnityEngine.Rendering.CameraEvent e in Enum.GetValues(typeof(UnityEngine.Rendering.CameraEvent)))
+            {
+                var buffers = camera.GetCommandBuffers(e);
+                if (buffers.Length > 0) sb.AppendLine($"      {e}: " + string.Join(", ", buffers.Select(b => $"{b.name} ({b.sizeInBytes} B)")));
+            }
+        }
+
+        var lights = Object.FindObjectsByType<Light>(FindObjectsSortMode.None).Where(l => l.isActiveAndEnabled).ToArray();
+        sb.AppendLine($"    lights on: {lights.Length}; casting shadows: " + string.Join(", ", lights.Where(l => l.shadows != LightShadows.None)
+            .GroupBy(l => $"{l.type} {(l.shadowCustomResolution > 0 ? l.shadowCustomResolution.ToString() : l.shadowResolution.ToString())}")
+            .OrderByDescending(g => g.Count()).Select(g => $"{g.Count()} {g.Key}")));
+        foreach (var light in lights.Where(l => l.commandBufferCount > 0).Take(12))
+        {
+            var names = Enum.GetValues(typeof(UnityEngine.Rendering.LightEvent)).Cast<UnityEngine.Rendering.LightEvent>()
+                .SelectMany(e => light.GetCommandBuffers(e).Select(b => $"{e} {b.name}"));
+            sb.AppendLine($"      light {PathOf(light.transform)} ({light.type}, {(light.cullingMask == 0 ? "skipped" : "lighting")}): {string.Join(", ", names)}");
+        }
+
+        var probes = Object.FindObjectsByType<ReflectionProbe>(FindObjectsSortMode.None).Where(p => p.isActiveAndEnabled).ToArray();
+        sb.AppendLine($"    reflection probes on: {probes.Length} (" + string.Join(", ", probes.GroupBy(p => p.mode).Select(g => $"{g.Count()} {g.Key}")) + ")");
+        foreach (var probe in probes.Where(p => p.mode == UnityEngine.Rendering.ReflectionProbeMode.Realtime).Take(12))
+            sb.AppendLine($"      realtime {PathOf(probe.transform)}: {probe.refreshMode}, {probe.timeSlicingMode}, {probe.resolution}px");
+
+        var textures = Resources.FindObjectsOfTypeAll<RenderTexture>().Where(t => t.IsCreated()).ToArray();
+        sb.AppendLine($"    render textures created: {textures.Length}, {textures.Sum(t => UnityEngine.Profiling.Profiler.GetRuntimeMemorySizeLong(t)) >> 20} MB; largest: " +
+                      string.Join(", ", textures.OrderByDescending(t => (long)t.width * t.height).Take(12).Select(t => $"{t.name} {t.width}x{t.height} {t.format}")));
+
+        // Drawn this frame (any camera, shadows included) and not a plain mesh: what the hiding
+        // leaves alone by kind. Players and their gear apart.
+        var drawn = Object.FindObjectsByType<Renderer>(FindObjectsSortMode.None).Where(r => r.isVisible && r is not MeshRenderer)
+            .GroupBy(r => r.GetType().Name + (r.GetComponentInParent<Player>() != null ? " (players)" : ""));
+        foreach (var kind in drawn.OrderByDescending(g => g.Count()))
+            sb.AppendLine($"    drawn {kind.Key}: {kind.Count()}; " + string.Join(", ", kind.GroupBy(r => r.name).OrderByDescending(g => g.Count()).Take(8).Select(g => $"{g.Count()} {g.Key}")));
+
+        // Draw calls GPU instancing or batching could merge: drawn level meshes (any camera,
+        // shadows included) by mesh + materials. Groups of 2+ are what instancing could draw in one
+        // call each, if their materials allow it and their shaders support it.
+        var meshes = Object.FindObjectsByType<MeshRenderer>(FindObjectsSortMode.None).Where(r => r.isVisible && r.GetComponentInParent<Player>() == null).ToArray();
+        var groups = meshes.GroupBy(r => (Mesh: r.GetComponent<MeshFilter>()?.sharedMesh, Materials: string.Join("|", r.sharedMaterials.Select(m => m == null ? 0 : m.GetInstanceID())))).ToArray();
+        var shared = groups.Where(g => g.Count() > 1).ToArray();
+        var materials = meshes.SelectMany(r => r.sharedMaterials).Where(m => m != null).Distinct().ToArray();
+        sb.AppendLine($"    drawn level meshes: {meshes.Length}, {meshes.Count(r => r.isPartOfStaticBatch)} static-batched, {meshes.Count(r => r.sharedMaterials.Length > 1)} with several materials; " +
+                      $"{groups.Length} mesh+material groups, {shared.Sum(g => g.Count())} meshes in {shared.Length} groups of 2+ (instancing could save up to {shared.Sum(g => g.Count() - 1)} draws); " +
+                      $"materials {materials.Length}, {materials.Count(m => m.enableInstancing)} with instancing on");
+        sb.AppendLine("      largest groups: " + string.Join(", ", shared.OrderByDescending(g => g.Count()).Take(10).Select(g => $"{g.Count()} {g.First().name} ({g.First().sharedMaterial?.shader?.name})")));
+        sb.AppendLine("      shaders of grouped meshes: " + string.Join(", ", shared.SelectMany(g => g).GroupBy(r => r.sharedMaterial?.shader?.name ?? "none").OrderByDescending(g => g.Count()).Take(10).Select(g => $"{g.Count()} {g.Key}")));
+    }
+
+    // Debug, F10: the small level meshes drawn right now (by any camera, shadows included): what
+    // they are, how far and how big on screen, whether the game's baked visibility owns them, why
+    // the covered-object hiding left them drawn, and whether they could be merged (readable
+    // meshes, shared materials). For views where the draw count jumps (Customs: 3,900 draws,
+    // mostly one-quad wall decals).
+    internal static void LogSmallCensus()
+    {
+        var camera = EFT.CameraControl.CameraManager.Instance?.Camera;
+        if (camera == null) return;
+        var eye = camera.transform.position;
+        // Pixels per metre at 1 m distance at the camera's render resolution.
+        var pixelsPerUnit = camera.pixelHeight / (2f * Mathf.Tan(camera.fieldOfView * 0.5f * Mathf.Deg2Rad));
+        var baked = new HashSet<Renderer>(ReferenceComparer.Instance);
+        foreach (var crossScene in Object.FindObjectsByType<Koenigz.PerfectCulling.EFT.PerfectCullingCrossSceneGroup>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            if (crossScene.bakeGroups == null) continue;
+            foreach (var group in crossScene.bakeGroups)
+            {
+                if (group?.renderers == null) continue;
+                foreach (var renderer in group.renderers)
+                {
+                    if (renderer != null) baked.Add(renderer);
+                }
+            }
+        }
+
+        var drawn = Object.FindObjectsByType<MeshRenderer>(FindObjectsSortMode.None).Where(r => r.isVisible && r.GetComponentInParent<Player>() == null).ToArray();
+        var small = new List<(MeshRenderer Renderer, Mesh Mesh, float Distance, float Pixels, bool InView)>();
+        var planes = GeometryUtility.CalculateFrustumPlanes(camera);
+        foreach (var r in drawn)
+        {
+            var mesh = r.GetComponent<MeshFilter>()?.sharedMesh;
+            if (mesh == null) continue;
+            long indices = 0;
+            for (var s = 0; s < mesh.subMeshCount; s++) indices += mesh.GetIndexCount(s);
+            if (indices > 108) continue;
+            var bounds = r.bounds;
+            var distance = Mathf.Max(0.01f, Vector3.Distance(eye, bounds.ClosestPoint(eye)));
+            var seen = GeometryUtility.TestPlanesAABB(planes, bounds);
+            small.Add((r, mesh, distance, bounds.size.magnitude * pixelsPerUnit / distance, seen));
+        }
+
+        string Buckets(IEnumerable<float> values, float[] edges, string unit) =>
+            string.Join(", ", edges.Select((e, k) => (e, k)).Select(x =>
+                $"{(x.k == 0 ? "<" : "")}{(x.k == 0 ? x.e : edges[x.k - 1]).ToString("0.#")}{(x.k == 0 ? "" : "-" + x.e.ToString("0.#"))}{unit}: {values.Count(v => (x.k == 0 || v >= edges[x.k - 1]) && v < x.e)}"))
+            + $", {edges[edges.Length - 1]:0.#}{unit}+: {values.Count(v => v >= edges[edges.Length - 1])}";
+
+        var inView = small.Where(s => s.InView).ToArray();
+        var sb = new StringBuilder($"{DateTime.Now:HH:mm:ss.fff} small level meshes (36 triangles or fewer) drawn now: {small.Count} of {drawn.Length} drawn level meshes, {inView.Length} in the main view (the rest only in shadows or other cameras); render size {camera.pixelWidth}x{camera.pixelHeight}\n");
+        sb.AppendLine("  in view, by distance: " + Buckets(inView.Select(s => s.Distance), new[] { 5f, 15f, 30f, 60f, 120f }, " m"));
+        sb.AppendLine("  in view, by size on screen: " + Buckets(inView.Select(s => s.Pixels), new[] { 1f, 2f, 4f, 8f, 16f, 32f }, " px"));
+        sb.AppendLine($"  in view: {inView.Count(s => baked.Contains(s.Renderer))} in the game's baked visibility, {inView.Count(s => s.Renderer.GetComponentInParent<LODGroup>() != null)} in an LOD group, " +
+                      $"{inView.Count(s => s.Mesh.isReadable)} with readable meshes, {inView.Count(s => s.Renderer.isPartOfStaticBatch)} static-batched");
+        sb.AppendLine("  why the hiding left them drawn: " + string.Join(", ", inView.GroupBy(s => DepthCulling.Explain(s.Renderer)).OrderByDescending(g => g.Count()).Select(g => $"{g.Count()} {g.Key}")));
+        sb.AppendLine("  materials: " + string.Join(", ", inView.GroupBy(s => s.Renderer.sharedMaterial?.name ?? "none").OrderByDescending(g => g.Count()).Take(12).Select(g => $"{g.Count()} {g.Key}")) +
+                      $" ({inView.Select(s => s.Renderer.sharedMaterial).Distinct().Count()} distinct)");
+        sb.AppendLine("  layers: " + string.Join(", ", inView.GroupBy(s => LayerMask.LayerToName(s.Renderer.gameObject.layer)).OrderByDescending(g => g.Count()).Select(g => $"{g.Count()} {g.Key}")));
+        sb.AppendLine("  names: " + string.Join(", ", inView.GroupBy(s => s.Renderer.name).OrderByDescending(g => g.Count()).Take(10).Select(g => $"{g.Count()} {g.Key}")));
+        sb.AppendLine("  parents: " + string.Join(", ", inView.GroupBy(s => s.Renderer.transform.parent != null ? s.Renderer.transform.parent.name : "-").OrderByDescending(g => g.Count()).Take(8).Select(g => $"{g.Count()} {g.Key}")));
+
+        // Why the size test can't take them: the hiding works per unit (a whole LOD group), and a
+        // unit's box on screen in render pixels (width x height); and how far the game's own LOD
+        // keeps them (lodBias multiplies every group's size on screen).
+        var unitSizes = new List<(int Renderers, float W, float H)>();
+        foreach (var s in inView)
+        {
+            if (!DepthCulling.UnitOf(s.Renderer, out var count, out var min, out var max)) continue;
+            float x0 = 1f, y0 = 1f, x1 = 0f, y1 = 0f;
+            for (var c = 0; c < 8; c++)
+            {
+                var v = camera.WorldToViewportPoint(new Vector3((c & 1) == 0 ? min.x : max.x, (c & 2) == 0 ? min.y : max.y, (c & 4) == 0 ? min.z : max.z));
+                x0 = Mathf.Min(x0, v.x); y0 = Mathf.Min(y0, v.y); x1 = Mathf.Max(x1, v.x); y1 = Mathf.Max(y1, v.y);
+            }
+
+            unitSizes.Add((count, (x1 - x0) * camera.pixelWidth, (y1 - y0) * camera.pixelHeight));
+        }
+
+        sb.AppendLine($"  hiding units of these: {unitSizes.Count} tracked; renderers per unit: " + Buckets(unitSizes.Select(u => (float)u.Renderers), new[] { 2f, 5f, 20f, 100f }, "") +
+                      "; unit box, larger side: " + Buckets(unitSizes.Select(u => Mathf.Max(u.W, u.H)), new[] { 1.5f, 4f, 16f, 64f }, " px") +
+                      "; smaller side: " + Buckets(unitSizes.Select(u => Mathf.Min(u.W, u.H)), new[] { 1.5f, 4f, 16f }, " px"));
+        var groups = inView.Select(s => s.Renderer.GetComponentInParent<LODGroup>()).Where(g => g != null).Distinct().ToArray();
+        sb.AppendLine($"  LOD: lodBias {QualitySettings.lodBias}, maximumLODLevel {QualitySettings.maximumLODLevel}; {groups.Length} LOD groups hold them, renderers per group: " +
+                      Buckets(groups.Select(g => (float)g!.GetLODs().Sum(l => l.renderers.Length)), new[] { 2f, 5f, 20f, 100f }, "") +
+                      "; last LOD's cull height: " + Buckets(groups.Select(g => { var l = g!.GetLODs(); return l.Length == 0 ? 0f : l[l.Length - 1].screenRelativeTransitionHeight * 100f; }), new[] { 0.5f, 1f, 2f, 5f }, " %"));
+
+        // Everything drawn in the main view, not just the small meshes, by why it's drawn: players,
+        // non-mesh renderers by type, and level meshes by what the hiding makes of them (kept as
+        // visible, or never collected and why). Draws estimated as one per material.
+        var everything = Object.FindObjectsByType<Renderer>(FindObjectsSortMode.None).Where(r => r.isVisible && GeometryUtility.TestPlanesAABB(planes, r.bounds)).ToArray();
+        string KindOf(Renderer r) =>
+            r.GetComponentInParent<Player>() != null ? "players (bots and you)"
+            : r is not MeshRenderer ? r.GetType().Name
+            : DepthCulling.Explain(r);
+        sb.AppendLine($"  everything drawn in the main view: {everything.Length} renderers, ~{everything.Sum(r => r.sharedMaterials.Length)} draws, by kind:");
+        foreach (var kind in everything.GroupBy(KindOf).OrderByDescending(g => g.Sum(r => r.sharedMaterials.Length)))
+            sb.AppendLine($"    ~{kind.Sum(r => r.sharedMaterials.Length),5} draws, {kind.Count(),5} renderers: {kind.Key}; e.g. " +
+                          string.Join(", ", kind.GroupBy(r => r.name).OrderByDescending(g => g.Count()).Take(5).Select(g => $"{g.Count()} {g.Key}")));
+
+        // Flat ones (one local axis under 1% of the largest): a one-sided flat mesh seen from
+        // behind draws nothing but still costs its draw call. Which side is the front needs the
+        // mesh's normals, so only readable meshes can tell; the eye must be 5 cm behind the plane.
+        int flat = 0, readableFlat = 0, facingAway = 0, facingAwayShadows = 0;
+        foreach (var s in inView)
+        {
+            var size = s.Mesh.bounds.size;
+            var largest = Mathf.Max(size.x, Mathf.Max(size.y, size.z));
+            if (largest <= 0f || Mathf.Min(size.x, Mathf.Min(size.y, size.z)) > largest * 0.01f) continue;
+            flat++;
+            if (!s.Mesh.isReadable) continue;
+            readableFlat++;
+            var normals = s.Mesh.normals;
+            if (normals.Length == 0) continue;
+            var t = s.Renderer.transform;
+            var normal = t.TransformDirection(normals[0]).normalized;
+            var point = t.TransformPoint(s.Mesh.bounds.center);
+            if (Vector3.Dot(normal, eye - point) >= -0.05f) continue;
+            facingAway++;
+            if (s.Renderer.shadowCastingMode != UnityEngine.Rendering.ShadowCastingMode.Off) facingAwayShadows++;
+        }
+
+        sb.Append($"  flat: {flat} of {inView.Length} in view, {readableFlat} of them readable; facing away from the camera: {facingAway} ({facingAwayShadows} of those cast shadows); " +
+                  $"flat ones casting shadows: {inView.Count(s => s.Renderer.shadowCastingMode != UnityEngine.Rendering.ShadowCastingMode.Off)} of all small in view");
+        Plugin.Log.LogInfo(sb.ToString());
+    }
+
+    private static bool Declares(Type type, string method)
+    {
+        for (var t = type; t != null && t != typeof(MonoBehaviour); t = t.BaseType)
+        {
+            if (t.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly).Any(m => m.Name == method)) return true;
+        }
+
+        return false;
+    }
+#endif
 
     private static string PathOf(Transform transform)
     {

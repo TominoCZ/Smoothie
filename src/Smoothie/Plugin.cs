@@ -14,7 +14,7 @@ using UnityEngine;
 
 namespace Smoothie;
 
-[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.0.9")]
+[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.1.0")]
 // Optional: when Fika is installed it has to load first, or its types aren't there yet when
 // Smoothie looks for them and its observed bots aren't recognised. Without Fika this does nothing.
 [BepInDependency("com.fika.core", BepInDependency.DependencyFlags.SoftDependency)]
@@ -40,6 +40,7 @@ public class Plugin : BaseUnityPlugin
     internal static ConfigEntry<float> SimplifyDistance = null!;
     internal static ConfigEntry<float> CorpseSettleTime = null!;
     internal static ConfigEntry<bool> HotPathFixes = null!;
+    internal static ConfigEntry<bool> GpuFixes = null!;
     internal static ConfigEntry<bool> NoMuzzleShadows = null!;
     internal static ConfigEntry<bool> HideCovered = null!;
     internal static ConfigEntry<float> HideBeyond = null!;
@@ -132,6 +133,8 @@ public class Plugin : BaseUnityPlugin
             new AcceptableValueRange<float>(2f, 30f));
         HotPathFixes = Bind(other, "Remove small CPU waste in game code", true,
             "Fixes spots where the game or a mod wastes CPU or memory: the main menu's video background is paused while it's hidden (it kept playing through raids, costing 2-3 CPU cores), bots the game tried to spawn no longer stay in memory until the game is closed, and the indoor lighting is no longer prepared every frame for scope and menu cameras that aren't drawing. Nothing you can see changes.", 90);
+        GpuFixes = Bind(other, "Skip unseen graphics work (distant shadows, idle screen effects)", true,
+            "Two things the game makes your graphics card draw every frame for nothing. Distant shadows (far buildings and terrain): each new distant shadow map fades in over the old one for half a second, but the game kept reading both maps for every pixel all the time, though a new map takes seconds to finish (on Low about 37 s). With this on, only the new one is read once the fade is done. Screen effects (blood on screen, death fade, grayscale, heat distortion): they copied the whole picture every frame even with nothing to show, and the death fade stayed on for good after your first death. With this on, each is switched off until it has something to show. The picture stays the same. Helps when your graphics card limits your frame rate (GPU wait above 0 in the overlay): on Streets at 1440p about 0.5 ms a frame.", 89);
         NoMuzzleShadows = Bind(other, "Muzzle flashes of others cast no shadows", true,
             "Each shot lights up the area around the gun, and if that light casts shadows the game redraws everything nearby up to 6 times. In a big fight that more than doubles the shadow work. With this on, other players' and bots' muzzle flashes still light things up, just without shadows. Your own gun is left alone.", 85);
         HideCovered = Bind(other, "Hide objects covered by nearer ones (experimental)", true,
@@ -180,6 +183,7 @@ public class Plugin : BaseUnityPlugin
         // A/B for hiding covered objects: each flip is measured on its own (see MeasureFlip).
         HideCovered.SettingChanged += (_, _) => StartFlip(HideCovered, "hiding covered objects");
         SortByMaterial.SettingChanged += (_, _) => StartFlip(SortByMaterial, "grouping by material");
+        GpuFixes.SettingChanged += (_, _) => StartFlip(GpuFixes, "graphics card waste removed");
         SkipCoveredLamps.SettingChanged += (_, _) => StartFlip(SkipCoveredLamps, "skipping covered lamps");
         SkipOutOfView.SettingChanged += (_, _) => StartFlip(SkipOutOfView, "skipping LOD work");
         SkipTooFar.SettingChanged += (_, _) => StartFlip(SkipTooFar, "skipping LOD work for far objects");
@@ -736,6 +740,8 @@ public class Plugin : BaseUnityPlugin
             if (Input.GetKeyDown(KeyCode.End)) Fail(HideCovered, new InvalidOperationException("test error (End key, Debug build)"));
             // Home: what the physics step is busy with (Diagnostics, logged a second later).
             if (Input.GetKeyDown(KeyCode.Home)) Diagnostics.StartPhysicsCensus();
+            // F10: the small level meshes drawn right now, and why (Diagnostics.LogSmallCensus).
+            if (Input.GetKeyDown(KeyCode.F10) && Diagnostics.InRaid) Diagnostics.LogSmallCensus();
             // Insert: keep the physics step running, for an A/B under a steady physics load.
             if (Input.GetKeyDown(KeyCode.Insert) && Diagnostics.InRaid) HotPaths.TogglePhysicsKeeper();
             // PageDown: a paired A/B of the setting changed last (StartPairs); PageUp: the long series
@@ -781,6 +787,7 @@ public class Plugin : BaseUnityPlugin
 
             _wasInRaid = inRaid;
             if (inRaid) Guard(SortByMaterial, HotPaths.SortByMaterial);
+            Guard(GpuFixes, HotPaths.IdleEffects);
             if (inRaid) Guard(FinePhysicsRegions, HotPaths.SyncPhysicsRegions);
             Guard(SkipHitTriggers, HotPaths.SyncHitTriggers);
             if (!inRaid) _pausedBeforeRaid = PauseFixes.Value;
