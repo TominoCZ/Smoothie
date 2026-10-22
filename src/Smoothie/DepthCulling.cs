@@ -1886,7 +1886,7 @@ internal static class DepthCulling
             if (Diagnostics.Measuring) WorkerMs = (Stopwatch.GetTimestamp() - start) * Diagnostics.TickMs;
             if (Diagnostics.Measuring) Status = $"{_width}x{_height} depth (arrives after {_arriveFrames:0.0} frames, {_arriveMs:0.0} ms; results applied {_appliedAge:0.0} frames old, one every {_resultEvery:0.0} frames), "
                      + $"{Tested} tested, depth checks {(DepthPyramid.UseNative ? "native" : "C#")} ({CoveredDeep} covered deep, checked again later; {GameSkipped} covered not asked about, the game draws none of them now); cells: {CellsOut} of {Cells} out of view, {CellsCovered} covered whole"
-                     + (_roundReach.sqrMagnitude > 0.0001f ? $"; moving {_roundReach.x:0.00} m sideways, {_roundReach.y:0.00} up, {_roundReach.z:0.00} forward before the next result, {MovingKept} kept drawn for it, {GearParts} parts of what you hold not counted as sliding cover" + (MovingKept > 0 ? $" (grown up to {_movingGrow:0.0} texels, cover as near as {_movingCover:0.0} m)" : "") : "")
+                     + (SqrDistance(_roundReach, default) > 0.0001f ? $"; moving {_roundReach.x:0.00} m sideways, {_roundReach.y:0.00} up, {_roundReach.z:0.00} forward before the next result, {MovingKept} kept drawn for it, {GearParts} parts of what you hold not counted as sliding cover" + (MovingKept > 0 ? $" (grown up to {_movingGrow:0.0} texels, cover as near as {_movingCover:0.0} m)" : "") : "")
                      + (_roundLamps ? $"; lamps: {LampsOff} of {_lamps.Length} skipped (their lit area covered)" : "")
                      + (_roundScoped ? _roundScopeDepth ? $"; scope: {_scopeWidth}x{_scopeHeight} depth, {ScopeTested} checked against it, view {ScopeFov:0.0}°, lead {ScopeLeadDegrees:0.0}°" : "; scope: no depth of its own, its view stays drawn" : "");
             TimeParts(pyramidTicks, lanesTicks, Stopwatch.GetTimestamp() - phase);
@@ -2084,7 +2084,7 @@ internal static class DepthCulling
             if (test) lane.LampsOn++;
             var inView = test && outOfView == 0 && !OutOfView(_lampMin[l], _lampMax[l]);
             var streak = _lampStreak[l];
-            if (inView && now < _lampNextCheck[l] && (streak == 0 || _lampWhole[l] && (eye - _lampCheckedFrom[l]).sqrMagnitude < _lampSlack[l]))
+            if (inView && now < _lampNextCheck[l] && (streak == 0 || _lampWhole[l] && SqrDistance(eye, _lampCheckedFrom[l]) < _lampSlack[l]))
             {
                 // Not due: its last verdict stands. A covered one keeps the box it was checked with,
                 // wholly on screen, so the turn check leaves it alone: all of it was checked.
@@ -2099,7 +2099,7 @@ internal static class DepthCulling
             _lampWhole[l] = false;
             if (covered && Project(_lampMin[l], _lampMax[l], ref m, out var lx0, out var ly0, out var lx1, out var ly1, out _, out _))
             {
-                _lampRect[l] = new Vector4(lx0, ly0, lx1, ly1);
+                _lampRect[l] = V4(lx0, ly0, lx1, ly1);
                 _lampWhole[l] = OnScreen(_lampRect[l]);
             }
 
@@ -2326,7 +2326,7 @@ internal static class DepthCulling
         }
 
         var size = set.LodSize[i];
-        return size > 0f && size * _roundLodScale < set.LodLast[i] * LodMargin * (set.LodRef[i] - _roundEye).magnitude && Skipped(lane);
+        return size > 0f && size * _roundLodScale < set.LodLast[i] * LodMargin * MathF.Sqrt(SqrDistance(set.LodRef[i], _roundEye)) && Skipped(lane);
     }
 
     private static bool Skipped(Lane lane)
@@ -2349,7 +2349,7 @@ internal static class DepthCulling
     // stale: the main thread shows it the frame it comes back into view (ShowEntering).
     private static void KeepOutOfView(Set set, Lane lane, int i, Vector3 eye, int round)
     {
-        if (set.Streak[i] != 0 && (eye - set.CheckedFrom[i]).sqrMagnitude >= set.Slack[i])
+        if (set.Streak[i] != 0 && SqrDistance(eye, set.CheckedFrom[i]) >= set.Slack[i])
         {
             set.Streak[i] = 0;
             set.NextCheck[i] = 0f;
@@ -2441,10 +2441,24 @@ internal static class DepthCulling
 
     private static void SetPlanes(Vector4[] planes, ref Matrix4x4 m)
     {
-        planes[0] = new Vector4(m.m30 + m.m00, m.m31 + m.m01, m.m32 + m.m02, m.m33 + m.m03);
-        planes[1] = new Vector4(m.m30 - m.m00, m.m31 - m.m01, m.m32 - m.m02, m.m33 - m.m03);
-        planes[2] = new Vector4(m.m30 + m.m10, m.m31 + m.m11, m.m32 + m.m12, m.m33 + m.m13);
-        planes[3] = new Vector4(m.m30 - m.m10, m.m31 - m.m11, m.m32 - m.m12, m.m33 - m.m13);
+        planes[0] = V4(m.m30 + m.m00, m.m31 + m.m01, m.m32 + m.m02, m.m33 + m.m03);
+        planes[1] = V4(m.m30 - m.m00, m.m31 - m.m01, m.m32 - m.m02, m.m33 - m.m03);
+        planes[2] = V4(m.m30 + m.m10, m.m31 + m.m11, m.m32 + m.m12, m.m33 + m.m13);
+        planes[3] = V4(m.m30 - m.m10, m.m31 - m.m11, m.m32 - m.m12, m.m33 - m.m13);
+    }
+
+    // The worker's threads aren't IL2CPP's, and Unity's struct math isn't plain C# here: every
+    // Vector3/Vector4 constructor, operator and property is an il2cpp_runtime_invoke that boxes
+    // its result on the game's heap. A collection started by one of those on the worker killed
+    // the game ("Fatal error in GC: Collecting from unknown thread"). Worker code uses these and
+    // the fields only (tools/il2cpp-stripcheck lists any interop call it reaches).
+    private static Vector3 V3(float x, float y, float z) => new() { x = x, y = y, z = z };
+    private static Vector4 V4(float x, float y, float z, float w) => new() { x = x, y = y, z = z, w = w };
+
+    private static float SqrDistance(Vector3 a, Vector3 b)
+    {
+        float x = a.x - b.x, y = a.y - b.y, z = a.z - b.z;
+        return x * x + y * y + z * z;
     }
 
     // A view's left, right, bottom and top planes (SetPlanes) with their normals' absolute
@@ -2462,10 +2476,10 @@ internal static class DepthCulling
             _p1 = planes[1];
             _p2 = planes[2];
             _p3 = planes[3];
-            _a0 = new Vector3(Math.Abs(_p0.x), Math.Abs(_p0.y), Math.Abs(_p0.z));
-            _a1 = new Vector3(Math.Abs(_p1.x), Math.Abs(_p1.y), Math.Abs(_p1.z));
-            _a2 = new Vector3(Math.Abs(_p2.x), Math.Abs(_p2.y), Math.Abs(_p2.z));
-            _a3 = new Vector3(Math.Abs(_p3.x), Math.Abs(_p3.y), Math.Abs(_p3.z));
+            _a0 = V3(Math.Abs(_p0.x), Math.Abs(_p0.y), Math.Abs(_p0.z));
+            _a1 = V3(Math.Abs(_p1.x), Math.Abs(_p1.y), Math.Abs(_p1.z));
+            _a2 = V3(Math.Abs(_p2.x), Math.Abs(_p2.y), Math.Abs(_p2.z));
+            _a3 = V3(Math.Abs(_p3.x), Math.Abs(_p3.y), Math.Abs(_p3.z));
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -2517,7 +2531,8 @@ internal static class DepthCulling
         // Forward, near cover spreads out from the middle faster, so a gap on the box's side
         // towards the middle comes towards it (back: the outer side). Up and down: both sides
         // (which way is up on the depth image isn't worth getting wrong).
-        if (_roundReach == Vector3.zero) return WhyCovered;
+        // Unity's == (within 1e-5).
+        if (SqrDistance(_roundReach, default) < 1e-10f) return WhyCovered;
         // World cover only: the player's gun moves with the eye, so its edge doesn't slide; behind it
         // things only shift by their own parallax (OwnShiftTexels).
         var cover = lane.NearestCover;

@@ -3,7 +3,7 @@
 // used it), which only throws once called, in game. Also rebuilt methods that add IL2CPP's string
 // data offset to a pinned .NET string (they hand Unity a pointer past the text; ProfilerRecorder.StartNew).
 // Any hit needs another way in (an internal call, see DepthCulling.Readback).
-// Expected output: "0 stripped call targets".
+// Expected output: "0 stripped call targets" (and the off-main-thread check at the end).
 // Usage: dotnet run -p:SptPath=$SPT_PATH -- src/Smoothie/bin/Release/net10.0/Smoothie.dll
 using System; using System.IO; using System.Linq; using System.Collections.Generic; using Mono.Cecil; using Mono.Cecil.Cil;
 var spt = Environment.GetEnvironmentVariable("SPT_PATH") ?? throw new InvalidOperationException("Set SPT_PATH to the SPT 5.0 folder");
@@ -53,3 +53,33 @@ foreach (var i in m.Body.Instructions)
 }
 foreach (var pair in hits) Console.WriteLine($"{pair.Key}\n    used by: {string.Join(", ", pair.Value)}");
 Console.WriteLine($"{hits.Count} stripped call targets");
+
+// Code run on threads IL2CPP doesn't know (DepthCulling's worker) must not reach an interop method
+// that goes through il2cpp_runtime_invoke: it boxes its result on the game's heap, and a collection
+// started there kills the game ("Fatal error in GC: Collecting from unknown thread"). Unity's
+// struct math (Vector3 operators, constructors, magnitude) is all of that kind. Getters with a
+// direct call pointer (plain field reads, e.g. CullingObject.IsVisible) are left out.
+// Expected output: "0 runtime_invoke calls off the main thread".
+bool Invokes(MethodDefinition d) => d is { HasBody: true }
+    && d.Body.Instructions.Any(i => i.Operand is MethodReference c && c.Name == "il2cpp_runtime_invoke")
+    && !d.Body.Instructions.Any(i => i.Operand is FieldReference f && f.Name.StartsWith("NativeDirectCallPtr_"));
+var walked = new HashSet<string>();
+var offMain = new SortedDictionary<string, SortedSet<string>>();
+var queue = new Queue<MethodDefinition>(smoothie.MainModule.GetTypes().SelectMany(t => t.Methods).Where(m => m.HasBody && $"{m.DeclaringType.Name}.{m.Name}" == "DepthCulling.Test"));
+while (queue.Count > 0)
+{
+    var m = queue.Dequeue();
+    if (!walked.Add(m.FullName)) continue;
+    foreach (var i in m.Body.Instructions)
+    {
+        if (i.Operand is not MethodReference r) continue;
+        MethodDefinition d = null; try { d = r.Resolve(); } catch { }
+        if (d == null) continue;
+        if (d.Module == smoothie.MainModule) { if (d.HasBody) queue.Enqueue(d); continue; }
+        if (!File.Exists(Path.Combine(interop, r.DeclaringType.Scope.Name.Replace(".dll", "") + ".dll")) || !Invokes(d)) continue;
+        if (!offMain.TryGetValue(d.FullName, out var users)) offMain[d.FullName] = users = new();
+        users.Add($"{m.DeclaringType.Name}.{m.Name}");
+    }
+}
+foreach (var pair in offMain) Console.WriteLine($"{pair.Key}\n    used off the main thread by: {string.Join(", ", pair.Value)}");
+Console.WriteLine($"{offMain.Count} runtime_invoke calls off the main thread");
