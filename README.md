@@ -17,11 +17,13 @@ what you see.
 | Close bots you can't see | full hand and head aiming | skipped until you have a line of sight |
 | Small gear on far bots | always drawn | skipped past 60 m (lasers and lights stay) |
 | Corpses | ragdoll for 15–30 s | settle after 5 s (left to Rupture when it's installed) |
-| Level objects behind nearer ones | drawn, shadows too | not drawn while fully covered (checked against your scope's view too) |
+| Level objects behind nearer ones | drawn, shadows too | not drawn while fully covered, down to parts of big buildings and their decals (checked against your scope's view too) |
 | Lamps lighting only rooms you can't see | lit, shadows drawn | skipped until their light may come into view |
 | Level of detail for objects behind you or too far to draw | worked out every frame | skipped |
 | Huge bot counts when you host | freezes on spawn waves | only as many as fit, gear built a bit per frame |
 | Requests to the SPT server | a new connection every time | one connection kept open |
+| Distant shadows | the old and the new shadow map read for every pixel, every frame | the old one skipped once the fade to the new one is done (about 0.4 ms less graphics card work at 1440p) |
+| Screen effects with nothing to show (blood, death fade, grayscale, distortion) | copy the whole picture every frame | switched off until they have something to show |
 
 Scope zoom counts: through a 4x scope a bot 200 m away is treated like one at 50 m. A few
 things the game wastes every frame are fixed too, like the main menu's background video
