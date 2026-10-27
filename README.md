@@ -44,7 +44,7 @@ How the patches were found and how to redo them after a game update is in
 - **Client-side only.** Nothing goes on the server.
 - **Fika is optional.** Works offline, as a Fika host and as a Fika client.
 - **Rupture:** Smoothie's corpse settle time switches itself off when Rupture is installed.
-- **AI Limit:** works alongside it; AI Limit switches far bots off, Smoothie makes the rest cheaper.
+- **AI Limit, ORBIT's Ghost Mode:** work alongside it; they switch far bots off, Smoothie hands those back to the game untouched and makes the rest cheaper.
 
 ## Install
 
