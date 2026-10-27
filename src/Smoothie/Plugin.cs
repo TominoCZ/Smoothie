@@ -14,7 +14,7 @@ using UnityEngine;
 
 namespace Smoothie;
 
-[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.1.0")]
+[BepInPlugin("com.tominocz.smoothie", "Smoothie", "1.1.1")]
 // Optional: when Fika is installed it has to load first, or its types aren't there yet when
 // Smoothie looks for them and its observed bots aren't recognised. Without Fika this does nothing.
 [BepInDependency("com.fika.core", BepInDependency.DependencyFlags.SoftDependency)]
@@ -689,13 +689,13 @@ public class Plugin : BaseUnityPlugin
             for (var i = 0; i < players.Count; i++)
             {
                 // Switched off (AILimit or ORBIT's Ghost Mode on the host, and Fika then on
-                // clients too): Unity skips their LateUpdate, so do we, after ending a catch-up
-                // step their own LateUpdate would have ended.
+                // clients too): Unity skips their LateUpdate, so do we, after handing the bot
+                // back to the game whole (AnimatorThrottle.LetGo).
                 var player = players[i];
                 if (player == null) continue;
                 if (!player.isActiveAndEnabled)
                 {
-                    AnimatorThrottle.EndStepIfAsleep(player);
+                    AnimatorThrottle.LetGo(player);
                     continue;
                 }
 

@@ -33,6 +33,9 @@ internal static class AnimatorThrottle
         public IAnimator? Body;
         public IAnimator? Arms;
 
+        // Their keepAnimatorControllerStateOnDisable before we set it, put back with them.
+        public bool BodyKeep, ArmsKeep;
+
         // Arms the game steps by hand every frame (Fika's observed bots). Their update is
         // held back in Player.ArmsUpdate and stepped here with the body instead.
         public bool DeferArms;
@@ -139,6 +142,9 @@ internal static class AnimatorThrottle
     {
         var handled = HandledFrame.GetValue(player, NewHandled);
         if (handled.Frame == Time.frameCount) return;
+        // Not handled last frame: switched off in between (ORBIT's Ghost Mode, AILimit), maybe
+        // without Plugin.LateUpdate seeing it. Nothing from before is trusted: start it fresh.
+        var skipped = handled.Frame >= 0 && handled.Frame < Time.frameCount - 1;
         handled.Frame = Time.frameCount;
         var bot = IsBot(player, handled);
 
@@ -162,6 +168,7 @@ internal static class AnimatorThrottle
 
         try
         {
+            if (skipped) LetGo(player);
             BeforeLateUpdate(player, bot);
         }
         catch (Exception ex)
@@ -231,8 +238,8 @@ internal static class AnimatorThrottle
             States.Add(player, state);
         }
 
-        Take(ref state.Body, player.BodyUpdateMode == Player.EUpdateMode.Auto ? player.BodyAnimatorCommon : null);
-        Take(ref state.Arms, player.ArmsUpdateMode == Player.EUpdateMode.Auto ? player.ArmsAnimatorCommon : null);
+        Take(ref state.Body, ref state.BodyKeep, player.BodyUpdateMode == Player.EUpdateMode.Auto ? player.BodyAnimatorCommon : null);
+        Take(ref state.Arms, ref state.ArmsKeep, player.ArmsUpdateMode == Player.EUpdateMode.Auto ? player.ArmsAnimatorCommon : null);
         // Only hold back arms we can step ourselves, or they would freeze.
         state.DeferArms = player.ArmsUpdateMode == Player.EUpdateMode.Manual && IsAlive(player.ArmsAnimatorCommon);
 
@@ -289,8 +296,7 @@ internal static class AnimatorThrottle
         RestoreSpeed(state.Arms, state.ArmsSpeed, scale);
         if (state.Releasing)
         {
-            state.Body = null;
-            state.Arms = null;
+            GiveBack(state);
             return;
         }
 
@@ -298,15 +304,25 @@ internal static class AnimatorThrottle
         if (IsAlive(state.Arms)) Hold(state.Arms!);
     }
 
-    // A bot switched off mid-step gets no LateUpdate, so nothing would end the step: its
-    // animators would keep the sped-up speed, and the movement hook would keep stretching its
-    // time step (the game still ticks a switched-off body's movement) until it woke. Ended as
-    // if no time had passed, so what it's owed is caught up once it's back.
-    internal static void EndStepIfAsleep(Player player)
+    // A bot another mod switched off (ORBIT's Ghost Mode, AILimit) is handed back whole: any step
+    // ended with the game's speeds back, animators running as Unity had them, nothing owed. Off,
+    // it gets no LateUpdate to end a step, and ORBIT moves it and wakes it with the base game's
+    // recipe; a held animator, a sped-up speed or time owed from before would carry over into
+    // that wake (a bot caught up twice, or walking several times too fast). Woken, it's throttled
+    // again from scratch like a newly spawned bot.
+    internal static void LetGo(Player player)
     {
-        if (!States.TryGetValue(player, out var state) || state.StepScale <= 0f) return;
-        FinishUnityStep(state, 0f);
-        if (state.Releasing) States.Remove(player);
+        if (!States.TryGetValue(player, out var state)) return;
+        States.Remove(player);
+        if (state.StepScale > 0f)
+        {
+            RestoreSpeed(state.Body, state.BodySpeed, state.StepScale);
+            RestoreSpeed(state.Arms, state.ArmsSpeed, state.StepScale);
+            state.StepScale = 0f;
+        }
+
+        // Died while off: the ragdoll has its animators switched off, and they stay off.
+        if (player.HealthController?.IsAlive == true) GiveBack(state);
     }
 
     // The game only sets a speed for sprint-to-idle; if it did in between, its value stays.
@@ -504,12 +520,12 @@ internal static class AnimatorThrottle
         return bot;
     }
 
-    private static void Take(ref IAnimator? owned, IAnimator? current)
+    private static void Take(ref IAnimator? owned, ref bool keep, IAnimator? current)
     {
         if (!ReferenceEquals(owned, current))
         {
             // The weapon (and with it the arms animator) changed.
-            GiveBack(owned);
+            GiveBack(owned, keep);
             owned = null;
         }
 
@@ -518,6 +534,7 @@ internal static class AnimatorThrottle
         // Disabled by the game, not by us: leave it be.
         if (owned == null && !current!.enabled) return;
 
+        if (owned == null) keep = current!.keepAnimatorControllerStateOnDisable;
         current!.keepAnimatorControllerStateOnDisable = true;
         Hold(current);
         owned = current;
@@ -568,16 +585,25 @@ internal static class AnimatorThrottle
         }
 
         Step(player, state);
-        GiveBack(state.Body);
-        GiveBack(state.Arms);
-        state.Body = null;
-        state.Arms = null;
+        GiveBack(state);
         return false;
     }
 
-    private static void GiveBack(IAnimator? animator)
+    private static void GiveBack(State state)
     {
-        if (IsAlive(animator)) Run(animator!);
+        GiveBack(state.Body, state.BodyKeep);
+        GiveBack(state.Arms, state.ArmsKeep);
+        state.Body = null;
+        state.Arms = null;
+    }
+
+    // Running, with the keep-state setting the game had: a GameObject switched off and on again
+    // (ORBIT's sleep) resets its animators the way the base game expects.
+    private static void GiveBack(IAnimator? animator, bool keep)
+    {
+        if (!IsAlive(animator)) return;
+        Run(animator!);
+        animator!.keepAnimatorControllerStateOnDisable = keep;
     }
 
     // Held back from Unity's update: paused inside Unity while its hooks are in (AnimatorPause:
